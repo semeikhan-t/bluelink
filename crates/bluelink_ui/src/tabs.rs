@@ -47,8 +47,9 @@ pub fn show(ui: &mut Ui, tabs: &[String], active: Option<&str>, dirty: bool) -> 
         .auto_shrink([false, true])
         .show(&mut child, |ui| {
             ui.set_min_height(TAB_H + 2.0);
-            ui.spacing_mut().item_spacing.x = 3.0;
-            ui.add_space(2.0);
+            // Room for the concave join ears on the active tab.
+            ui.spacing_mut().item_spacing.x = theme::ROUND as f32 + 2.0;
+            ui.add_space(theme::ROUND as f32);
 
             for path in tabs {
                 let is_active = active == Some(path.as_str());
@@ -203,58 +204,61 @@ fn tab_chip(
     let _ = x;
 }
 
-/// Soft concave corner where each side of the active tab meets the document rule.
+/// Browser-tab ear: concave join from the vertical tab edge into the document rule.
+///
+/// Left ear geometry (right is mirrored):
+/// - clip square sits left of the tab, above the rule
+/// - circle centered at the outer corner of that square
+/// - SE quarter becomes tab/content color → strip keeps a concave bite
+/// - arc stroke continues the document border into the tab side
 fn paint_tab_join(ui: &Ui, left: f32, right: f32, rule_y: f32, strip: Color32, edge: Stroke) {
     let r = theme::ROUND as f32;
 
-    // Left: quarter-circle of content color into the strip → concave join.
+    // Hide the sharp L where the side stroke met the rule; the arc replaces it.
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(left - 1.0, rule_y - r),
+            egui::pos2(left + 2.0, rule_y + 1.0),
+        ),
+        egui::CornerRadius::ZERO,
+        theme::BG,
+    );
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(right - 2.0, rule_y - r),
+            egui::pos2(right + 1.0, rule_y + 1.0),
+        ),
+        egui::CornerRadius::ZERO,
+        theme::BG,
+    );
+
+    // Left ear
     let left_clip = egui::Rect::from_min_max(
         egui::pos2(left - r, rule_y - r),
-        egui::pos2(left + 0.5, rule_y + 0.5),
+        egui::pos2(left, rule_y),
     );
+    let left_center = egui::pos2(left - r, rule_y - r);
     ui.painter()
         .rect_filled(left_clip, egui::CornerRadius::ZERO, strip);
     {
         let p = ui.painter().with_clip_rect(left_clip);
-        p.circle_filled(egui::pos2(left, rule_y), r, theme::BG);
-        p.circle_stroke(egui::pos2(left, rule_y), r, edge);
+        p.circle_filled(left_center, r, theme::BG);
+        p.circle_stroke(left_center, r, edge);
     }
-    // Cover the sharp L of the tab side stroke at the join.
-    ui.painter().rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(left - 0.5, rule_y - r),
-            egui::pos2(left + 1.5, rule_y + 0.5),
-        ),
-        egui::CornerRadius::ZERO,
-        theme::BG,
-    );
-    ui.painter()
-        .with_clip_rect(left_clip.expand(1.0))
-        .circle_stroke(egui::pos2(left, rule_y), r, edge);
 
-    // Right: mirror.
+    // Right ear
     let right_clip = egui::Rect::from_min_max(
-        egui::pos2(right - 0.5, rule_y - r),
-        egui::pos2(right + r, rule_y + 0.5),
+        egui::pos2(right, rule_y - r),
+        egui::pos2(right + r, rule_y),
     );
+    let right_center = egui::pos2(right + r, rule_y - r);
     ui.painter()
         .rect_filled(right_clip, egui::CornerRadius::ZERO, strip);
     {
         let p = ui.painter().with_clip_rect(right_clip);
-        p.circle_filled(egui::pos2(right, rule_y), r, theme::BG);
-        p.circle_stroke(egui::pos2(right, rule_y), r, edge);
+        p.circle_filled(right_center, r, theme::BG);
+        p.circle_stroke(right_center, r, edge);
     }
-    ui.painter().rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(right - 1.5, rule_y - r),
-            egui::pos2(right + 0.5, rule_y + 0.5),
-        ),
-        egui::CornerRadius::ZERO,
-        theme::BG,
-    );
-    ui.painter()
-        .with_clip_rect(right_clip.expand(1.0))
-        .circle_stroke(egui::pos2(right, rule_y), r, edge);
 }
 
 enum AlignX {
