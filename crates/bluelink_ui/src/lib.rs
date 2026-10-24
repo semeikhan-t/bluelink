@@ -319,6 +319,20 @@ impl App {
         }
     }
 
+    fn cycle_next_tab(&mut self) {
+        if self.open_tabs.len() < 2 {
+            return;
+        }
+        let idx = self
+            .selected
+            .as_ref()
+            .and_then(|s| self.open_tabs.iter().position(|t| t == s))
+            .unwrap_or(0);
+        let next = (idx + 1) % self.open_tabs.len();
+        let path = self.open_tabs[next].clone();
+        self.select_note(&path);
+    }
+
     fn close_tab(&mut self, path: &str) {
         let idx = self.open_tabs.iter().position(|t| t == path);
         let was_active = self.selected.as_deref() == Some(path);
@@ -845,8 +859,29 @@ impl eframe::App for App {
             }
         }
 
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+        let (save, new_note, close_tab, next_tab) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::T),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::W),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab),
+            )
+        });
+        if save {
             self.save_current();
+        }
+        if new_note && self.vault.is_some() && self.dialog.is_none() {
+            self.dialog = Some(Dialog::NewNote {
+                name: "untitled".into(),
+            });
+        }
+        if close_tab {
+            if let Some(path) = self.selected.clone() {
+                self.close_tab(&path);
+            }
+        }
+        if next_tab {
+            self.cycle_next_tab();
         }
 
         self.show_dialogs(ctx);
