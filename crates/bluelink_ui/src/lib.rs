@@ -20,8 +20,6 @@ enum Dialog {
     NewNote { name: String },
     NewFolder { name: String },
     NewVault { name: String },
-    /// `from` is the current note/folder path; `name` is the editable target.
-    Rename { from: String, name: String },
     CreateLink { rel_path: String },
     ConfirmDelete { path: String },
 }
@@ -45,6 +43,8 @@ pub struct App {
     doc_edit: bool,
     status: String,
     dialog: Option<Dialog>,
+    /// Sidebar inline rename (note or folder).
+    renaming: Option<tree::InlineRename>,
     reload_flag: Arc<AtomicBool>,
     pick_folder: Option<FolderPicker>,
     /// SHA of selected note as last loaded/saved — used to detect external edits.
@@ -78,6 +78,7 @@ impl App {
             doc_edit: false,
             status: String::new(),
             dialog: None,
+            renaming: None,
             reload_flag,
             pick_folder,
             selected_sha: None,
@@ -587,7 +588,6 @@ impl App {
         let mut close = false;
         let mut confirm_create: Option<String> = None;
         let mut confirm_new: Option<String> = None;
-        let mut confirm_rename: Option<(String, String)> = None;
         let mut do_delete: Option<String> = None;
 
         let mut confirm_vault: Option<String> = None;
@@ -640,23 +640,6 @@ impl App {
                         ui.horizontal(|ui| {
                             if ui.button("Create").clicked() {
                                 confirm_vault = Some(name.clone());
-                                close = true;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                close = true;
-                            }
-                        });
-                    });
-            }
-            Some(Dialog::Rename { from, name }) => {
-                egui::Window::new("Rename")
-                    .collapsible(false)
-                    .resizable(false)
-                    .show(ctx, |ui| {
-                        ui.text_edit_singleline(name);
-                        ui.horizontal(|ui| {
-                            if ui.button("Rename").clicked() {
-                                confirm_rename = Some((from.clone(), name.clone()));
                                 close = true;
                             }
                             if ui.button("Cancel").clicked() {
@@ -735,9 +718,6 @@ impl App {
         if let Some(name) = confirm_folder {
             let rel = name.trim().trim_matches('/').to_string();
             self.create_folder(&rel);
-        }
-        if let Some((from, name)) = confirm_rename {
-            self.rename_path(&from, &name);
         }
         if let Some(path) = do_delete {
             self.delete_path(&path);
@@ -850,8 +830,13 @@ impl eframe::App for App {
 
                 ui.label(egui::RichText::new("Notes").size(14.0).color(theme::WEAK));
                 ui.add_space(8.0);
-                let action =
-                    tree::show_tree(ui, &self.notes, &self.folders, self.selected.as_deref());
+                let action = tree::show_tree(
+                    ui,
+                    &self.notes,
+                    &self.folders,
+                    self.selected.as_deref(),
+                    &mut self.renaming,
+                );
                 if let Some(path) = action.select {
                     self.select_note(&path);
                 }
@@ -865,11 +850,20 @@ impl eframe::App for App {
                         name: "inbox".into(),
                     });
                 }
-                if let Some(path) = action.rename {
-                    self.dialog = Some(Dialog::Rename {
-                        from: path.clone(),
-                        name: path,
+                if let Some(path) = action.start_rename {
+                    let is_folder = self.folders.iter().any(|f| f == &path);
+                    self.renaming = Some(tree::InlineRename {
+                        draft: tree::rename_draft(&path, is_folder),
+                        from: path,
+                        request_focus: true,
                     });
+                }
+                if action.cancel_rename {
+                    self.renaming = None;
+                }
+                if let Some((from, to)) = action.commit_rename {
+                    self.renaming = None;
+                    self.rename_path(&from, &to);
                 }
                 if let Some(path) = action.delete {
                     self.dialog = Some(Dialog::ConfirmDelete { path });
