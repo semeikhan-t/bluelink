@@ -60,6 +60,7 @@ pub fn show(ui: &mut Ui, tabs: &[String], active: Option<&str>, dirty: bool) -> 
                     is_active,
                     dirty && is_active,
                     rule_y,
+                    strip,
                     &mut action,
                 );
             }
@@ -76,6 +77,7 @@ fn tab_chip(
     active: bool,
     dirty: bool,
     rule_y: f32,
+    strip: Color32,
     action: &mut TabAction,
 ) {
     let close_id = ui.id().with(("note_tab_close", path));
@@ -118,6 +120,8 @@ fn tab_chip(
         );
         ui.painter()
             .rect_filled(seal, egui::CornerRadius::ZERO, theme::BG);
+        // Concave rounds where the tab sides meet the document top border.
+        paint_tab_join(ui, body.left(), body.right(), rule_y, strip, edge);
     } else if hovered {
         ui.painter().rect_filled(
             rect.shrink2(egui::vec2(0.0, 3.0)),
@@ -197,6 +201,60 @@ fn tab_chip(
     }
 
     let _ = x;
+}
+
+/// Soft concave corner where each side of the active tab meets the document rule.
+fn paint_tab_join(ui: &Ui, left: f32, right: f32, rule_y: f32, strip: Color32, edge: Stroke) {
+    let r = theme::ROUND as f32;
+
+    // Left: quarter-circle of content color into the strip → concave join.
+    let left_clip = egui::Rect::from_min_max(
+        egui::pos2(left - r, rule_y - r),
+        egui::pos2(left + 0.5, rule_y + 0.5),
+    );
+    ui.painter()
+        .rect_filled(left_clip, egui::CornerRadius::ZERO, strip);
+    {
+        let p = ui.painter().with_clip_rect(left_clip);
+        p.circle_filled(egui::pos2(left, rule_y), r, theme::BG);
+        p.circle_stroke(egui::pos2(left, rule_y), r, edge);
+    }
+    // Cover the sharp L of the tab side stroke at the join.
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(left - 0.5, rule_y - r),
+            egui::pos2(left + 1.5, rule_y + 0.5),
+        ),
+        egui::CornerRadius::ZERO,
+        theme::BG,
+    );
+    ui.painter()
+        .with_clip_rect(left_clip.expand(1.0))
+        .circle_stroke(egui::pos2(left, rule_y), r, edge);
+
+    // Right: mirror.
+    let right_clip = egui::Rect::from_min_max(
+        egui::pos2(right - 0.5, rule_y - r),
+        egui::pos2(right + r, rule_y + 0.5),
+    );
+    ui.painter()
+        .rect_filled(right_clip, egui::CornerRadius::ZERO, strip);
+    {
+        let p = ui.painter().with_clip_rect(right_clip);
+        p.circle_filled(egui::pos2(right, rule_y), r, theme::BG);
+        p.circle_stroke(egui::pos2(right, rule_y), r, edge);
+    }
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(right - 1.5, rule_y - r),
+            egui::pos2(right + 0.5, rule_y + 0.5),
+        ),
+        egui::CornerRadius::ZERO,
+        theme::BG,
+    );
+    ui.painter()
+        .with_clip_rect(right_clip.expand(1.0))
+        .circle_stroke(egui::pos2(right, rule_y), r, edge);
 }
 
 enum AlignX {
