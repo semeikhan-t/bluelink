@@ -780,6 +780,9 @@ impl eframe::App for App {
             .default_width(theme::SIDEBAR_WIDTH)
             .min_width(240.0)
             .show(ctx, |ui| {
+                ui.with_layout(
+                    egui::Layout::top_down(egui::Align::Min).with_cross_justify(true),
+                    |ui| {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new("BlueLink")
@@ -871,6 +874,7 @@ impl eframe::App for App {
                 if let Some((from, to)) = action.move_note {
                     self.move_note(&from, &to);
                 }
+                });
             });
 
         if let Some(path) = switch_to {

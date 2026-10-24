@@ -1,7 +1,7 @@
 use bluelink_core::NoteMeta;
 use egui::{
-    emath::TSTransform, CursorIcon, Id, Key, LayerId, Order, RichText, Sense, TextEdit, Ui,
-    UiBuilder, Vec2,
+    emath::TSTransform, Align, CursorIcon, Id, Key, LayerId, Layout, Order, RichText, Sense,
+    TextEdit, Ui, UiBuilder, Vec2,
 };
 use egui_phosphor::regular;
 
@@ -65,6 +65,8 @@ pub fn show_tree(
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            // add_sized() centers; keep every tree row flush left.
+            ui.with_layout(Layout::top_down(Align::Min).with_cross_justify(true), |ui| {
             let mut by_folder: Vec<(String, Vec<&NoteMeta>)> = Vec::new();
             let mut root_notes: Vec<&NoteMeta> = Vec::new();
 
@@ -128,6 +130,7 @@ pub fn show_tree(
                     action.move_note = Some(((*from).clone(), to));
                 }
             }
+            }); // left-aligned layout
         });
 
     action
@@ -176,17 +179,11 @@ fn folder_block(
             .show(ui, |ui| {
                 ui.add_space(4.0);
                 if list.is_empty() {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), 28.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.label(
-                                RichText::new("drop notes here")
-                                    .size(14.0)
-                                    .italics()
-                                    .color(theme::WEAK),
-                            );
-                        },
+                    ui.label(
+                        RichText::new("drop notes here")
+                            .size(14.0)
+                            .italics()
+                            .color(theme::WEAK),
                     );
                 }
                 for note in list {
@@ -233,7 +230,7 @@ fn note_row(
     } else {
         RichText::new(text).size(16.0)
     };
-    let row_size = [ui.available_width(), 30.0];
+    let row_size = egui::vec2(ui.available_width(), 30.0);
 
     if ui.ctx().is_being_dragged(id) {
         egui::DragAndDrop::set_payload(ui.ctx(), note.rel_path.clone());
@@ -243,7 +240,9 @@ fn note_row(
         let layer_id = LayerId::new(Order::Tooltip, id);
         let response = ui
             .scope_builder(UiBuilder::new().layer_id(layer_id), |ui| {
-                ui.add_sized(row_size, egui::Label::new(label));
+                left_row(ui, row_size, |ui| {
+                    ui.label(label);
+                });
             })
             .response;
         if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
@@ -255,7 +254,10 @@ fn note_row(
     }
 
     // click_and_drag: click opens; drag starts only after movement threshold.
-    let painted = ui.add_sized(row_size, egui::Label::new(label).sense(Sense::hover()));
+    // Don't use add_sized — it forces Layout::centered_and_justified.
+    let painted = left_row(ui, row_size, |ui| {
+        ui.add(egui::Label::new(label).sense(Sense::hover()));
+    });
     let response = ui
         .interact(painted.rect, id, Sense::click_and_drag())
         .on_hover_cursor(CursorIcon::Grab);
@@ -346,6 +348,11 @@ fn path_context_menu(response: &egui::Response, path: &str, action: &mut TreeAct
             ui.close_menu();
         }
     });
+}
+
+fn left_row(ui: &mut Ui, size: Vec2, add: impl FnOnce(&mut Ui)) -> egui::Response {
+    ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), add)
+        .response
 }
 
 fn basename(rel: &str) -> &str {
