@@ -3,6 +3,7 @@
 mod editor;
 mod editor_menu;
 mod preview;
+mod quick_switcher;
 mod tabs;
 mod theme;
 mod tree;
@@ -45,6 +46,15 @@ struct OpenTab {
     history_index: usize,
 }
 
+/// State held only while the quick switcher is visible.
+#[derive(Default)]
+struct QuickSwitcher {
+    query: String,
+    results: Vec<quick_switcher::SearchResult>,
+    selected: usize,
+    request_focus: bool,
+}
+
 impl OpenTab {
     fn new(path: &str) -> Self {
         Self {
@@ -83,6 +93,7 @@ pub struct App {
     suppress_reload_until: Option<Instant>,
     registry: VaultRegistry,
     undo_stack: Vec<UndoItem>,
+    quick_switcher: Option<QuickSwitcher>,
 }
 
 impl App {
@@ -119,6 +130,7 @@ impl App {
             suppress_reload_until: None,
             registry,
             undo_stack: Vec::new(),
+            quick_switcher: None,
         };
 
         // --vault wins; otherwise reopen last known vault.
@@ -615,6 +627,185 @@ impl App {
                 self.status = format!("created {path}");
             }
             Err(e) => self.status = format!("create failed: {e}"),
+        }
+    }
+
+    fn open_quick_switcher(&mut self) {
+        if self.vault.is_some() {
+            self.quick_switcher = Some(QuickSwitcher {
+                results: self.quick_switch_results(""),
+                request_focus: true,
+                ..Default::default()
+            });
+        }
+    }
+
+    fn quick_switch_results(&self, query: &str) -> Vec<quick_switcher::SearchResult> {
+        let selected = self.selected.as_deref();
+        let dirty_buffer = self.dirty.then_some(self.buffer.as_str());
+        let Some(vault) = &self.vault else {
+            return Vec::new();
+        };
+        quick_switcher::search(&self.notes, query, |path| {
+            if selected == Some(path) {
+                if let Some(buffer) = dirty_buffer {
+                    return Some(buffer.to_string());
+                }
+            }
+            vault.read(path).ok()
+        })
+    }
+
+    fn show_quick_switcher(&mut self, ctx: &egui::Context) {
+        let Some(mut switcher) = self.quick_switcher.take() else {
+            return;
+        };
+
+        let mut open: Option<(String, bool)> = None;
+        let query_id = egui::Id::new("bluelink_quick_switch_query");
+
+        let modal = egui::Modal::new(egui::Id::new("bluelink_quick_switcher"))
+            .show(ctx, |ui| {
+                ui.set_width(620.0);
+                ui.label(
+                    egui::RichText::new("Find a note")
+                        .size(22.0)
+                        .family(theme::display_family())
+                        .color(theme::TEXT),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Titles, paths, and note text — all local to this vault")
+                        .size(14.0)
+                        .color(theme::WEAK),
+                );
+                ui.add_space(12.0);
+
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut switcher.query)
+                        .id(query_id)
+                        .hint_text("Search notes…")
+                        .desired_width(f32::INFINITY),
+                );
+                if switcher.request_focus {
+                    response.request_focus();
+                    switcher.request_focus = false;
+                }
+                if response.changed() {
+                    switcher.selected = 0;
+                    switcher.results = self.quick_switch_results(&switcher.query);
+                }
+
+                let results = &switcher.results;
+                switcher.selected = switcher.selected.min(results.len().saturating_sub(1));
+
+                let (up, down, open_new, open_current) = ctx.input_mut(|input| {
+                    let open_new = input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter);
+                    (
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                        open_new,
+                        !open_new && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                    )
+                });
+                if up && !results.is_empty() {
+                    switcher.selected = switcher
+                        .selected
+                        .checked_sub(1)
+                        .unwrap_or(results.len() - 1);
+                }
+                if down && !results.is_empty() {
+                    switcher.selected = (switcher.selected + 1) % results.len();
+                }
+                if (open_current || open_new) && !results.is_empty() {
+                    open = Some((results[switcher.selected].path.clone(), open_new));
+                }
+
+                ui.add_space(10.0);
+                let count = if results.len() == 1 {
+                    "1 note".into()
+                } else {
+                    format!("{} notes", results.len())
+                };
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(count).size(13.0).color(theme::WEAK));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new("Enter open  ·  Ctrl+Enter new tab  ·  Esc close")
+                                .size(13.0)
+                                .color(theme::WEAK),
+                        );
+                    });
+                });
+                ui.add_space(6.0);
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .max_height(400.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if results.is_empty() {
+                            ui.add_space(18.0);
+                            ui.centered_and_justified(|ui| {
+                                ui.label(egui::RichText::new("No matching notes").color(theme::WEAK));
+                            });
+                            ui.add_space(18.0);
+                        }
+                        for (index, result) in results.iter().enumerate() {
+                            let selected = index == switcher.selected;
+                            let fill = if selected {
+                                theme::FAINT
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            let row = egui::Frame::NONE
+                                .fill(fill)
+                                .inner_margin(egui::Margin::symmetric(10, 8))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&result.title)
+                                                .size(17.0)
+                                                .color(theme::TEXT),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(&result.path)
+                                                .size(13.0)
+                                                .color(theme::ACCENT),
+                                        );
+                                        if let Some(snippet) = &result.snippet {
+                                            ui.add_space(2.0);
+                                            ui.label(
+                                                egui::RichText::new(snippet)
+                                                    .size(14.0)
+                                                    .color(theme::WEAK),
+                                            );
+                                        }
+                                    });
+                                })
+                                .response
+                                .interact(egui::Sense::click());
+                            if row.hovered() {
+                                switcher.selected = index;
+                            }
+                            if row.clicked() {
+                                open = Some((result.path.clone(), false));
+                            }
+                        }
+                    });
+            });
+
+        if let Some((path, new_tab)) = open {
+            if new_tab {
+                self.open_note_in_new_tab(&path);
+            } else {
+                self.select_note(&path);
+            }
+            return;
+        }
+        if !modal.should_close() {
+            self.quick_switcher = Some(switcher);
         }
     }
 
@@ -1148,15 +1339,20 @@ impl eframe::App for App {
             }
         }
 
-        // Don't steal Delete/Z from TextEdit / rename fields.
-        let can_bind = !ctx.wants_keyboard_input() && self.dialog.is_none();
-        let (save, new_note, close_tab, next_tab, delete_note, undo, nav_back, nav_fwd) =
+        // Ctrl+P is intentionally available from the editor. Other bindings must not
+        // steal Delete/Z from TextEdit / rename fields or from the quick switcher.
+        let can_bind = !ctx.wants_keyboard_input()
+            && self.dialog.is_none()
+            && self.quick_switcher.is_none();
+        let can_open_switcher = self.dialog.is_none() && self.quick_switcher.is_none();
+        let (save, new_note, close_tab, next_tab, quick_switch, delete_note, undo, nav_back, nav_fwd) =
             ctx.input_mut(|i| {
                 (
                     i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
                     i.consume_key(egui::Modifiers::COMMAND, egui::Key::T),
                     i.consume_key(egui::Modifiers::COMMAND, egui::Key::W),
                     i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab),
+                    can_open_switcher && i.consume_key(egui::Modifiers::COMMAND, egui::Key::P),
                     can_bind && i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
                     can_bind && i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z),
                     i.modifiers.alt
@@ -1180,6 +1376,9 @@ impl eframe::App for App {
         }
         if next_tab {
             self.cycle_next_tab();
+        }
+        if quick_switch {
+            self.open_quick_switcher();
         }
         if delete_note {
             if let Some(path) = self.selected.clone() {
@@ -1408,6 +1607,18 @@ impl eframe::App for App {
                 ui.add_space(2.0);
                 self.show_nav_buttons(ui);
                 ui.add_space(4.0);
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new(regular::MAGNIFYING_GLASS).size(16.0))
+                            .min_size(egui::vec2(32.0, 32.0))
+                            .frame(false),
+                    )
+                    .on_hover_text("Find a note (Ctrl+P)")
+                    .clicked()
+                {
+                    self.open_quick_switcher();
+                }
+                ui.add_space(4.0);
                 if self.open_tabs.is_empty() {
                     ui.label(egui::RichText::new("Note").size(15.0).color(theme::WEAK));
                 } else {
@@ -1475,6 +1686,8 @@ impl eframe::App for App {
                 self.handle_wikilink(&raw);
             }
         });
+
+        self.show_quick_switcher(ctx);
     }
 }
 
