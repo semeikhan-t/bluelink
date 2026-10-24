@@ -1,11 +1,22 @@
 use bluelink_core::NoteMeta;
 use egui::{
-    emath::TSTransform, Align, CursorIcon, Id, Key, LayerId, Layout, Order, RichText, Sense,
+    emath::TSTransform, Align, CursorIcon, Id, Key, LayerId, Layout, Order, Pos2, RichText, Sense,
     TextEdit, Ui, UiBuilder, Vec2,
 };
 use egui_phosphor::regular;
 
 use crate::theme;
+
+/// One floating tree popup — not per-row egui `context_menu` (that freezes via BarState).
+#[derive(Clone)]
+struct TreeMenu {
+    pos: Pos2,
+    /// `None` = empty panel (Undo only).
+    path: Option<String>,
+    is_note: bool,
+}
+
+const TREE_MENU_KEY: &str = "bluelink_tree_ctx_menu";
 
 /// In-place rename of a note or folder in the sidebar.
 pub struct InlineRename {
@@ -97,7 +108,7 @@ pub fn show_tree(
 
             for (folder, list) in &by_folder {
                 let dropped =
-                    folder_block(ui, folder, list, selected, renaming, can_undo, &mut action);
+                    folder_block(ui, folder, list, selected, renaming, &mut action);
                 if let Some(from) = dropped {
                     let file = basename(&from);
                     let to = format!("{folder}/{file}");
@@ -123,7 +134,7 @@ pub fn show_tree(
                     ui.add_space(4.0);
                 }
                 for note in &root_notes {
-                    note_row(ui, note, selected, renaming, can_undo, &mut action);
+                    note_row(ui, note, selected, renaming, &mut action);
                 }
                 // Keep a hit area when root is empty so drops still work.
                 if root_notes.is_empty() {
@@ -140,10 +151,11 @@ pub fn show_tree(
 
             // Empty space under the tree — still offers Undo via context menu.
             let fill = ui.allocate_response(ui.available_size(), Sense::click());
-            panel_context_menu(&fill, can_undo, &mut action);
+            open_tree_menu_on_right_click(&fill, None, false);
             }); // left-aligned layout
         });
 
+    show_tree_menu(ui.ctx(), can_undo, &mut action);
     action
 }
 
@@ -153,7 +165,6 @@ fn folder_block(
     list: &[&NoteMeta],
     selected: Option<&str>,
     renaming: &mut Option<InlineRename>,
-    can_undo: bool,
     action: &mut TreeAction,
 ) -> Option<std::sync::Arc<String>> {
     let editing = renaming
@@ -178,7 +189,7 @@ fn folder_block(
                 );
             }
             for note in list {
-                note_row(ui, note, selected, renaming, can_undo, action);
+                note_row(ui, note, selected, renaming, action);
             }
         } else {
             let cr = egui::CollapsingHeader::new(
@@ -199,10 +210,10 @@ fn folder_block(
                     );
                 }
                 for note in list {
-                    note_row(ui, note, selected, renaming, can_undo, action);
+                    note_row(ui, note, selected, renaming, action);
                 }
             });
-            path_context_menu(&cr.header_response, folder, action, false, can_undo);
+            open_tree_menu_on_right_click(&cr.header_response, Some(folder.to_string()), false);
         }
     });
     resp.response.dnd_release_payload::<String>()
@@ -213,7 +224,6 @@ fn note_row(
     note: &NoteMeta,
     selected: Option<&str>,
     renaming: &mut Option<InlineRename>,
-    can_undo: bool,
     action: &mut TreeAction,
 ) {
     let editing = renaming
@@ -291,7 +301,7 @@ fn note_row(
             action.select = Some(note.rel_path.clone());
         }
     }
-    path_context_menu(&response, &note.rel_path, action, true, can_undo);
+    open_tree_menu_on_right_click(&response, Some(note.rel_path.clone()), true);
 }
 
 fn rename_field(
@@ -354,63 +364,91 @@ pub fn rename_draft(path: &str, is_folder: bool) -> String {
     }
 }
 
-fn path_context_menu(
-    response: &egui::Response,
-    path: &str,
-    action: &mut TreeAction,
-    is_note: bool,
-    can_undo: bool,
-) {
-    response.context_menu(|ui| {
-        ui.add_enabled_ui(can_undo, |ui| {
-            if ui
-                .button(format!("{}  Undo", regular::ARROW_COUNTER_CLOCKWISE))
-                .clicked()
-            {
-                action.undo = true;
-                ui.close_menu();
-            }
-        });
-        if can_undo {
-            ui.separator();
-        }
-        if is_note
-            && ui
-                .button(format!("{}  Open in new tab", regular::ARROW_SQUARE_OUT))
-                .clicked()
-        {
-            action.open_in_new_tab = Some(path.to_string());
-            ui.close_menu();
-        }
-        if ui
-            .button(format!("{}  Rename", regular::PENCIL_SIMPLE))
-            .clicked()
-        {
-            action.start_rename = Some(path.to_string());
-            ui.close_menu();
-        }
-        if ui
-            .button(format!("{}  Delete", regular::TRASH))
-            .clicked()
-        {
-            action.delete = Some(path.to_string());
-            ui.close_menu();
-        }
+fn open_tree_menu_on_right_click(response: &egui::Response, path: Option<String>, is_note: bool) {
+    if !response.secondary_clicked() {
+        return;
+    }
+    let Some(pos) = response.interact_pointer_pos() else {
+        return;
+    };
+    response.ctx.data_mut(|d| {
+        d.insert_temp(
+            Id::new(TREE_MENU_KEY),
+            Some(TreeMenu {
+                pos,
+                path,
+                is_note,
+            }),
+        );
     });
 }
 
-fn panel_context_menu(response: &egui::Response, can_undo: bool, action: &mut TreeAction) {
-    response.context_menu(|ui| {
-        ui.add_enabled_ui(can_undo, |ui| {
-            if ui
-                .button(format!("{}  Undo", regular::ARROW_COUNTER_CLOCKWISE))
-                .clicked()
-            {
-                action.undo = true;
-                ui.close_menu();
-            }
+fn show_tree_menu(ctx: &egui::Context, can_undo: bool, action: &mut TreeAction) {
+    let Some(menu) = ctx.data_mut(|d| d.get_temp::<Option<TreeMenu>>(Id::new(TREE_MENU_KEY)).flatten())
+    else {
+        return;
+    };
+
+    let mut chosen = false;
+    let popup = egui::Area::new(Id::new("bluelink_tree_ctx_popup"))
+        .order(Order::Foreground)
+        .fixed_pos(menu.pos)
+        .sense(Sense::click())
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(180.0);
+                ui.add_enabled_ui(can_undo, |ui| {
+                    if ui
+                        .button(format!("{}  Undo", regular::ARROW_COUNTER_CLOCKWISE))
+                        .clicked()
+                    {
+                        action.undo = true;
+                        chosen = true;
+                    }
+                });
+                if let Some(path) = menu.path.as_ref() {
+                    if can_undo {
+                        ui.separator();
+                    }
+                    if menu.is_note
+                        && ui
+                            .button(format!("{}  Open in new tab", regular::ARROW_SQUARE_OUT))
+                            .clicked()
+                    {
+                        action.open_in_new_tab = Some(path.clone());
+                        chosen = true;
+                    }
+                    if ui
+                        .button(format!("{}  Rename", regular::PENCIL_SIMPLE))
+                        .clicked()
+                    {
+                        action.start_rename = Some(path.clone());
+                        chosen = true;
+                    }
+                    if ui
+                        .button(format!("{}  Delete", regular::TRASH))
+                        .clicked()
+                    {
+                        action.delete = Some(path.clone());
+                        chosen = true;
+                    }
+                }
+            });
         });
+
+    let escape = ctx.input(|i| i.key_pressed(Key::Escape));
+    let click_outside = ctx.input(|i| {
+        i.pointer.primary_clicked()
+            && i.pointer
+                .interact_pos()
+                .is_some_and(|p| !popup.response.rect.contains(p))
     });
+    if chosen || escape || click_outside {
+        ctx.data_mut(|d| d.insert_temp(Id::new(TREE_MENU_KEY), None::<TreeMenu>));
+    } else {
+        // Temp data is frame-local — re-insert while the popup stays open.
+        ctx.data_mut(|d| d.insert_temp(Id::new(TREE_MENU_KEY), Some(menu)));
+    }
 }
 
 fn left_row(ui: &mut Ui, size: Vec2, add: impl FnOnce(&mut Ui)) -> egui::Response {

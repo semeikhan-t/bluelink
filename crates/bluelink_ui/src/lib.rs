@@ -1355,10 +1355,16 @@ impl eframe::App for App {
         }
 
         let mut open_backlink: Option<String> = None;
+        let backlinks: Vec<String> = match (self.selected.as_ref(), self.vault.as_ref()) {
+            (Some(sel), Some(vault)) => vault.index().backlinks(sel),
+            _ => Vec::new(),
+        };
+        // show_animated: hide when empty without remounting the panel every note switch
+        // (abrupt SidePanel mount/unmount has frozen the Wayland event loop before).
         egui::SidePanel::right("backlinks")
             .default_width(240.0)
             .min_width(180.0)
-            .show(ctx, |ui| {
+            .show_animated(ctx, !backlinks.is_empty(), |ui| {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new("Backlinks")
@@ -1370,48 +1376,28 @@ impl eframe::App for App {
                 ui.separator();
                 ui.add_space(6.0);
 
-                match (self.selected.as_ref(), self.vault.as_ref()) {
-                    (Some(sel), Some(vault)) => {
-                        let links = vault.index().backlinks(sel);
-                        if links.is_empty() {
-                            ui.label(
-                                egui::RichText::new("No backlinks")
-                                    .size(14.0)
-                                    .color(theme::WEAK),
-                            );
-                        } else {
-                            egui::ScrollArea::vertical()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    for path in links {
-                                        let name = path
-                                            .rsplit('/')
-                                            .next()
-                                            .unwrap_or(&path)
-                                            .trim_end_matches(".md");
-                                        let label = format!("{}  {name}", regular::LINK);
-                                        if ui
-                                            .add_sized(
-                                                [ui.available_width(), 28.0],
-                                                egui::SelectableLabel::new(false, label),
-                                            )
-                                            .on_hover_text(&path)
-                                            .clicked()
-                                        {
-                                            open_backlink = Some(path);
-                                        }
-                                    }
-                                });
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for path in &backlinks {
+                            let name = path
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(path)
+                                .trim_end_matches(".md");
+                            let label = format!("{}  {name}", regular::LINK);
+                            if ui
+                                .add_sized(
+                                    [ui.available_width(), 28.0],
+                                    egui::SelectableLabel::new(false, label),
+                                )
+                                .on_hover_text(path)
+                                .clicked()
+                            {
+                                open_backlink = Some(path.clone());
+                            }
                         }
-                    }
-                    _ => {
-                        ui.label(
-                            egui::RichText::new("Select a note")
-                                .size(14.0)
-                                .color(theme::WEAK),
-                        );
-                    }
-                }
+                    });
             });
         if let Some(path) = open_backlink {
             self.select_note(&path);
