@@ -2,6 +2,7 @@
 
 mod editor;
 mod preview;
+mod tabs;
 mod theme;
 mod tree;
 mod vault_registry;
@@ -32,6 +33,8 @@ pub struct App {
     notes: Vec<NoteMeta>,
     /// Relative folder paths (including empty).
     folders: Vec<String>,
+    /// Open note tabs (browser-style), active = `selected`.
+    open_tabs: Vec<String>,
     selected: Option<String>,
     buffer: String,
     dirty: bool,
@@ -69,6 +72,7 @@ impl App {
             vault: None,
             notes: Vec::new(),
             folders: Vec::new(),
+            open_tabs: Vec::new(),
             selected: None,
             buffer: String::new(),
             dirty: false,
@@ -122,6 +126,7 @@ impl App {
                 self.registry.remember(vault.root());
                 let _ = self.registry.save();
                 self.vault = Some(vault);
+                self.open_tabs.clear();
                 self.selected = None;
                 self.buffer.clear();
                 self.dirty = false;
@@ -135,6 +140,7 @@ impl App {
                 self.status = format!("open failed: {e}");
                 self.vault = None;
                 self.folders.clear();
+                self.open_tabs.clear();
             }
         }
     }
@@ -146,6 +152,7 @@ impl App {
         self.vault = None;
         self.notes.clear();
         self.folders.clear();
+        self.open_tabs.clear();
         self.selected = None;
         self.buffer.clear();
         self.dirty = false;
@@ -244,6 +251,9 @@ impl App {
     }
 
     fn select_note(&mut self, rel_path: &str) {
+        if !self.open_tabs.iter().any(|t| t == rel_path) {
+            self.open_tabs.push(rel_path.to_string());
+        }
         if self.selected.as_deref() == Some(rel_path) {
             return;
         }
@@ -284,6 +294,49 @@ impl App {
                 self.status = format!("read failed: {e}");
             }
         }
+    }
+
+    fn close_tab(&mut self, path: &str) {
+        let idx = self.open_tabs.iter().position(|t| t == path);
+        let was_active = self.selected.as_deref() == Some(path);
+        self.open_tabs.retain(|t| t != path);
+        if !was_active {
+            return;
+        }
+        if self.dirty {
+            self.save_current();
+        }
+        let next = idx.and_then(|i| {
+            if i < self.open_tabs.len() {
+                Some(self.open_tabs[i].clone())
+            } else {
+                self.open_tabs.last().cloned()
+            }
+        });
+        self.selected = None;
+        self.buffer.clear();
+        self.dirty = false;
+        self.readonly = false;
+        self.selected_sha = None;
+        self.active_line = None;
+        self.doc_edit = false;
+        if let Some(path) = next {
+            self.select_note(&path);
+        }
+    }
+
+    fn retarget_tab(&mut self, from: &str, to: &str) {
+        for tab in &mut self.open_tabs {
+            if tab == from {
+                *tab = to.to_string();
+            }
+        }
+    }
+
+    fn drop_tabs_with_prefix(&mut self, prefix: &str) {
+        let p = format!("{prefix}/");
+        self.open_tabs
+            .retain(|t| t != prefix && !t.starts_with(&p));
     }
 
     fn handle_wikilink(&mut self, raw: &str) {
@@ -338,6 +391,12 @@ impl App {
             match vault.rename_folder(from, &to) {
                 Ok(()) => {
                     let prefix = format!("{from}/");
+                    let new_prefix = format!("{to}/");
+                    for tab in &mut self.open_tabs {
+                        if let Some(rest) = tab.strip_prefix(&prefix) {
+                            *tab = format!("{new_prefix}{rest}");
+                        }
+                    }
                     let selected_was_inside = self
                         .selected
                         .as_ref()
@@ -374,6 +433,7 @@ impl App {
         };
         match vault.rename(from, to) {
             Ok(_) => {
+                self.retarget_tab(from, to);
                 self.refresh_notes();
                 if self.selected.as_deref() == Some(from) {
                     self.select_note(to);
@@ -396,6 +456,7 @@ impl App {
                 .is_some_and(|s| s.starts_with(&prefix));
             match vault.delete_folder(rel) {
                 Ok(()) => {
+                    self.drop_tabs_with_prefix(rel);
                     if clear_selected {
                         self.selected = None;
                         self.buffer.clear();
@@ -404,6 +465,9 @@ impl App {
                         self.selected_sha = None;
                         self.active_line = None;
                         self.doc_edit = false;
+                        if let Some(path) = self.open_tabs.first().cloned() {
+                            self.select_note(&path);
+                        }
                     }
                     self.refresh_notes();
                     self.status = format!("deleted folder {rel}");
@@ -414,7 +478,10 @@ impl App {
         }
         match vault.delete(rel) {
             Ok(()) => {
-                if self.selected.as_deref() == Some(rel) {
+                let was_active = self.selected.as_deref() == Some(rel);
+                let idx = self.open_tabs.iter().position(|t| t == rel);
+                self.open_tabs.retain(|t| t != rel);
+                if was_active {
                     self.selected = None;
                     self.buffer.clear();
                     self.dirty = false;
@@ -422,6 +489,16 @@ impl App {
                     self.selected_sha = None;
                     self.active_line = None;
                     self.doc_edit = false;
+                    let next = idx.and_then(|i| {
+                        if i < self.open_tabs.len() {
+                            Some(self.open_tabs[i].clone())
+                        } else {
+                            self.open_tabs.last().cloned()
+                        }
+                    });
+                    if let Some(path) = next {
+                        self.select_note(&path);
+                    }
                 }
                 self.refresh_notes();
                 self.status = format!("deleted {rel}");
@@ -958,20 +1035,39 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(sel) = &self.selected {
-                    ui.label(egui::RichText::new(sel).size(15.0).strong());
-                } else {
+            let mut tab_select: Option<String> = None;
+            let mut tab_close: Option<String> = None;
+
+            if self.open_tabs.is_empty() {
+                ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Note").size(15.0).color(theme::WEAK));
-                }
-                if self.readonly {
-                    ui.separator();
-                    ui.colored_label(theme::WARN, "read-only");
-                }
-            });
-            ui.add_space(6.0);
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    let tab_action = tabs::show(
+                        ui,
+                        &self.open_tabs,
+                        self.selected.as_deref(),
+                        self.dirty,
+                    );
+                    tab_select = tab_action.select;
+                    tab_close = tab_action.close;
+                    if self.readonly {
+                        ui.add_space(8.0);
+                        ui.colored_label(theme::WARN, "read-only");
+                    }
+                });
+            }
+            ui.add_space(4.0);
             ui.separator();
             ui.add_space(8.0);
+
+            if let Some(path) = tab_select {
+                self.select_note(&path);
+            }
+            if let Some(path) = tab_close {
+                self.close_tab(&path);
+            }
 
             if self.selected.is_none() {
                 ui.centered_and_justified(|ui| {
