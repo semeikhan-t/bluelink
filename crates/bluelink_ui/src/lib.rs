@@ -1,6 +1,7 @@
 //! Shared egui UI for BlueLink (desktop + Android later).
 
 mod editor;
+mod editor_menu;
 mod preview;
 mod tabs;
 mod theme;

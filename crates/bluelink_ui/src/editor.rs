@@ -7,8 +7,39 @@ use bluelink_core::Vault;
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{FontFamily, FontId, Id, Key, Order, TextEdit, Ui};
 
+use crate::editor_menu::{self, EditorAction};
 use crate::preview;
 use crate::theme;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum PendingClipboard {
+    #[default]
+    None,
+    Cut,
+    Copy,
+    Paste,
+}
+
+impl PendingClipboard {
+    fn from_action(action: &EditorAction) -> Self {
+        match action {
+            EditorAction::Cut => Self::Cut,
+            EditorAction::Copy => Self::Copy,
+            EditorAction::Paste => Self::Paste,
+            _ => Self::None,
+        }
+    }
+
+    fn dispatch(self, ui: &Ui) {
+        let action = match self {
+            Self::None => return,
+            Self::Cut => EditorAction::Cut,
+            Self::Copy => EditorAction::Copy,
+            Self::Paste => EditorAction::Paste,
+        };
+        editor_menu::dispatch_clipboard(ui, &action);
+    }
+}
 
 pub struct LiveResult {
     pub changed: bool,
@@ -66,6 +97,8 @@ pub fn show_live(
     let mut merge_with_prev: Option<usize> = None;
     // After inserting a completed `[[link]]`, show it as preview (clickable).
     let mut leave_edit_after_wiki = false;
+    let mut request_select_all = false;
+    let mut pending_clipboard = PendingClipboard::None;
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -119,7 +152,7 @@ pub fn show_live(
                             response.request_focus();
                         }
 
-                        // Place cursor after merge-up / wiki insert.
+                        // Place cursor after merge-up / wiki insert / context-menu edit.
                         let cursor_key = egui::Id::new(("live_cursor", i));
                         if let Some(idx) = ui.ctx().data_mut(|d| d.remove_temp::<usize>(cursor_key)) {
                             let mut state = output.state.clone();
@@ -129,64 +162,119 @@ pub fn show_live(
                             state.store(ui.ctx(), row_id);
                         }
 
+                        // Deferred clipboard from preview-row / fill context menu.
+                        let clip_key = egui::Id::new("live_pending_clipboard");
+                        if response.has_focus() {
+                            let clip = ui.ctx().data_mut(|d| {
+                                d.remove_temp::<PendingClipboard>(clip_key)
+                                    .unwrap_or_default()
+                            });
+                            clip.dispatch(ui);
+                        }
+
                         let enter = ui.input(|inp| inp.key_pressed(Key::Enter));
                         let backspace = ui.input(|inp| inp.key_pressed(Key::Backspace));
                         let focused = response.has_focus() || response.lost_focus();
 
-                        let char_idx = output
+                        let (mut primary, secondary) = output
                             .cursor_range
-                            .map(|r| r.primary.ccursor.index)
-                            .unwrap_or_else(|| draft.chars().count());
+                            .map(|r| (r.primary.ccursor.index, r.secondary.ccursor.index))
+                            .unwrap_or_else(|| {
+                                let n = draft.chars().count();
+                                (n, n)
+                            });
+                        let has_selection = primary != secondary;
+
+                        let mut menu_action = None;
+                        response.context_menu(|ui| {
+                            menu_action = editor_menu::menu_ui(ui, has_selection);
+                        });
+                        if let Some(action) = menu_action.take() {
+                            match action {
+                                EditorAction::SelectAll => {
+                                    request_select_all = true;
+                                }
+                                EditorAction::Cut
+                                | EditorAction::Copy
+                                | EditorAction::Paste => {
+                                    response.request_focus();
+                                    editor_menu::dispatch_clipboard(ui, &action);
+                                }
+                                ref text_action => {
+                                    if let Some(caret) = editor_menu::apply_text_action(
+                                        &mut draft,
+                                        primary,
+                                        secondary,
+                                        text_action,
+                                    ) {
+                                        splice = Some((start, end, draft.clone()));
+                                        primary = caret;
+                                        response.request_focus();
+                                        let mut state = output.state.clone();
+                                        state.cursor.set_char_range(Some(
+                                            CCursorRange::one(CCursor::new(caret)),
+                                        ));
+                                        state.store(ui.ctx(), row_id);
+                                        ui.ctx().data_mut(|d| {
+                                            d.insert_temp(
+                                                egui::Id::new(("live_cursor", i)),
+                                                caret,
+                                            );
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
                         let byte_idx = draft
                             .char_indices()
-                            .nth(char_idx)
+                            .nth(primary)
                             .map(|(b, _)| b)
                             .unwrap_or(draft.len());
 
-                        // `[[query` autocomplete
+                        // Wiki autocomplete: keep popup interactive even after the click
+                        // steals TextEdit focus (otherwise picking a note does nothing).
                         let mut wiki_consumed_enter = false;
-                        if focused {
-                            if let Some((brack_at, query)) = open_wiki_query(&draft, byte_idx) {
-                                let candidates = wiki_candidates(&vault.index().note_paths(), &query);
-                                let mut picked: Option<String> = None;
-                                if !candidates.is_empty() {
-                                    egui::Area::new(Id::new(("wiki_ac", i)))
-                                        .order(Order::Foreground)
-                                        .fixed_pos(response.rect.left_bottom() + egui::vec2(0.0, 4.0))
-                                        .show(ui.ctx(), |ui| {
-                                            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                                ui.set_min_width(220.0);
-                                                ui.label(
-                                                    egui::RichText::new("Link to note")
-                                                        .size(12.0)
-                                                        .color(theme::WEAK),
-                                                );
-                                                for path in candidates.iter().take(12) {
-                                                    let label = path.trim_end_matches(".md");
-                                                    if ui
-                                                        .selectable_label(false, label)
-                                                        .clicked()
-                                                    {
-                                                        picked = Some(label.to_string());
-                                                    }
+                        if let Some((brack_at, query)) = open_wiki_query(&draft, byte_idx) {
+                            let candidates = wiki_candidates(&vault.index().note_paths(), &query);
+                            let mut picked: Option<String> = None;
+                            if !candidates.is_empty() {
+                                egui::Area::new(Id::new(("wiki_ac", i)))
+                                    .order(Order::Foreground)
+                                    .fixed_pos(response.rect.left_bottom() + egui::vec2(0.0, 4.0))
+                                    .show(ui.ctx(), |ui| {
+                                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                            ui.set_min_width(220.0);
+                                            ui.label(
+                                                egui::RichText::new("Link to note")
+                                                    .size(12.0)
+                                                    .color(theme::WEAK),
+                                            );
+                                            for path in candidates.iter().take(12) {
+                                                let label = path.trim_end_matches(".md");
+                                                if ui
+                                                    .selectable_label(false, label)
+                                                    .clicked()
+                                                {
+                                                    picked = Some(label.to_string());
                                                 }
-                                            });
+                                            }
                                         });
-                                    if enter {
-                                        picked = Some(
-                                            candidates[0].trim_end_matches(".md").to_string(),
-                                        );
-                                        wiki_consumed_enter = true;
-                                    }
+                                    });
+                                if enter && focused {
+                                    picked = Some(
+                                        candidates[0].trim_end_matches(".md").to_string(),
+                                    );
+                                    wiki_consumed_enter = true;
                                 }
-                                if let Some(name) = picked {
-                                    let prefix = &draft[..brack_at];
-                                    let suffix = &draft[byte_idx..];
-                                    let inserted = format!("{prefix}[[{name}]]{suffix}");
-                                    splice = Some((start, end, inserted));
-                                    // Drop raw edit so the link renders as a clickable preview.
-                                    leave_edit_after_wiki = true;
-                                }
+                            }
+                            if let Some(name) = picked {
+                                let prefix = &draft[..brack_at];
+                                let suffix = &draft[byte_idx..];
+                                let inserted = format!("{prefix}[[{name}]]{suffix}");
+                                splice = Some((start, end, inserted));
+                                // Drop raw edit so the link renders as a clickable preview.
+                                leave_edit_after_wiki = true;
                             }
                         }
 
@@ -227,17 +315,58 @@ pub fn show_live(
                             merge_with_prev = Some(i);
                         }
                     } else {
-                        let click = ui
-                            .allocate_ui_with_layout(
-                                egui::vec2(ui.available_width(), 0.0),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    ui.set_min_width(ui.available_width());
-                                    ui.set_min_height(22.0);
-                                    preview::render_line(ui, vault, &line)
-                                },
-                            )
-                            .inner;
+                        let row = ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.set_min_height(22.0);
+                                preview::render_line(ui, vault, &line)
+                            },
+                        );
+                        let click = row.inner;
+
+                        if !readonly {
+                            let mut menu_action = None;
+                            row.response.context_menu(|ui| {
+                                menu_action = editor_menu::menu_ui(ui, false);
+                            });
+                            if let Some(action) = menu_action.take() {
+                                request_active = Some(i);
+                                ui.ctx().data_mut(|d| {
+                                    d.insert_temp(egui::Id::new(("live_focus", i)), true);
+                                });
+                                match action {
+                                    EditorAction::SelectAll => {
+                                        request_select_all = true;
+                                    }
+                                    EditorAction::Cut
+                                    | EditorAction::Copy
+                                    | EditorAction::Paste => {
+                                        pending_clipboard =
+                                            PendingClipboard::from_action(&action);
+                                    }
+                                    ref text_action => {
+                                        let mut draft = line.clone();
+                                        let n = draft.chars().count();
+                                        if let Some(caret) = editor_menu::apply_text_action(
+                                            &mut draft,
+                                            n,
+                                            n,
+                                            text_action,
+                                        ) {
+                                            splice = Some((start, end, draft));
+                                            ui.ctx().data_mut(|d| {
+                                                d.insert_temp(
+                                                    egui::Id::new(("live_cursor", i)),
+                                                    caret,
+                                                );
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         match click {
                             preview::LineClick::Wiki(raw) => {
@@ -261,7 +390,52 @@ pub fn show_live(
                     egui::vec2(ui.available_width(), fill_h),
                     egui::Sense::click(),
                 );
-                if resp.clicked() {
+                let mut menu_action = None;
+                resp.context_menu(|ui| {
+                    menu_action = editor_menu::menu_ui(ui, false);
+                });
+                if let Some(action) = menu_action.take() {
+                    let last = ranges.len().saturating_sub(1);
+                    request_active = Some(last);
+                    let end_chars = ranges
+                        .get(last)
+                        .and_then(|&(s, e)| buffer.get(s..e))
+                        .map(|t| t.chars().count())
+                        .unwrap_or(0);
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new(("live_focus", last)), true);
+                        d.insert_temp(egui::Id::new(("live_cursor", last)), end_chars);
+                    });
+                    match action {
+                        EditorAction::SelectAll => {
+                            request_select_all = true;
+                        }
+                        EditorAction::Cut | EditorAction::Copy | EditorAction::Paste => {
+                            pending_clipboard = PendingClipboard::from_action(&action);
+                        }
+                        ref text_action => {
+                            if let Some(&(s, e)) = ranges.get(last) {
+                                let mut draft =
+                                    buffer.get(s..e).unwrap_or("").to_string();
+                                let n = draft.chars().count();
+                                if let Some(caret) = editor_menu::apply_text_action(
+                                    &mut draft,
+                                    n,
+                                    n,
+                                    text_action,
+                                ) {
+                                    splice = Some((s, e, draft));
+                                    ui.ctx().data_mut(|d| {
+                                        d.insert_temp(
+                                            egui::Id::new(("live_cursor", last)),
+                                            caret,
+                                        );
+                                    });
+                                }
+                            }
+                        }
+                    }
+                } else if resp.clicked() {
                     let last = ranges.len().saturating_sub(1);
                     request_active = Some(last);
                     let end_chars = ranges
@@ -278,7 +452,7 @@ pub fn show_live(
         });
 
     // ↑/↓ move the active raw line (commit edits via splice above first).
-    if !readonly && request_active.is_none() {
+    if !readonly && request_active.is_none() && !request_select_all {
         let (up, down) = ui.input(|i| {
             let no_chord = !i.modifiers.command && !i.modifiers.alt && !i.modifiers.shift;
             (
@@ -296,6 +470,12 @@ pub fn show_live(
                 _ => None,
             };
         }
+    }
+
+    if pending_clipboard != PendingClipboard::None {
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(egui::Id::new("live_pending_clipboard"), pending_clipboard);
+        });
     }
 
     if let Some(i) = request_active {
@@ -338,6 +518,13 @@ pub fn show_live(
         }
     }
 
+    if request_select_all {
+        *doc_edit = true;
+        *active_line = None;
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new("live_select_all"), true));
+    }
+
     result
 }
 
@@ -375,6 +562,8 @@ fn show_doc_edit(
                     .margin(egui::Margin::ZERO)
                     .show(ui);
 
+                let response = output.response;
+
                 let select_all = ui.ctx().data_mut(|d| {
                     let v = d
                         .get_temp::<bool>(egui::Id::new("live_select_all"))
@@ -387,15 +576,64 @@ fn show_doc_edit(
 
                 if select_all {
                     let end = CCursor::new(buffer.chars().count());
-                    let mut state = output.state;
+                    let mut state = output.state.clone();
                     state
                         .cursor
                         .set_char_range(Some(CCursorRange::two(CCursor::new(0), end)));
                     state.store(ui.ctx(), id);
-                    output.response.request_focus();
+                    response.request_focus();
                 }
 
-                if output.response.changed() {
+                let (primary, secondary) = output
+                    .cursor_range
+                    .map(|r| (r.primary.ccursor.index, r.secondary.ccursor.index))
+                    .unwrap_or_else(|| {
+                        let n = buffer.chars().count();
+                        (n, n)
+                    });
+                let has_selection = primary != secondary;
+
+                let mut menu_action = None;
+                response.context_menu(|ui| {
+                    menu_action = editor_menu::menu_ui(ui, has_selection);
+                });
+                if let Some(action) = menu_action.take() {
+                    match action {
+                        EditorAction::SelectAll => {
+                            let end = CCursor::new(buffer.chars().count());
+                            let mut state = output.state.clone();
+                            state
+                                .cursor
+                                .set_char_range(Some(CCursorRange::two(CCursor::new(0), end)));
+                            state.store(ui.ctx(), id);
+                            response.request_focus();
+                        }
+                        EditorAction::Cut
+                        | EditorAction::Copy
+                        | EditorAction::Paste => {
+                            response.request_focus();
+                            editor_menu::dispatch_clipboard(ui, &action);
+                        }
+                        ref text_action => {
+                            if let Some(caret) = editor_menu::apply_text_action(
+                                buffer,
+                                primary,
+                                secondary,
+                                text_action,
+                            ) {
+                                let mut state = output.state.clone();
+                                state
+                                    .cursor
+                                    .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
+                                state.store(ui.ctx(), id);
+                                response.request_focus();
+                                result.changed = true;
+                            }
+                        }
+                    }
+                }
+
+                if response.changed() {
                     result.changed = true;
                 }
             });
