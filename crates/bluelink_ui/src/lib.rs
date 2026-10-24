@@ -416,6 +416,45 @@ impl App {
         }
     }
 
+    /// Next free `untitled.md` / `untitled1.md` / `untitled2.md` …
+    fn next_untitled_rel(&self) -> String {
+        let taken = |stem: &str| {
+            let path = format!("{stem}.md");
+            self.notes.iter().any(|n| n.rel_path == path)
+                || self.open_tabs.iter().any(|t| t == &path)
+        };
+        if !taken("untitled") {
+            return "untitled.md".into();
+        }
+        for i in 1..10_000 {
+            let stem = format!("untitled{i}");
+            if !taken(&stem) {
+                return format!("{stem}.md");
+            }
+        }
+        "untitled.md".into()
+    }
+
+    /// Ctrl+T: create untitled note and open it in a new tab (no name dialog).
+    fn create_untitled_tab(&mut self) {
+        let path = self.next_untitled_rel();
+        let title = path.trim_end_matches(".md");
+        if self.dirty {
+            self.save_current();
+        }
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
+        match vault.write(&path, &format!("# {title}\n")) {
+            Ok(_) => {
+                self.refresh_notes();
+                self.open_note_in_new_tab(&path);
+                self.status = format!("created {path}");
+            }
+            Err(e) => self.status = format!("create failed: {e}"),
+        }
+    }
+
     fn rename_path(&mut self, from: &str, new_name: &str) {
         if self.folders.iter().any(|f| f == from) {
             let to = new_name.trim().trim_matches('/').to_string();
@@ -871,9 +910,7 @@ impl eframe::App for App {
             self.save_current();
         }
         if new_note && self.vault.is_some() && self.dialog.is_none() {
-            self.dialog = Some(Dialog::NewNote {
-                name: "untitled".into(),
-            });
+            self.create_untitled_tab();
         }
         if close_tab {
             if let Some(path) = self.selected.clone() {
