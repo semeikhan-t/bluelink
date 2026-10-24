@@ -1,5 +1,5 @@
 use bluelink_core::{parse_preview, split_wikilinks, PreviewBlock, Span, Vault};
-use egui::{FontFamily, FontId, RichText, Sense, Ui};
+use egui::{Color32, CursorIcon, FontFamily, FontId, RichText, Sense, Ui};
 
 use crate::theme;
 
@@ -222,21 +222,46 @@ fn render_one_span(
                 .as_deref()
                 .unwrap_or_else(|| raw.split('|').next().unwrap_or(raw));
             let resolved = vault.index().resolve(raw);
-            let color = if resolved.is_some() {
+            let base = if resolved.is_some() {
                 theme::ACCENT
             } else {
                 theme::WARN
             };
-            let rich = if heading {
-                theme::heading_rich(label, level).color(color).underline()
+
+            let font = if heading {
+                FontId::new(theme::heading_size(level), theme::heading_family(level))
             } else {
-                RichText::new(label).size(size).color(color).underline()
+                FontId::new(size, FontFamily::Proportional)
             };
-            let response = ui.add(egui::Label::new(rich).sense(Sense::click()));
-            response.clone().on_hover_text(match &resolved {
-                Some(p) => format!("Open {p}"),
-                None => format!("Create {target}"),
-            });
+            // Measure with a placeholder color; final color depends on hover.
+            let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font.clone(), base));
+            let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::click());
+            let hovered = response.hovered();
+            let color = if hovered { lighten(base) } else { base };
+
+            if hovered {
+                ui.painter().rect_filled(
+                    rect.expand2(egui::vec2(3.0, 1.5)),
+                    3.0,
+                    Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 40),
+                );
+            }
+            let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font, color));
+            ui.painter().galley(rect.min, galley, color);
+            let underline_y = rect.bottom() - 1.0;
+            ui.painter().hline(
+                rect.left()..=rect.right(),
+                underline_y,
+                egui::Stroke::new(if hovered { 1.5_f32 } else { 1.0_f32 }, color),
+            );
+
+            response
+                .clone()
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(match &resolved {
+                    Some(p) => format!("Open {p}"),
+                    None => format!("Create {target}"),
+                });
             if response.clicked() {
                 LineClick::Wiki(raw.clone())
             } else {
@@ -244,4 +269,12 @@ fn render_one_span(
             }
         }
     }
+}
+
+fn lighten(c: Color32) -> Color32 {
+    Color32::from_rgb(
+        c.r().saturating_add(48),
+        c.g().saturating_add(48),
+        c.b().saturating_add(36),
+    )
 }
