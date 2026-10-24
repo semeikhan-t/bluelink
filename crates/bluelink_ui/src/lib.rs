@@ -37,16 +37,30 @@ enum UndoItem {
 /// Folder picker supplied by the host (desktop uses `rfd`).
 pub type FolderPicker = Box<dyn FnMut() -> Option<PathBuf> + Send>;
 
+/// One editor tab with its own back/forward history.
+struct OpenTab {
+    path: String,
+    history: Vec<String>,
+    history_index: usize,
+}
+
+impl OpenTab {
+    fn new(path: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            history: vec![path.to_string()],
+            history_index: 0,
+        }
+    }
+}
+
 pub struct App {
     vault: Option<Vault>,
     notes: Vec<NoteMeta>,
     /// Relative folder paths (including empty).
     folders: Vec<String>,
     /// Open note tabs (browser-style), active = `selected`.
-    open_tabs: Vec<String>,
-    /// Browser-style note navigation history.
-    nav_history: Vec<String>,
-    nav_index: usize,
+    open_tabs: Vec<OpenTab>,
     selected: Option<String>,
     buffer: String,
     dirty: bool,
@@ -86,8 +100,6 @@ impl App {
             notes: Vec::new(),
             folders: Vec::new(),
             open_tabs: Vec::new(),
-            nav_history: Vec::new(),
-            nav_index: 0,
             selected: None,
             buffer: String::new(),
             dirty: false,
@@ -143,8 +155,6 @@ impl App {
                 let _ = self.registry.save();
                 self.vault = Some(vault);
                 self.open_tabs.clear();
-                self.nav_history.clear();
-                self.nav_index = 0;
                 self.undo_stack.clear();
                 self.selected = None;
                 self.buffer.clear();
@@ -160,8 +170,6 @@ impl App {
                 self.vault = None;
                 self.folders.clear();
                 self.open_tabs.clear();
-                self.nav_history.clear();
-                self.nav_index = 0;
                 self.undo_stack.clear();
             }
         }
@@ -175,8 +183,6 @@ impl App {
         self.notes.clear();
         self.folders.clear();
         self.open_tabs.clear();
-        self.nav_history.clear();
-        self.nav_index = 0;
         self.undo_stack.clear();
         self.selected = None;
         self.buffer.clear();
@@ -275,6 +281,15 @@ impl App {
         }
     }
 
+    fn tab_paths(&self) -> Vec<String> {
+        self.open_tabs.iter().map(|t| t.path.clone()).collect()
+    }
+
+    fn active_tab_index(&self) -> Option<usize> {
+        let sel = self.selected.as_deref()?;
+        self.open_tabs.iter().position(|t| t.path == sel)
+    }
+
     /// Open a note in the current tab (replace), or switch to it if already open.
     fn select_note(&mut self, rel_path: &str) {
         self.open_note(rel_path, false, true);
@@ -286,30 +301,40 @@ impl App {
     }
 
     fn open_note(&mut self, rel_path: &str, new_tab: bool, record_history: bool) {
-        let already_open = self.open_tabs.iter().any(|t| t == rel_path);
+        let already_open = self.open_tabs.iter().any(|t| t.path == rel_path);
         if already_open {
             // Just focus the existing tab.
         } else if new_tab {
-            self.open_tabs.push(rel_path.to_string());
+            self.open_tabs.push(OpenTab::new(rel_path));
         } else if let Some(cur) = self.selected.clone() {
-            // In-place: replace the active tab's path.
-            if let Some(slot) = self.open_tabs.iter_mut().find(|t| t.as_str() == cur) {
-                *slot = rel_path.to_string();
+            // In-place: replace the active tab's path; keep its history stack.
+            if let Some(tab) = self.open_tabs.iter_mut().find(|t| t.path == cur) {
+                tab.path = rel_path.to_string();
             } else {
-                self.open_tabs.push(rel_path.to_string());
+                self.open_tabs.push(OpenTab::new(rel_path));
             }
         } else {
-            self.open_tabs.push(rel_path.to_string());
+            self.open_tabs.push(OpenTab::new(rel_path));
         }
 
         if self.selected.as_deref() == Some(rel_path) {
             return;
         }
+        if !self.load_note_content(rel_path) {
+            return;
+        }
+        if record_history {
+            self.record_nav(rel_path);
+        }
+    }
+
+    /// Load buffer/selection for `rel_path`. Returns false if the note could not be read.
+    fn load_note_content(&mut self, rel_path: &str) -> bool {
         if self.dirty {
             self.save_current();
         }
         let Some(vault) = &self.vault else {
-            return;
+            return false;
         };
         match vault.read(rel_path) {
             Ok(text) => {
@@ -326,9 +351,7 @@ impl App {
                     .find(|n| n.rel_path == rel_path)
                     .map(|n| n.sha256.clone());
                 self.status.clear();
-                if record_history {
-                    self.record_nav(rel_path);
-                }
+                true
             }
             Err(VaultError::NotUtf8) => {
                 self.buffer.clear();
@@ -340,52 +363,64 @@ impl App {
                 self.selected = Some(rel_path.to_string());
                 self.selected_sha = None;
                 self.status = "note is not UTF-8 (read-only)".into();
-                if record_history {
-                    self.record_nav(rel_path);
-                }
+                true
             }
             Err(e) => {
                 self.status = format!("read failed: {e}");
+                false
             }
         }
     }
 
     fn record_nav(&mut self, path: &str) {
-        if self.nav_history.get(self.nav_index).map(String::as_str) == Some(path) {
+        let Some(tab) = self.open_tabs.iter_mut().find(|t| t.path == path) else {
+            return;
+        };
+        if tab.history.get(tab.history_index).map(String::as_str) == Some(path) {
             return;
         }
-        if !self.nav_history.is_empty() {
-            self.nav_history.truncate(self.nav_index.saturating_add(1));
-        }
-        self.nav_history.push(path.to_string());
-        self.nav_index = self.nav_history.len() - 1;
+        tab.history.truncate(tab.history_index.saturating_add(1));
+        tab.history.push(path.to_string());
+        tab.history_index = tab.history.len() - 1;
     }
 
     fn can_go_back(&self) -> bool {
-        self.nav_index > 0
+        self.active_tab_index()
+            .is_some_and(|i| self.open_tabs[i].history_index > 0)
     }
 
     fn can_go_forward(&self) -> bool {
-        !self.nav_history.is_empty() && self.nav_index + 1 < self.nav_history.len()
+        self.active_tab_index().is_some_and(|i| {
+            let tab = &self.open_tabs[i];
+            tab.history_index + 1 < tab.history.len()
+        })
     }
 
     fn go_back(&mut self) {
-        while self.nav_index > 0 {
-            self.nav_index -= 1;
-            let path = self.nav_history[self.nav_index].clone();
+        let Some(tab_i) = self.active_tab_index() else {
+            return;
+        };
+        while self.open_tabs[tab_i].history_index > 0 {
+            self.open_tabs[tab_i].history_index -= 1;
+            let path = self.open_tabs[tab_i].history[self.open_tabs[tab_i].history_index].clone();
             if self.notes.iter().any(|n| n.rel_path == path) {
-                self.open_note(&path, false, false);
+                self.open_tabs[tab_i].path = path.clone();
+                let _ = self.load_note_content(&path);
                 return;
             }
         }
     }
 
     fn go_forward(&mut self) {
-        while self.nav_index + 1 < self.nav_history.len() {
-            self.nav_index += 1;
-            let path = self.nav_history[self.nav_index].clone();
+        let Some(tab_i) = self.active_tab_index() else {
+            return;
+        };
+        while self.open_tabs[tab_i].history_index + 1 < self.open_tabs[tab_i].history.len() {
+            self.open_tabs[tab_i].history_index += 1;
+            let path = self.open_tabs[tab_i].history[self.open_tabs[tab_i].history_index].clone();
             if self.notes.iter().any(|n| n.rel_path == path) {
-                self.open_note(&path, false, false);
+                self.open_tabs[tab_i].path = path.clone();
+                let _ = self.load_note_content(&path);
                 return;
             }
         }
@@ -426,20 +461,16 @@ impl App {
         if self.open_tabs.len() < 2 {
             return;
         }
-        let idx = self
-            .selected
-            .as_ref()
-            .and_then(|s| self.open_tabs.iter().position(|t| t == s))
-            .unwrap_or(0);
+        let idx = self.active_tab_index().unwrap_or(0);
         let next = (idx + 1) % self.open_tabs.len();
-        let path = self.open_tabs[next].clone();
+        let path = self.open_tabs[next].path.clone();
         self.select_note(&path);
     }
 
     fn close_tab(&mut self, path: &str) {
-        let idx = self.open_tabs.iter().position(|t| t == path);
+        let idx = self.open_tabs.iter().position(|t| t.path == path);
         let was_active = self.selected.as_deref() == Some(path);
-        self.open_tabs.retain(|t| t != path);
+        self.open_tabs.retain(|t| t.path != path);
         if !was_active {
             return;
         }
@@ -448,9 +479,9 @@ impl App {
         }
         let next = idx.and_then(|i| {
             if i < self.open_tabs.len() {
-                Some(self.open_tabs[i].clone())
+                Some(self.open_tabs[i].path.clone())
             } else {
-                self.open_tabs.last().cloned()
+                self.open_tabs.last().map(|t| t.path.clone())
             }
         });
         self.selected = None;
@@ -467,8 +498,13 @@ impl App {
 
     fn retarget_tab(&mut self, from: &str, to: &str) {
         for tab in &mut self.open_tabs {
-            if tab == from {
-                *tab = to.to_string();
+            if tab.path == from {
+                tab.path = to.to_string();
+            }
+            for entry in &mut tab.history {
+                if entry == from {
+                    *entry = to.to_string();
+                }
             }
         }
     }
@@ -476,7 +512,7 @@ impl App {
     fn drop_tabs_with_prefix(&mut self, prefix: &str) {
         let p = format!("{prefix}/");
         self.open_tabs
-            .retain(|t| t != prefix && !t.starts_with(&p));
+            .retain(|t| t.path != prefix && !t.path.starts_with(&p));
     }
 
     fn handle_wikilink(&mut self, raw: &str) {
@@ -524,7 +560,7 @@ impl App {
         let taken = |stem: &str| {
             let path = format!("{stem}.md");
             self.notes.iter().any(|n| n.rel_path == path)
-                || self.open_tabs.iter().any(|t| t == &path)
+                || self.open_tabs.iter().any(|t| t.path == path)
         };
         if !taken("untitled") {
             return "untitled.md".into();
@@ -572,8 +608,13 @@ impl App {
                     let prefix = format!("{from}/");
                     let new_prefix = format!("{to}/");
                     for tab in &mut self.open_tabs {
-                        if let Some(rest) = tab.strip_prefix(&prefix) {
-                            *tab = format!("{new_prefix}{rest}");
+                        if let Some(rest) = tab.path.strip_prefix(&prefix) {
+                            tab.path = format!("{new_prefix}{rest}");
+                        }
+                        for entry in &mut tab.history {
+                            if let Some(rest) = entry.strip_prefix(&prefix) {
+                                *entry = format!("{new_prefix}{rest}");
+                            }
                         }
                     }
                     let selected_was_inside = self
@@ -668,7 +709,7 @@ impl App {
                         self.selected_sha = None;
                         self.active_line = None;
                         self.doc_edit = false;
-                        if let Some(path) = self.open_tabs.first().cloned() {
+                        if let Some(path) = self.open_tabs.first().map(|t| t.path.clone()) {
                             self.select_note(&path);
                         }
                     }
@@ -705,8 +746,8 @@ impl App {
                     content,
                 });
                 let was_active = self.selected.as_deref() == Some(rel);
-                let idx = self.open_tabs.iter().position(|t| t == rel);
-                self.open_tabs.retain(|t| t != rel);
+                let idx = self.open_tabs.iter().position(|t| t.path == rel);
+                self.open_tabs.retain(|t| t.path != rel);
                 if was_active {
                     self.selected = None;
                     self.buffer.clear();
@@ -717,9 +758,9 @@ impl App {
                     self.doc_edit = false;
                     let next = idx.and_then(|i| {
                         if i < self.open_tabs.len() {
-                            Some(self.open_tabs[i].clone())
+                            Some(self.open_tabs[i].path.clone())
                         } else {
-                            self.open_tabs.last().cloned()
+                            self.open_tabs.last().map(|t| t.path.clone())
                         }
                     });
                     if let Some(path) = next {
@@ -1352,12 +1393,9 @@ impl eframe::App for App {
                 if self.open_tabs.is_empty() {
                     ui.label(egui::RichText::new("Note").size(15.0).color(theme::WEAK));
                 } else {
-                    let tab_action = tabs::show(
-                        ui,
-                        &self.open_tabs,
-                        self.selected.as_deref(),
-                        self.dirty,
-                    );
+                    let paths = self.tab_paths();
+                    let tab_action =
+                        tabs::show(ui, &paths, self.selected.as_deref(), self.dirty);
                     tab_select = tab_action.select;
                     tab_close = tab_action.close;
                 }
