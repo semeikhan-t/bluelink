@@ -100,18 +100,22 @@ fn tab_chip(
             egui::pos2(rect.left(), rect.top()),
             egui::pos2(rect.right(), rule_y + 1.0),
         );
-        ui.painter().rect_filled(body, theme::round(), theme::BG);
-        ui.painter().hline(
-            body.x_range().shrink(12.0),
-            body.top() + 3.0,
-            Stroke::new(2.0_f32, theme::ACCENT),
+        // Same stroke as the document top rule: top + sides, open bottom into the editor.
+        let edge = Stroke::new(1.0_f32, theme::STROKE);
+        ui.painter().rect(
+            body,
+            theme::round(),
+            theme::BG,
+            edge,
+            egui::StrokeKind::Inside,
         );
-        // Cover the strip rule so the active tab merges into the editor.
-        ui.painter().hline(
-            body.x_range().shrink(2.0),
-            rule_y,
-            Stroke::new(2.5_f32, theme::BG),
+        // Erase bottom edge so the tab merges with the content plane.
+        let seal = egui::Rect::from_min_max(
+            egui::pos2(body.left() + 1.0, rule_y - 2.0),
+            egui::pos2(body.right() - 1.0, body.bottom() + 1.0),
         );
+        ui.painter()
+            .rect_filled(seal, egui::CornerRadius::ZERO, theme::BG);
     } else if hovered {
         ui.painter().rect_filled(
             rect.shrink2(egui::vec2(0.0, 3.0)),
