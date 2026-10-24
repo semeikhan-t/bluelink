@@ -101,14 +101,16 @@ fn tab_chip(
             egui::pos2(rect.right(), rule_y + 1.0),
         );
         // Same stroke as the document top rule: top + sides, open bottom into the editor.
+        // Square bottom corners so the tab meets the content plane cleanly.
+        let rounding = egui::CornerRadius {
+            nw: theme::ROUND,
+            ne: theme::ROUND,
+            sw: 0,
+            se: 0,
+        };
         let edge = Stroke::new(1.0_f32, theme::STROKE);
-        ui.painter().rect(
-            body,
-            theme::round(),
-            theme::BG,
-            edge,
-            egui::StrokeKind::Inside,
-        );
+        ui.painter()
+            .rect(body, rounding, theme::BG, edge, egui::StrokeKind::Inside);
         // Erase bottom edge so the tab merges with the content plane.
         let seal = egui::Rect::from_min_max(
             egui::pos2(body.left() + 1.0, rule_y - 2.0),
