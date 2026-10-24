@@ -28,6 +28,9 @@ pub enum Span {
 }
 
 /// Parse markdown into a preview document. Wikilinks `[[...]]` become `Span::WikiLink`.
+///
+/// Note: pulldown-cmark emits `[[Note]]` as separate Text events (`[`, `[`, `Note`, `]`, `]`),
+/// so plain text is buffered and run through [`split_wikilinks`] before being pushed as spans.
 pub fn parse_preview(input: &str) -> PreviewDoc {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -50,14 +53,53 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
 
     let mut strong_buf: Option<String> = None;
     let mut em_buf: Option<String> = None;
+    let mut pending_link_dest: Option<String> = None;
+
+    // Coalesce fragmented Text events so `[[wikilinks]]` can be detected.
+    let mut pending_text = String::new();
+
+    let flush_text = |pending: &mut String,
+                      para: &mut Option<Vec<Span>>,
+                      quote: &mut Option<Vec<Span>>,
+                      item: &mut Option<Vec<Span>>,
+                      heading: &mut String,
+                      in_heading: bool| {
+        if pending.is_empty() {
+            return;
+        }
+        let text = std::mem::take(pending);
+        if in_heading {
+            heading.push_str(&text);
+            return;
+        }
+        for piece in split_wikilinks(&text) {
+            push_span(para, quote, item, heading, false, piece);
+        }
+    };
 
     for event in parser {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    false,
+                );
                 heading_level = Some(level as u8);
                 heading_text.clear();
             }
             Event::End(TagEnd::Heading(_)) => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    true,
+                );
                 if let Some(level) = heading_level.take() {
                     blocks.push(PreviewBlock::Heading {
                         level,
@@ -66,6 +108,14 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
                 }
             }
             Event::Start(Tag::Paragraph) => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    heading_level.is_some(),
+                );
                 if quote_spans.is_some() {
                     // paragraph inside quote — reuse quote buffer
                 } else {
@@ -73,14 +123,38 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
                 }
             }
             Event::End(TagEnd::Paragraph) => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    false,
+                );
                 if let Some(spans) = para_spans.take() {
                     blocks.push(PreviewBlock::Paragraph { spans });
                 }
             }
             Event::Start(Tag::BlockQuote(_)) => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    false,
+                );
                 quote_spans = Some(Vec::new());
             }
             Event::End(TagEnd::BlockQuote(_)) => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    false,
+                );
                 if let Some(spans) = quote_spans.take() {
                     blocks.push(PreviewBlock::Quote { spans });
                 }
@@ -92,6 +166,14 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
                 next_ordered = None;
             }
             Event::Start(Tag::Item) => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    false,
+                );
                 list_item_spans = Some(Vec::new());
                 list_item_number = next_ordered;
                 if let Some(n) = next_ordered.as_mut() {
@@ -99,6 +181,14 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
                 }
             }
             Event::End(TagEnd::Item) => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    false,
+                );
                 if let Some(spans) = list_item_spans.take() {
                     if let Some(number) = list_item_number.take() {
                         blocks.push(PreviewBlock::NumberedItem { number, spans });
@@ -108,6 +198,14 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
                 }
             }
             Event::Start(Tag::CodeBlock(kind)) => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    heading_level.is_some(),
+                );
                 in_code = true;
                 code_buf.clear();
                 code_lang = match kind {
@@ -128,8 +226,28 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
                     code: std::mem::take(&mut code_buf),
                 });
             }
-            Event::Rule => blocks.push(PreviewBlock::ThematicBreak),
-            Event::Start(Tag::Strong) => strong_buf = Some(String::new()),
+            Event::Rule => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    false,
+                );
+                blocks.push(PreviewBlock::ThematicBreak);
+            }
+            Event::Start(Tag::Strong) => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    heading_level.is_some(),
+                );
+                strong_buf = Some(String::new());
+            }
             Event::End(TagEnd::Strong) => {
                 if let Some(text) = strong_buf.take() {
                     push_span(
@@ -142,7 +260,17 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
                     );
                 }
             }
-            Event::Start(Tag::Emphasis) => em_buf = Some(String::new()),
+            Event::Start(Tag::Emphasis) => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    heading_level.is_some(),
+                );
+                em_buf = Some(String::new());
+            }
             Event::End(TagEnd::Emphasis) => {
                 if let Some(text) = em_buf.take() {
                     push_span(
@@ -156,6 +284,14 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
                 }
             }
             Event::Code(code) => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    heading_level.is_some(),
+                );
                 push_span(
                     &mut para_spans,
                     &mut quote_spans,
@@ -166,15 +302,19 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
                 );
             }
             Event::Start(Tag::Link { dest_url, .. }) => {
-                // Collect link text via subsequent Text events into strong/em style buffer reuse:
-                // use strong_buf as temporary link text accumulator keyed by dest in a side channel.
-                // Simpler: append as Text for now and rewrite — keep dest in em_buf slot via pair.
-                let _ = dest_url;
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    heading_level.is_some(),
+                );
+                pending_link_dest = Some(dest_url.into_string());
                 strong_buf = Some(String::new());
             }
             Event::End(TagEnd::Link) => {
-                // Link without capturing dest properly — handled via Text below as plain.
-                // Upgrade: store pending link dest.
+                let dest = pending_link_dest.take().unwrap_or_default();
                 if let Some(text) = strong_buf.take() {
                     push_span(
                         &mut para_spans,
@@ -182,7 +322,7 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
                         &mut list_item_spans,
                         &mut heading_text,
                         heading_level.is_some(),
-                        Span::Text(text),
+                        Span::Link { text, dest },
                     );
                 }
             }
@@ -192,38 +332,33 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
                     code_buf.push_str(&s);
                 } else if let Some(buf) = strong_buf.as_mut().or(em_buf.as_mut()) {
                     buf.push_str(&s);
-                } else if heading_level.is_some() {
-                    heading_text.push_str(&s);
                 } else {
-                    for piece in split_wikilinks(&s) {
-                        push_span(
-                            &mut para_spans,
-                            &mut quote_spans,
-                            &mut list_item_spans,
-                            &mut heading_text,
-                            false,
-                            piece,
-                        );
-                    }
+                    pending_text.push_str(&s);
                 }
             }
             Event::SoftBreak | Event::HardBreak => {
-                if heading_level.is_some() {
-                    heading_text.push(' ');
+                if heading_level.is_some() || strong_buf.is_some() || em_buf.is_some() {
+                    if let Some(buf) = strong_buf.as_mut().or(em_buf.as_mut()) {
+                        buf.push(' ');
+                    } else {
+                        pending_text.push(' ');
+                    }
                 } else {
-                    push_span(
-                        &mut para_spans,
-                        &mut quote_spans,
-                        &mut list_item_spans,
-                        &mut heading_text,
-                        false,
-                        Span::Text("\n".into()),
-                    );
+                    pending_text.push('\n');
                 }
             }
             _ => {}
         }
     }
+
+    flush_text(
+        &mut pending_text,
+        &mut para_spans,
+        &mut quote_spans,
+        &mut list_item_spans,
+        &mut heading_text,
+        heading_level.is_some(),
+    );
 
     PreviewDoc { blocks }
 }
@@ -313,5 +448,36 @@ mod tests {
             .blocks
             .iter()
             .any(|b| matches!(b, PreviewBlock::CodeBlock { .. })));
+    }
+
+    #[test]
+    fn parses_wikilink_despite_fragmented_text_events() {
+        let doc = parse_preview("see [[Hello]] now");
+        let spans = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                PreviewBlock::Paragraph { spans } => Some(spans.clone()),
+                _ => None,
+            })
+            .expect("paragraph");
+        assert!(
+            spans
+                .iter()
+                .any(|s| matches!(s, Span::WikiLink { raw, .. } if raw == "Hello")),
+            "spans={spans:?}"
+        );
+    }
+
+    #[test]
+    fn parses_lone_wikilink() {
+        let doc = parse_preview("[[Hello]]");
+        let has = doc.blocks.iter().any(|b| match b {
+            PreviewBlock::Paragraph { spans } => spans
+                .iter()
+                .any(|s| matches!(s, Span::WikiLink { raw, .. } if raw == "Hello")),
+            _ => false,
+        });
+        assert!(has, "blocks={:?}", doc.blocks);
     }
 }
