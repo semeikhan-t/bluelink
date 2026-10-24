@@ -1,0 +1,21 @@
+[package]
+name = "bluelink_ble"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+bluez = ["dep:bluer", "dep:tokio", "dep:async-trait", "dep:futures", "dep:bluelink_sync"]
+
+[dependencies]
+thiserror = { workspace = true }
+bluelink_sync = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+futures = { version = "0.3", optional = true }
+bluer = { version = "0.17", features = ["bluetoothd"], optional = true }
+
+[[example]]
+name = "peripheral"
+required-features = ["bluez"]

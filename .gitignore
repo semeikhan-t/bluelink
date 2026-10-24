@@ -8,6 +8,9 @@ local.properties
 *.apk
 *.aab
 
+# Verification Ladder (operational evidence, not source)
+.verification/
+
 # Editors / OS
 .idea/
 .vscode/

@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bluelink_core",
+    "crates/bluelink_sync",
+    "crates/bluelink_ble",
+    "crates/bluelink_ui",
+    "apps/desktop",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+bluelink_core = { path = "crates/bluelink_core" }
+bluelink_ui = { path = "crates/bluelink_ui" }
+bluelink_sync = { path = "crates/bluelink_sync" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+pulldown-cmark = { version = "0.13", default-features = false }
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+getrandom = "0.2"
+tempfile = "3"
+eframe = "0.31"
+egui = "0.31"
+egui-phosphor = "0.9"
+rfd = "0.15"
+notify = "7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "signal"] }
+async-trait = "0.1"
+bytes = "1"
+spake2 = "0.4"
+snow = "0.9"
+postcard = { version = "1", features = ["alloc"] }
+hmac = "0.12"
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

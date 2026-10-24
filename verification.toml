@@ -1,0 +1,6 @@
+# BlueLink verification policy — what "complete" means for this repo.
+required_gates = ["tests"]
+judgment_rungs = ["task", "diff", "self-review", "requirements", "architecture", "fresh-review"]
+
+[gates.local]
+tests = "cargo test --workspace"

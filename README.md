@@ -4,11 +4,36 @@ Native Markdown vault for Linux desktop and Android, written in Rust. Notes are 
 
 ## Status
 
-Planning. The full specification (in Russian) lives in [`docs/ТЗ_BlueLink.md`](docs/ТЗ_BlueLink.md).
+Stages 1–4 done: vault core, desktop UI, sync on Loopback, BlueZ GATT peripheral spike. Spec: [`docs/ТЗ_BlueLink.md`](docs/ТЗ_BlueLink.md).
 
-## Planned stack
+```bash
+cargo test --workspace
+cargo run -p desktop -- --vault ~/BlueLinkDemo
+```
+
+Without `--vault`, use **Open vault** in the start screen.
+
+## BLE peripheral spike (Linux / BlueZ)
+
+Requires BlueZ ≥ 5.60, `bluetoothd` running, adapter powered (`bluetoothctl power on`), user in group `bluetooth` (or equivalent D-Bus policy).
+
+```bash
+cargo run -p bluelink_ble --example peripheral --features bluez
+```
+
+Then on a phone: nRF Connect → scan for **BlueLink** → connect → Read `info`, Write Without Response on `rx`, Subscribe on `tx` (echo).
+
+| Role | UUID |
+|------|------|
+| Service | `6e400001-b5a3-f393-e0a9-e50e24dcca9e` |
+| rx (write) | `6e400002-b5a3-f393-e0a9-e50e24dcca9e` |
+| tx (notify) | `6e400003-b5a3-f393-e0a9-e50e24dcca9e` |
+| info (read) | `6e400004-b5a3-f393-e0a9-e50e24dcca9e` |
+
+`info` payload: `protocol_version` (u16 LE) + `pairing_open` (u8). Fragmentation unit-tested without hardware (`cargo test -p bluelink_ble`).
+
+## Stack
 
 - UI: `eframe` + `egui` (shared between desktop and Android)
-- BLE: `bluer` (BlueZ peripheral on Linux), `btleplug` (central on Android)
-- Pairing: SPAKE2 over a 6-digit code; secure channel: Noise XX
-- Serialization: `serde` + `postcard`
+- Sync: `spake2` + `snow` (Noise XX) + `postcard` over `Transport` (Loopback in tests)
+- BLE: `bluer` (BlueZ peripheral, feature `bluez`); Android central (`btleplug`) next

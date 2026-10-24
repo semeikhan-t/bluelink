@@ -1,0 +1,17 @@
+[package]
+name = "desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bluelink"
+path = "src/main.rs"
+
+[dependencies]
+bluelink_core = { workspace = true }
+bluelink_ui = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+rfd = { workspace = true }
+notify = { workspace = true }
