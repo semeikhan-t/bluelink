@@ -103,7 +103,10 @@ pub fn render_line_with_role(
         click = merge_click(click, c);
     }
     if doc.blocks.is_empty() {
-        click = merge_click(click, render_text_with_wikis(ui, vault, line, 17.0, false, 0));
+        click = merge_click(
+            click,
+            render_text_with_wikis(ui, vault, line, theme::EDITOR_SIZE, false, 0),
+        );
     }
     click
 }
@@ -140,7 +143,8 @@ fn render_fence_stripe(ui: &mut Ui, line: &str, role: FenceRole) -> LineClick {
             .color(theme::WEAK),
         FenceRole::Body | FenceRole::Outside => {
             let shown = if line.is_empty() { " " } else { line };
-            RichText::new(shown).size(16.0).monospace()
+            // Explicit ink — clickable labels otherwise pick hovered.fg (dark) and vanish.
+            RichText::new(shown).size(16.0).monospace().color(theme::TEXT)
         }
     };
 
@@ -186,7 +190,7 @@ fn render_block_compact(ui: &mut Ui, vault: &Vault, block: &PreviewBlock) -> Lin
             let mut click = LineClick::None;
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                click = render_spans(ui, vault, spans, 17.0, false, 0);
+                click = render_spans(ui, vault, spans, theme::EDITOR_SIZE, false, 0);
             });
             click
         }
@@ -194,7 +198,7 @@ fn render_block_compact(ui: &mut Ui, vault: &Vault, block: &PreviewBlock) -> Lin
             let mut click = LineClick::None;
             ui.horizontal_wrapped(|ui| {
                 ui.label("•");
-                click = render_spans(ui, vault, spans, 17.0, false, 0);
+                click = render_spans(ui, vault, spans, theme::EDITOR_SIZE, false, 0);
             });
             click
         }
@@ -202,7 +206,7 @@ fn render_block_compact(ui: &mut Ui, vault: &Vault, block: &PreviewBlock) -> Lin
             let mut click = LineClick::None;
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("{number}."));
-                click = render_spans(ui, vault, spans, 17.0, false, 0);
+                click = render_spans(ui, vault, spans, theme::EDITOR_SIZE, false, 0);
             });
             click
         }
@@ -214,7 +218,7 @@ fn render_block_compact(ui: &mut Ui, vault: &Vault, block: &PreviewBlock) -> Lin
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        click = render_spans(ui, vault, spans, 17.0, false, 0);
+                        click = render_spans(ui, vault, spans, theme::EDITOR_SIZE, false, 0);
                     });
                 });
             click
@@ -237,7 +241,8 @@ fn render_block_compact(ui: &mut Ui, vault: &Vault, block: &PreviewBlock) -> Lin
                         egui::Label::new(
                             RichText::new(code.trim_end_matches('\n'))
                                 .size(16.0)
-                                .monospace(),
+                                .monospace()
+                                .color(theme::TEXT),
                         )
                         .sense(Sense::click()),
                     );
@@ -303,7 +308,8 @@ fn render_one_span(
             let rich = if heading {
                 theme::heading_rich(t, level)
             } else {
-                RichText::new(t).size(size)
+                // Pin ink: Sense::click labels use hovered.fg_stroke (invert = dark on dark).
+                RichText::new(t).size(size).color(theme::TEXT)
             };
             let resp = ui.add(egui::Label::new(rich).sense(Sense::click()));
             if resp.clicked() {
@@ -314,7 +320,8 @@ fn render_one_span(
         }
         Span::Strong(t) => {
             let resp = ui.add(
-                egui::Label::new(RichText::new(t).size(size).strong()).sense(Sense::click()),
+                egui::Label::new(RichText::new(t).size(size).strong().color(theme::TEXT))
+                    .sense(Sense::click()),
             );
             if resp.clicked() {
                 LineClick::Edit
@@ -324,7 +331,8 @@ fn render_one_span(
         }
         Span::Emphasis(t) => {
             let resp = ui.add(
-                egui::Label::new(RichText::new(t).size(size).italics()).sense(Sense::click()),
+                egui::Label::new(RichText::new(t).size(size).italics().color(theme::TEXT))
+                    .sense(Sense::click()),
             );
             if resp.clicked() {
                 LineClick::Edit
@@ -341,8 +349,10 @@ fn render_one_span(
                 .inner_margin(egui::Margin::symmetric(6, 2))
                 .show(ui, |ui| {
                     let resp = ui.add(
-                        egui::Label::new(RichText::new(t).size(size).monospace())
-                            .sense(Sense::click()),
+                        egui::Label::new(
+                            RichText::new(t).size(size).monospace().color(theme::TEXT),
+                        )
+                        .sense(Sense::click()),
                     );
                     clicked = resp.clicked();
                 });
@@ -412,11 +422,12 @@ fn render_one_span(
     }
 }
 
+/// Brighten for hover on dark sheet (accent/warn stay legible).
 fn lighten(c: Color32) -> Color32 {
     Color32::from_rgb(
-        c.r().saturating_add(48),
-        c.g().saturating_add(48),
-        c.b().saturating_add(36),
+        c.r().saturating_add(40),
+        c.g().saturating_add(36),
+        c.b().saturating_add(30),
     )
 }
 

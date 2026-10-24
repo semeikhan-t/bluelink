@@ -926,8 +926,8 @@ impl App {
                 ui.label(
                     egui::RichText::new("BlueLink")
                         .size(42.0)
-                        .strong()
-                        .color(theme::ACCENT),
+                        .family(theme::display_family())
+                        .color(theme::TEXT),
                 );
                 ui.add_space(8.0);
                 ui.label(
@@ -1233,9 +1233,9 @@ impl eframe::App for App {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new("BlueLink")
-                        .size(20.0)
-                        .strong()
-                        .color(theme::ACCENT),
+                        .size(22.0)
+                        .family(theme::display_family())
+                        .color(theme::TEXT),
                 );
 
                 let vault_name = self
@@ -1278,7 +1278,12 @@ impl eframe::App for App {
                         }
                     });
 
-                ui.label(egui::RichText::new("Notes").size(14.0).color(theme::WEAK));
+                ui.label(
+                    egui::RichText::new("NOTES")
+                        .size(12.0)
+                        .family(theme::display_family())
+                        .color(theme::WEAK),
+                );
                 ui.add_space(8.0);
                 let can_undo = !self.undo_stack.is_empty();
                 let action = tree::show_tree(
@@ -1358,8 +1363,8 @@ impl eframe::App for App {
                 ui.label(
                     egui::RichText::new("Backlinks")
                         .size(16.0)
-                        .strong()
-                        .color(theme::ACCENT),
+                        .family(theme::display_family())
+                        .color(theme::TEXT),
                 );
                 ui.add_space(6.0);
                 ui.separator();

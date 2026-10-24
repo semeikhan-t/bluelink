@@ -25,12 +25,11 @@ pub fn show(ui: &mut Ui, tabs: &[String], active: Option<&str>, dirty: bool) -> 
     let (_, bar_rect) = ui.allocate_space(egui::vec2(bar_w, TAB_H + 4.0));
     let rule_y = bar_rect.bottom() - 1.0;
 
-    // Slightly deeper than the editor so the active tab can "lift" into the content.
-    let strip = Color32::from_rgb(10, 13, 22);
+    // Faint strip so the active tab can lift into the paper content.
     ui.painter()
-        .rect_filled(bar_rect, theme::round(), strip);
+        .rect_filled(bar_rect, theme::round(), theme::FAINT);
     ui.painter().hline(
-        bar_rect.x_range().shrink(theme::ROUND as f32),
+        bar_rect.x_range(),
         rule_y,
         Stroke::new(1.0_f32, theme::STROKE),
     );
@@ -47,9 +46,8 @@ pub fn show(ui: &mut Ui, tabs: &[String], active: Option<&str>, dirty: bool) -> 
         .auto_shrink([false, true])
         .show(&mut child, |ui| {
             ui.set_min_height(TAB_H + 2.0);
-            // Room for the concave join ears on the active tab.
-            ui.spacing_mut().item_spacing.x = theme::ROUND as f32 + 2.0;
-            ui.add_space(theme::ROUND as f32);
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.add_space(4.0);
 
             for path in tabs {
                 let is_active = active == Some(path.as_str());
@@ -61,7 +59,6 @@ pub fn show(ui: &mut Ui, tabs: &[String], active: Option<&str>, dirty: bool) -> 
                     is_active,
                     dirty && is_active,
                     rule_y,
-                    strip,
                     &mut action,
                 );
             }
@@ -78,7 +75,6 @@ fn tab_chip(
     active: bool,
     dirty: bool,
     rule_y: f32,
-    strip: Color32,
     action: &mut TabAction,
 ) {
     let close_id = ui.id().with(("note_tab_close", path));
@@ -88,7 +84,7 @@ fn tab_chip(
     let close_w = 20.0_f32;
     let gaps = 8.0_f32 + if dirty { 12.0 } else { 0.0 } + 8.0;
     let text_w = ui.fonts(|f| {
-        f.layout_no_wrap(title.to_owned(), FontId::proportional(TITLE_SIZE), Color32::WHITE)
+        f.layout_no_wrap(title.to_owned(), FontId::proportional(TITLE_SIZE), theme::TEXT)
             .size()
             .x
     });
@@ -99,12 +95,11 @@ fn tab_chip(
     let hovered = response.hovered();
 
     if active {
+        // Square bottom corners; open into the document (no bottom stroke, no ears).
         let body = egui::Rect::from_min_max(
             egui::pos2(rect.left(), rect.top()),
             egui::pos2(rect.right(), rule_y + 1.0),
         );
-        // Same stroke as the document top rule: top + sides, open bottom into the editor.
-        // Square bottom corners so the tab meets the content plane cleanly.
         let rounding = egui::CornerRadius {
             nw: theme::ROUND,
             ne: theme::ROUND,
@@ -114,32 +109,34 @@ fn tab_chip(
         let edge = Stroke::new(1.0_f32, theme::STROKE);
         ui.painter()
             .rect(body, rounding, theme::BG, edge, egui::StrokeKind::Inside);
-        // Erase bottom edge so the tab merges with the content plane.
+        // Cover only the bottom stroke — stay inside the side strokes so we
+        // don't paint BG wings over the strip (that looked like convex ears).
         let seal = egui::Rect::from_min_max(
-            egui::pos2(body.left() + 1.0, rule_y - 2.0),
+            egui::pos2(body.left() + 1.0, rule_y - 1.0),
             egui::pos2(body.right() - 1.0, body.bottom() + 1.0),
         );
         ui.painter()
             .rect_filled(seal, egui::CornerRadius::ZERO, theme::BG);
-        // Concave rounds where the tab sides meet the document top border.
-        paint_tab_join(ui, body.left(), body.right(), rule_y, strip, edge);
     } else if hovered {
+        // Invert: ink fill on paper strip (immediate, no motion).
         ui.painter().rect_filled(
             rect.shrink2(egui::vec2(0.0, 3.0)),
             theme::round_sm(),
-            Color32::from_rgb(24, 32, 48),
+            theme::TEXT,
         );
     }
 
-    let text_color = if active || hovered {
+    let text_color = if active {
         theme::TEXT
+    } else if hovered {
+        theme::BG
     } else {
         theme::WEAK
     };
     let icon_color = if active {
         theme::ACCENT
     } else if hovered {
-        theme::TEXT
+        theme::BG
     } else {
         theme::WEAK
     };
@@ -172,11 +169,20 @@ fn tab_chip(
             ui.painter().rect_filled(
                 close_rect.expand(2.0),
                 theme::round_sm(),
-                Color32::from_rgba_unmultiplied(220, 90, 90, 55),
+                Color32::from_rgba_unmultiplied(
+                    theme::ACCENT.r(),
+                    theme::ACCENT.g(),
+                    theme::ACCENT.b(),
+                    55,
+                ),
             );
         }
         let xc = if ch {
-            Color32::from_rgb(255, 140, 140)
+            theme::ACCENT
+        } else if active {
+            theme::WEAK
+        } else if hovered {
+            theme::BG
         } else {
             theme::WEAK
         };
@@ -202,60 +208,6 @@ fn tab_chip(
     }
 
     let _ = x;
-}
-
-/// Browser-tab ear: concave join from the vertical tab edge into the document rule.
-///
-/// Fill the ear square with the tab/content color, then cut a strip-colored
-/// quarter-circle from the outer corner. That leaves a convex tab foot and a
-/// concave strip corner — the same trick browser chrome uses.
-fn paint_tab_join(ui: &Ui, left: f32, right: f32, rule_y: f32, strip: Color32, edge: Stroke) {
-    let r = theme::ROUND as f32;
-
-    // Left ear
-    let left_ear = egui::Rect::from_min_max(
-        egui::pos2(left - r, rule_y - r),
-        egui::pos2(left, rule_y),
-    );
-    ui.painter()
-        .rect_filled(left_ear, egui::CornerRadius::ZERO, theme::BG);
-    {
-        let center = egui::pos2(left - r, rule_y - r);
-        let p = ui.painter().with_clip_rect(left_ear);
-        p.circle_filled(center, r, strip);
-        p.circle_stroke(center, r, edge);
-    }
-    // Remove the sharp L of the side stroke; the arc takes over from here.
-    ui.painter().rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(left, rule_y - r),
-            egui::pos2(left + 1.5, rule_y + 0.5),
-        ),
-        egui::CornerRadius::ZERO,
-        theme::BG,
-    );
-
-    // Right ear
-    let right_ear = egui::Rect::from_min_max(
-        egui::pos2(right, rule_y - r),
-        egui::pos2(right + r, rule_y),
-    );
-    ui.painter()
-        .rect_filled(right_ear, egui::CornerRadius::ZERO, theme::BG);
-    {
-        let center = egui::pos2(right + r, rule_y - r);
-        let p = ui.painter().with_clip_rect(right_ear);
-        p.circle_filled(center, r, strip);
-        p.circle_stroke(center, r, edge);
-    }
-    ui.painter().rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(right - 1.5, rule_y - r),
-            egui::pos2(right, rule_y + 0.5),
-        ),
-        egui::CornerRadius::ZERO,
-        theme::BG,
-    );
 }
 
 enum AlignX {

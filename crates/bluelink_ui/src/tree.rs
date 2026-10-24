@@ -239,9 +239,12 @@ fn note_row(
         .trim_end_matches(".md");
     let text = format!("{}  {name}", regular::NOTE);
     let label = if is_sel {
-        RichText::new(text).size(16.0).strong().color(theme::ACCENT)
+        RichText::new(text)
+            .size(16.0)
+            .strong()
+            .color(theme::ACCENT)
     } else {
-        RichText::new(text).size(16.0)
+        RichText::new(text).size(16.0).color(theme::TEXT)
     };
     let row_size = egui::vec2(ui.available_width(), 30.0);
 
