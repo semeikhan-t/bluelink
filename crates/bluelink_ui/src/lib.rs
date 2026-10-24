@@ -392,28 +392,34 @@ impl App {
     }
 
     fn show_nav_buttons(&mut self, ui: &mut egui::Ui) {
-        let back = ui
-            .add_enabled(
-                self.can_go_back(),
-                egui::Button::new(egui::RichText::new(regular::ARROW_LEFT).size(16.0))
-                    .min_size(egui::vec2(32.0, 32.0))
-                    .frame(false),
-            )
-            .on_hover_text("Back (Alt+←)");
-        let fwd = ui
-            .add_enabled(
-                self.can_go_forward(),
-                egui::Button::new(egui::RichText::new(regular::ARROW_RIGHT).size(16.0))
-                    .min_size(egui::vec2(32.0, 32.0))
-                    .frame(false),
-            )
-            .on_hover_text("Forward (Alt+→)");
-        if back.clicked() {
-            self.go_back();
-        }
-        if fwd.clicked() {
-            self.go_forward();
-        }
+        // Nudge down to sit with the tab baseline.
+        ui.vertical(|ui| {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let back = ui
+                    .add_enabled(
+                        self.can_go_back(),
+                        egui::Button::new(egui::RichText::new(regular::ARROW_LEFT).size(16.0))
+                            .min_size(egui::vec2(32.0, 32.0))
+                            .frame(false),
+                    )
+                    .on_hover_text("Back (Alt+←)");
+                let fwd = ui
+                    .add_enabled(
+                        self.can_go_forward(),
+                        egui::Button::new(egui::RichText::new(regular::ARROW_RIGHT).size(16.0))
+                            .min_size(egui::vec2(32.0, 32.0))
+                            .frame(false),
+                    )
+                    .on_hover_text("Forward (Alt+→)");
+                if back.clicked() {
+                    self.go_back();
+                }
+                if fwd.clicked() {
+                    self.go_forward();
+                }
+            });
+        });
     }
 
     fn cycle_next_tab(&mut self) {
