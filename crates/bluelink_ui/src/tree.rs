@@ -16,7 +16,10 @@ pub struct InlineRename {
 
 #[derive(Default)]
 pub struct TreeAction {
+    /// Open note in the current tab (in-place).
     pub select: Option<String>,
+    /// Open note in a new tab (Ctrl+click / context menu).
+    pub open_in_new_tab: Option<String>,
     pub new_note: bool,
     pub new_folder: bool,
     /// Begin inline rename for this note/folder path.
@@ -190,7 +193,7 @@ fn folder_block(
                     note_row(ui, note, selected, renaming, action);
                 }
             });
-            path_context_menu(&cr.header_response, folder, action);
+            path_context_menu(&cr.header_response, folder, action, false);
         }
     });
     resp.response.dnd_release_payload::<String>()
@@ -260,15 +263,22 @@ fn note_row(
     });
     let response = ui
         .interact(painted.rect, id, Sense::click_and_drag())
-        .on_hover_cursor(CursorIcon::Grab);
+        .on_hover_cursor(CursorIcon::Grab)
+        .on_hover_text("Open · Ctrl+click for new tab");
 
     if response.drag_started() {
         egui::DragAndDrop::set_payload(ui.ctx(), note.rel_path.clone());
     }
     if response.clicked() {
-        action.select = Some(note.rel_path.clone());
+        // Ctrl/Cmd+click → new tab; plain click → replace current tab.
+        let new_tab = ui.input(|i| i.modifiers.command);
+        if new_tab {
+            action.open_in_new_tab = Some(note.rel_path.clone());
+        } else {
+            action.select = Some(note.rel_path.clone());
+        }
     }
-    path_context_menu(&response, &note.rel_path, action);
+    path_context_menu(&response, &note.rel_path, action, true);
 }
 
 fn rename_field(
@@ -331,8 +341,21 @@ pub fn rename_draft(path: &str, is_folder: bool) -> String {
     }
 }
 
-fn path_context_menu(response: &egui::Response, path: &str, action: &mut TreeAction) {
+fn path_context_menu(
+    response: &egui::Response,
+    path: &str,
+    action: &mut TreeAction,
+    is_note: bool,
+) {
     response.context_menu(|ui| {
+        if is_note
+            && ui
+                .button(format!("{}  Open in new tab", regular::ARROW_SQUARE_OUT))
+                .clicked()
+        {
+            action.open_in_new_tab = Some(path.to_string());
+            ui.close_menu();
+        }
         if ui
             .button(format!("{}  Rename", regular::PENCIL_SIMPLE))
             .clicked()

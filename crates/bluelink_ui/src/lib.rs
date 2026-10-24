@@ -250,10 +250,33 @@ impl App {
         }
     }
 
+    /// Open a note in the current tab (replace), or switch to it if already open.
     fn select_note(&mut self, rel_path: &str) {
-        if !self.open_tabs.iter().any(|t| t == rel_path) {
+        self.open_note(rel_path, false);
+    }
+
+    /// Open a note in a new tab (or focus existing tab for that path).
+    fn open_note_in_new_tab(&mut self, rel_path: &str) {
+        self.open_note(rel_path, true);
+    }
+
+    fn open_note(&mut self, rel_path: &str, new_tab: bool) {
+        let already_open = self.open_tabs.iter().any(|t| t == rel_path);
+        if already_open {
+            // Just focus the existing tab.
+        } else if new_tab {
+            self.open_tabs.push(rel_path.to_string());
+        } else if let Some(cur) = self.selected.clone() {
+            // In-place: replace the active tab's path.
+            if let Some(slot) = self.open_tabs.iter_mut().find(|t| t.as_str() == cur) {
+                *slot = rel_path.to_string();
+            } else {
+                self.open_tabs.push(rel_path.to_string());
+            }
+        } else {
             self.open_tabs.push(rel_path.to_string());
         }
+
         if self.selected.as_deref() == Some(rel_path) {
             return;
         }
@@ -919,6 +942,9 @@ impl eframe::App for App {
                 );
                 if let Some(path) = action.select {
                     self.select_note(&path);
+                }
+                if let Some(path) = action.open_in_new_tab {
+                    self.open_note_in_new_tab(&path);
                 }
                 if action.new_note {
                     self.dialog = Some(Dialog::NewNote {
