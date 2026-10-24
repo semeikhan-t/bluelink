@@ -898,12 +898,15 @@ impl eframe::App for App {
             }
         }
 
-        let (save, new_note, close_tab, next_tab) = ctx.input_mut(|i| {
+        // Don't steal Delete from TextEdit / rename fields.
+        let can_bind_delete = !ctx.wants_keyboard_input() && self.dialog.is_none();
+        let (save, new_note, close_tab, next_tab, delete_note) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::T),
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::W),
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab),
+                can_bind_delete && i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
             )
         });
         if save {
@@ -919,6 +922,11 @@ impl eframe::App for App {
         }
         if next_tab {
             self.cycle_next_tab();
+        }
+        if delete_note {
+            if let Some(path) = self.selected.clone() {
+                self.dialog = Some(Dialog::ConfirmDelete { path });
+            }
         }
 
         self.show_dialogs(ctx);
