@@ -94,7 +94,8 @@ fn render_block_compact(ui: &mut Ui, vault: &Vault, block: &PreviewBlock) -> Lin
             let mut click = LineClick::None;
             egui::Frame::NONE
                 .fill(ui.visuals().faint_bg_color)
-                .inner_margin(egui::Margin::symmetric(8, 4))
+                .corner_radius(theme::round())
+                .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         click = render_spans(ui, vault, spans, 17.0, false, 0);
@@ -103,15 +104,24 @@ fn render_block_compact(ui: &mut Ui, vault: &Vault, block: &PreviewBlock) -> Lin
             click
         }
         PreviewBlock::CodeBlock { code, .. } => {
-            let resp = ui.add(
-                egui::Label::new(
-                    RichText::new(code.trim_end_matches('\n'))
-                        .size(16.0)
-                        .monospace(),
-                )
-                .sense(Sense::click()),
-            );
-            if resp.clicked() {
+            let mut clicked = false;
+            egui::Frame::NONE
+                .fill(theme::CODE_BG)
+                .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                .corner_radius(theme::round())
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    let resp = ui.add(
+                        egui::Label::new(
+                            RichText::new(code.trim_end_matches('\n'))
+                                .size(16.0)
+                                .monospace(),
+                        )
+                        .sense(Sense::click()),
+                    );
+                    clicked = resp.clicked();
+                });
+            if clicked {
                 LineClick::Edit
             } else {
                 LineClick::None
@@ -241,8 +251,8 @@ fn render_one_span(
 
             if hovered {
                 ui.painter().rect_filled(
-                    rect.expand2(egui::vec2(3.0, 1.5)),
-                    3.0,
+                    rect.expand2(egui::vec2(4.0, 2.0)),
+                    theme::round_sm(),
                     Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 40),
                 );
             }

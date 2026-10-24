@@ -26,6 +26,21 @@ pub const SIDEBAR_WIDTH: f32 = 300.0;
 /// Readable note column — centered in the central panel.
 pub const CONTENT_MAX_WIDTH: f32 = 720.0;
 
+/// Shared corner radii — keep UI chrome consistently rounded.
+pub const ROUND_SM: u8 = 8;
+pub const ROUND: u8 = 10;
+pub const ROUND_LG: u8 = 12;
+
+pub fn round_sm() -> CornerRadius {
+    CornerRadius::same(ROUND_SM)
+}
+pub fn round() -> CornerRadius {
+    CornerRadius::same(ROUND)
+}
+pub fn round_lg() -> CornerRadius {
+    CornerRadius::same(ROUND_LG)
+}
+
 /// Named families: fewer `#` → heavier weight (`H1` black … `H4+` regular).
 const FACE_BLACK: &str = "bl_black";
 const FACE_BOLD: &str = "bl_bold";
@@ -215,12 +230,13 @@ fn dark_visuals() -> Visuals {
     let _ = WEAK; // used via RichText::weak() / style elsewhere
 
     v.window_stroke = Stroke::new(1.0_f32, STROKE);
-    v.window_corner_radius = CornerRadius::same(8);
-    v.menu_corner_radius = CornerRadius::same(6);
-    v.widgets.noninteractive.corner_radius = CornerRadius::same(6);
-    v.widgets.inactive.corner_radius = CornerRadius::same(6);
-    v.widgets.hovered.corner_radius = CornerRadius::same(6);
-    v.widgets.active.corner_radius = CornerRadius::same(6);
+    v.window_corner_radius = round_lg();
+    v.menu_corner_radius = round();
+    v.widgets.noninteractive.corner_radius = round();
+    v.widgets.inactive.corner_radius = round();
+    v.widgets.hovered.corner_radius = round();
+    v.widgets.active.corner_radius = round();
+    v.widgets.open.corner_radius = round();
 
     v
 }

@@ -1,4 +1,4 @@
-use egui::{Color32, CornerRadius, CursorIcon, FontId, Sense, Stroke, Ui, Vec2};
+use egui::{Color32, CursorIcon, FontId, Sense, Stroke, Ui, Vec2};
 use egui_phosphor::regular;
 
 use crate::theme;
@@ -28,9 +28,9 @@ pub fn show(ui: &mut Ui, tabs: &[String], active: Option<&str>, dirty: bool) -> 
     // Slightly deeper than the editor so the active tab can "lift" into the content.
     let strip = Color32::from_rgb(10, 13, 22);
     ui.painter()
-        .rect_filled(bar_rect, CornerRadius::ZERO, strip);
+        .rect_filled(bar_rect, theme::round(), strip);
     ui.painter().hline(
-        bar_rect.x_range(),
+        bar_rect.x_range().shrink(theme::ROUND as f32),
         rule_y,
         Stroke::new(1.0_f32, theme::STROKE),
     );
@@ -95,34 +95,27 @@ fn tab_chip(
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let hovered = response.hovered();
 
-    let rounding = CornerRadius {
-        nw: 10,
-        ne: 10,
-        sw: 0,
-        se: 0,
-    };
-
     if active {
         let body = egui::Rect::from_min_max(
             egui::pos2(rect.left(), rect.top()),
             egui::pos2(rect.right(), rule_y + 1.0),
         );
-        ui.painter().rect_filled(body, rounding, theme::BG);
+        ui.painter().rect_filled(body, theme::round(), theme::BG);
         ui.painter().hline(
-            body.x_range().shrink(10.0),
-            body.top() + 2.0,
+            body.x_range().shrink(12.0),
+            body.top() + 3.0,
             Stroke::new(2.0_f32, theme::ACCENT),
         );
         // Cover the strip rule so the active tab merges into the editor.
         ui.painter().hline(
-            body.x_range(),
+            body.x_range().shrink(2.0),
             rule_y,
             Stroke::new(2.5_f32, theme::BG),
         );
     } else if hovered {
         ui.painter().rect_filled(
-            rect.shrink2(egui::vec2(0.0, 4.0)),
-            CornerRadius::same(6),
+            rect.shrink2(egui::vec2(0.0, 3.0)),
+            theme::round_sm(),
             Color32::from_rgb(24, 32, 48),
         );
     }
@@ -167,7 +160,7 @@ fn tab_chip(
         if ch {
             ui.painter().rect_filled(
                 close_rect.expand(2.0),
-                CornerRadius::same(5),
+                theme::round_sm(),
                 Color32::from_rgba_unmultiplied(220, 90, 90, 55),
             );
         }
