@@ -79,6 +79,8 @@ pub struct App {
     pick_folder: Option<FolderPicker>,
     /// SHA of selected note as last loaded/saved — used to detect external edits.
     selected_sha: Option<String>,
+    /// Ignore notify reloads until this instant (our own saves).
+    suppress_reload_until: Option<Instant>,
     registry: VaultRegistry,
     undo_stack: Vec<UndoItem>,
 }
@@ -114,6 +116,7 @@ impl App {
             reload_flag,
             pick_folder,
             selected_sha: None,
+            suppress_reload_until: None,
             registry,
             undo_stack: Vec::new(),
         };
@@ -258,6 +261,15 @@ impl App {
     }
 
     fn save_current(&mut self) {
+        self.persist_current(true);
+    }
+
+    /// Idle autosave — no fsync, no full vault rescan (keeps the UI thread free).
+    fn autosave_current(&mut self) {
+        self.persist_current(false);
+    }
+
+    fn persist_current(&mut self, durable: bool) {
         if !self.dirty || self.readonly {
             return;
         }
@@ -268,15 +280,26 @@ impl App {
         let Some(vault) = self.vault.as_mut() else {
             return;
         };
-        match vault.write(&rel, &content) {
+        // Always clear idle timer so a failed save cannot retry every frame.
+        self.last_edit = None;
+        let result = if durable {
+            vault.write(&rel, &content)
+        } else {
+            vault.write_soft(&rel, &content)
+        };
+        match result {
             Ok(meta) => {
                 self.dirty = false;
-                self.last_edit = None;
-                self.selected_sha = Some(meta.sha256);
+                self.selected_sha = Some(meta.sha256.clone());
                 self.status.clear();
-                if let Ok(notes) = vault.list() {
-                    self.notes = notes;
+                if let Some(n) = self.notes.iter_mut().find(|n| n.rel_path == rel) {
+                    *n = meta;
+                } else {
+                    self.notes.push(meta);
                 }
+                // Notify will fire for our own write — skip the echo reload briefly.
+                self.suppress_reload_until =
+                    Some(Instant::now() + Duration::from_millis(750));
             }
             Err(e) => self.status = format!("save failed: {e}"),
         }
@@ -835,6 +858,12 @@ impl App {
         if !self.reload_flag.swap(false, Ordering::SeqCst) {
             return;
         }
+        if self
+            .suppress_reload_until
+            .is_some_and(|t| Instant::now() < t)
+        {
+            return;
+        }
         // Always refresh the tree; only reload buffer when not dirty.
         self.refresh_notes();
         if self.dirty {
@@ -1108,11 +1137,11 @@ impl eframe::App for App {
             return;
         }
 
-        // Autosave after 1s idle.
+        // Autosave after 1s idle (soft write — must not block the UI thread).
         if self.dirty {
             if let Some(t) = self.last_edit {
                 if t.elapsed() >= Duration::from_secs(1) {
-                    self.save_current();
+                    self.autosave_current();
                 } else {
                     ctx.request_repaint_after(Duration::from_millis(200));
                 }

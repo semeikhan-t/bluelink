@@ -232,51 +232,74 @@ pub fn show_live(
                             .map(|(b, _)| b)
                             .unwrap_or(draft.len());
 
-                        // Wiki autocomplete: keep popup interactive even after the click
-                        // steals TextEdit focus (otherwise picking a note does nothing).
+                        // Wiki autocomplete. Clicking a candidate steals TextEdit focus on
+                        // pointer-down and only registers `clicked` on pointer-up next frame —
+                        // keep the popup alive for a few frames after lost_focus so the pick lands.
                         let mut wiki_consumed_enter = false;
-                        if let Some((brack_at, query)) = open_wiki_query(&draft, byte_idx) {
-                            let candidates = wiki_candidates(&vault.index().note_paths(), &query);
-                            let mut picked: Option<String> = None;
-                            if !candidates.is_empty() {
-                                egui::Area::new(Id::new(("wiki_ac", i)))
-                                    .order(Order::Foreground)
-                                    .fixed_pos(response.rect.left_bottom() + egui::vec2(0.0, 4.0))
-                                    .show(ui.ctx(), |ui| {
-                                        egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                            ui.set_min_width(220.0);
-                                            ui.label(
-                                                egui::RichText::new("Link to note")
-                                                    .size(12.0)
-                                                    .color(theme::WEAK),
-                                            );
-                                            for path in candidates.iter().take(12) {
-                                                let label = path.trim_end_matches(".md");
-                                                if ui
-                                                    .selectable_label(false, label)
-                                                    .clicked()
-                                                {
-                                                    picked = Some(label.to_string());
+                        let wiki_open = open_wiki_query(&draft, byte_idx);
+                        let grace_key = egui::Id::new(("wiki_ac_grace", i));
+                        let mut grace: u8 = ui
+                            .ctx()
+                            .data_mut(|d| d.get_temp::<u8>(grace_key).unwrap_or(0));
+                        if wiki_open.is_none() {
+                            grace = 0;
+                        } else if response.lost_focus() {
+                            grace = 24; // ~0.4s at 60fps
+                        } else if focused {
+                            grace = 2;
+                        } else if grace > 0 {
+                            grace -= 1;
+                        }
+                        let show_wiki = wiki_open.is_some() && (focused || grace > 0);
+                        if let Some((brack_at, query)) = wiki_open {
+                            if show_wiki {
+                                let candidates =
+                                    wiki_candidates(&vault.index().note_paths(), &query);
+                                let mut picked: Option<String> = None;
+                                if !candidates.is_empty() {
+                                    egui::Area::new(Id::new(("wiki_ac", i)))
+                                        .order(Order::Foreground)
+                                        .fixed_pos(
+                                            response.rect.left_bottom() + egui::vec2(0.0, 4.0),
+                                        )
+                                        .show(ui.ctx(), |ui| {
+                                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                                ui.set_min_width(220.0);
+                                                ui.label(
+                                                    egui::RichText::new("Link to note")
+                                                        .size(12.0)
+                                                        .color(theme::WEAK),
+                                                );
+                                                for path in candidates.iter().take(12) {
+                                                    let label = path.trim_end_matches(".md");
+                                                    let r = ui.selectable_label(false, label);
+                                                    if r.hovered() || r.clicked() {
+                                                        grace = 24;
+                                                    }
+                                                    if r.clicked() {
+                                                        picked = Some(label.to_string());
+                                                    }
                                                 }
-                                            }
+                                            });
                                         });
-                                    });
-                                if enter && focused {
-                                    picked = Some(
-                                        candidates[0].trim_end_matches(".md").to_string(),
-                                    );
-                                    wiki_consumed_enter = true;
+                                    if enter && focused {
+                                        picked = Some(
+                                            candidates[0].trim_end_matches(".md").to_string(),
+                                        );
+                                        wiki_consumed_enter = true;
+                                    }
+                                }
+                                if let Some(name) = picked {
+                                    let prefix = &draft[..brack_at];
+                                    let suffix = &draft[byte_idx..];
+                                    let inserted = format!("{prefix}[[{name}]]{suffix}");
+                                    splice = Some((start, end, inserted));
+                                    // Drop raw edit so the link renders as a clickable preview.
+                                    leave_edit_after_wiki = true;
                                 }
                             }
-                            if let Some(name) = picked {
-                                let prefix = &draft[..brack_at];
-                                let suffix = &draft[byte_idx..];
-                                let inserted = format!("{prefix}[[{name}]]{suffix}");
-                                splice = Some((start, end, inserted));
-                                // Drop raw edit so the link renders as a clickable preview.
-                                leave_edit_after_wiki = true;
-                            }
                         }
+                        ui.ctx().data_mut(|d| d.insert_temp(grace_key, grace));
 
                         // singleline TextEdit loses focus on Enter — newline, unless wiki picked.
                         let enter_here =

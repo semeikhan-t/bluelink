@@ -65,7 +65,8 @@ impl eframe::App for DesktopApp {
         }
 
         if self.reload_flag.load(Ordering::Relaxed) {
-            ctx.request_repaint();
+            // Coalesce notify bursts — don't spin the event loop at max rate.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         self.inner.update(ctx, frame);
     }

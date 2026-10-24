@@ -104,6 +104,20 @@ impl Vault {
     }
 
     pub fn write(&mut self, rel_path: &str, content: &str) -> Result<NoteMeta, VaultError> {
+        self.write_inner(rel_path, content, true)
+    }
+
+    /// Autosave path: atomic rename without `fsync`, so the UI thread stays responsive.
+    pub fn write_soft(&mut self, rel_path: &str, content: &str) -> Result<NoteMeta, VaultError> {
+        self.write_inner(rel_path, content, false)
+    }
+
+    fn write_inner(
+        &mut self,
+        rel_path: &str,
+        content: &str,
+        sync: bool,
+    ) -> Result<NoteMeta, VaultError> {
         if content.len() as u64 > MAX_NOTE_BYTES {
             return Err(VaultError::TooLarge);
         }
@@ -117,7 +131,7 @@ impl Vault {
         // Re-validate after parents exist (canonicalize containment).
         let abs = path::resolve_inside_vault(&self.root, rel_path)?;
 
-        atomic_write(&abs, content.as_bytes())?;
+        atomic_write(&abs, content.as_bytes(), sync)?;
 
         self.index.set_note(rel_path, content);
         note_meta_for(&abs, rel_path)
@@ -306,7 +320,7 @@ impl Vault {
     }
 }
 
-fn atomic_write(path: &Path, data: &[u8]) -> Result<(), VaultError> {
+fn atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<(), VaultError> {
     let parent = path.parent().ok_or(VaultError::InvalidPath)?;
     let tmp_name = format!(
         ".{}.tmp-{}",
@@ -320,11 +334,15 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), VaultError> {
     let result = (|| {
         let mut file = File::create(&tmp_path).map_err(VaultError::from_io)?;
         file.write_all(data).map_err(VaultError::from_io)?;
-        file.sync_all().map_err(VaultError::from_io)?;
+        if sync {
+            file.sync_all().map_err(VaultError::from_io)?;
+        }
         fs::rename(&tmp_path, path).map_err(VaultError::from_io)?;
         // Best-effort directory fsync for durability on crash.
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
+        if sync {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
         }
         Ok(())
     })();
