@@ -9,8 +9,10 @@ pub struct TabAction {
     pub close: Option<String>,
 }
 
-const TAB_H: f32 = 32.0;
-const TITLE_MAX: usize = 24;
+const TAB_H: f32 = 42.0;
+const TITLE_MAX: usize = 28;
+const TITLE_SIZE: f32 = 16.0;
+const ICON_SIZE: f32 = 16.0;
 
 /// Browser-style tab strip for open notes.
 pub fn show(ui: &mut Ui, tabs: &[String], active: Option<&str>, dirty: bool) -> TabAction {
@@ -78,24 +80,24 @@ fn tab_chip(
 ) {
     let close_id = ui.id().with(("note_tab_close", path));
 
-    let pad_x = 10.0_f32;
-    let icon_w = 14.0_f32;
-    let close_w = 16.0_f32;
-    let gaps = 6.0_f32 + if dirty { 10.0 } else { 0.0 } + 6.0;
+    let pad_x = 14.0_f32;
+    let icon_w = 18.0_f32;
+    let close_w = 20.0_f32;
+    let gaps = 8.0_f32 + if dirty { 12.0 } else { 0.0 } + 8.0;
     let text_w = ui.fonts(|f| {
-        f.layout_no_wrap(title.to_owned(), FontId::proportional(13.5), Color32::WHITE)
+        f.layout_no_wrap(title.to_owned(), FontId::proportional(TITLE_SIZE), Color32::WHITE)
             .size()
             .x
     });
     let width = pad_x + icon_w + gaps + text_w + close_w + pad_x;
-    let size = Vec2::new(width.max(72.0), TAB_H);
+    let size = Vec2::new(width.max(96.0), TAB_H);
 
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let hovered = response.hovered();
 
     let rounding = CornerRadius {
-        nw: 8,
-        ne: 8,
+        nw: 10,
+        ne: 10,
         sw: 0,
         se: 0,
     };
@@ -141,17 +143,17 @@ fn tab_chip(
     let mut x = rect.left() + pad_x;
     let cy = rect.center().y;
 
-    paint_glyph(ui, egui::pos2(x, cy), regular::NOTE, 13.0, icon_color, AlignX::Left);
-    x += icon_w + 6.0;
+    paint_glyph(ui, egui::pos2(x, cy), regular::NOTE, ICON_SIZE, icon_color, AlignX::Left);
+    x += icon_w + 8.0;
 
     if dirty {
         ui.painter()
-            .circle_filled(egui::pos2(x + 3.0, cy), 3.0, theme::WARN);
-        x += 10.0;
+            .circle_filled(egui::pos2(x + 3.5, cy), 3.5, theme::WARN);
+        x += 12.0;
     }
 
-    paint_glyph(ui, egui::pos2(x, cy), title, 13.5, text_color, AlignX::Left);
-    x += text_w + 6.0;
+    paint_glyph(ui, egui::pos2(x, cy), title, TITLE_SIZE, text_color, AlignX::Left);
+    x += text_w + 8.0;
 
     let close_rect = egui::Rect::from_center_size(
         egui::pos2(rect.right() - pad_x - close_w * 0.5, cy),
@@ -164,8 +166,8 @@ fn tab_chip(
         let ch = close.hovered();
         if ch {
             ui.painter().rect_filled(
-                close_rect.expand(1.5),
-                CornerRadius::same(4),
+                close_rect.expand(2.0),
+                CornerRadius::same(5),
                 Color32::from_rgba_unmultiplied(220, 90, 90, 55),
             );
         }
@@ -174,7 +176,7 @@ fn tab_chip(
         } else {
             theme::WEAK
         };
-        paint_glyph(ui, close_rect.center(), regular::X, 11.0, xc, AlignX::Center);
+        paint_glyph(ui, close_rect.center(), regular::X, 13.0, xc, AlignX::Center);
         close.clone().on_hover_text("Close");
         if close.clicked() {
             action.close = Some(path.to_string());
