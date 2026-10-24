@@ -1039,28 +1039,28 @@ impl eframe::App for App {
             let mut tab_close: Option<String> = None;
 
             if self.open_tabs.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Note").size(15.0).color(theme::WEAK));
-                });
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Note").size(15.0).color(theme::WEAK));
+                ui.add_space(6.0);
+                ui.separator();
             } else {
-                ui.horizontal(|ui| {
-                    let tab_action = tabs::show(
-                        ui,
-                        &self.open_tabs,
-                        self.selected.as_deref(),
-                        self.dirty,
-                    );
-                    tab_select = tab_action.select;
-                    tab_close = tab_action.close;
-                    if self.readonly {
+                // Full-bleed tab strip (negative margin cancels panel padding feel).
+                let tab_action = tabs::show(
+                    ui,
+                    &self.open_tabs,
+                    self.selected.as_deref(),
+                    self.dirty,
+                );
+                tab_select = tab_action.select;
+                tab_close = tab_action.close;
+                if self.readonly {
+                    ui.horizontal(|ui| {
                         ui.add_space(8.0);
                         ui.colored_label(theme::WARN, "read-only");
-                    }
-                });
+                    });
+                }
             }
-            ui.add_space(4.0);
-            ui.separator();
-            ui.add_space(8.0);
+            ui.add_space(10.0);
 
             if let Some(path) = tab_select {
                 self.select_note(&path);
