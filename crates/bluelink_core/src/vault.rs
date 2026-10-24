@@ -14,11 +14,33 @@ use crate::wiki::WikiIndex;
 pub struct NoteMeta {
     /// Always uses `/` as separator, e.g. `inbox/todo.md`.
     pub rel_path: String,
+    /// Display title = first non-empty line (ATX `#` markers stripped).
+    pub title: String,
     /// Hex SHA-256 of file contents.
     pub sha256: String,
     pub size: u64,
     /// Unix milliseconds — UI only, not used by sync logic.
     pub modified: u64,
+}
+
+/// First non-empty line of a note, with leading `#` heading markers stripped.
+/// Falls back to the `.md` stem of `rel_path` when the body has no usable line.
+pub fn title_from_content(content: &str, rel_path: &str) -> String {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let body = trimmed.trim_start_matches('#').trim();
+        if !body.is_empty() {
+            return body.to_string();
+        }
+    }
+    Path::new(rel_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(rel_path)
+        .to_string()
 }
 
 pub struct Vault {
@@ -363,10 +385,34 @@ fn note_meta_for(abs: &Path, rel_path: &str) -> Result<NoteMeta, VaultError> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    let rel = rel_path.replace('\\', "/");
+    let title = match std::str::from_utf8(&bytes) {
+        Ok(text) => title_from_content(text, &rel),
+        Err(_) => title_from_content("", &rel),
+    };
     Ok(NoteMeta {
-        rel_path: rel_path.replace('\\', "/"),
+        rel_path: rel,
+        title,
         sha256,
         size: meta.len(),
         modified,
     })
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::title_from_content;
+
+    #[test]
+    fn strips_heading_markers() {
+        assert_eq!(title_from_content("# Hello\nbody", "a.md"), "Hello");
+        assert_eq!(title_from_content("### sdfdfs\n", "x.md"), "sdfdfs");
+        assert_eq!(title_from_content("plain title\nmore", "a.md"), "plain title");
+    }
+
+    #[test]
+    fn falls_back_to_stem_when_empty() {
+        assert_eq!(title_from_content("\n\n", "inbox/todo.md"), "todo");
+        assert_eq!(title_from_content("###\n", "note.md"), "note");
+    }
 }

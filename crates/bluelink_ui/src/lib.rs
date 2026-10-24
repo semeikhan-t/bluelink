@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bluelink_core::{validate_rel_path, NoteMeta, Vault, VaultError};
+use bluelink_core::{title_from_content, validate_rel_path, NoteMeta, Vault, VaultError};
 use eframe::egui;
 use egui_phosphor::regular;
 use vault_registry::{validate_vault_name, VaultRegistry};
@@ -1285,6 +1285,7 @@ impl eframe::App for App {
                         .color(theme::WEAK),
                 );
                 ui.add_space(8.0);
+                self.sync_live_title();
                 let can_undo = !self.undo_stack.is_empty();
                 let action = tree::show_tree(
                     ui,
@@ -1380,11 +1381,7 @@ impl eframe::App for App {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for path in &backlinks {
-                            let name = path
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or(path)
-                                .trim_end_matches(".md");
+                            let name = self.note_display_title(path);
                             let label = format!("{}  {name}", regular::LINK);
                             if ui
                                 .add_sized(
@@ -1415,8 +1412,13 @@ impl eframe::App for App {
                     ui.label(egui::RichText::new("Note").size(15.0).color(theme::WEAK));
                 } else {
                     let paths = self.tab_paths();
-                    let tab_action =
-                        tabs::show(ui, &paths, self.selected.as_deref(), self.dirty);
+                    let tab_action = tabs::show(
+                        ui,
+                        &paths,
+                        self.selected.as_deref(),
+                        self.dirty,
+                        |path| self.note_display_title(path),
+                    );
                     tab_select = tab_action.select;
                     tab_close = tab_action.close;
                 }
@@ -1477,6 +1479,29 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Keep the open note's sidebar/tab title in sync with the buffer's first line.
+    fn sync_live_title(&mut self) {
+        let Some(sel) = self.selected.clone() else {
+            return;
+        };
+        let title = title_from_content(&self.buffer, &sel);
+        if let Some(n) = self.notes.iter_mut().find(|n| n.rel_path == sel) {
+            n.title = title;
+        }
+    }
+
+    fn note_display_title(&self, path: &str) -> String {
+        if self.selected.as_deref() == Some(path) {
+            return title_from_content(&self.buffer, path);
+        }
+        self.notes
+            .iter()
+            .find(|n| n.rel_path == path)
+            .map(|n| n.title.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| title_from_content("", path))
+    }
+
     /// Last-modified clock time of the open note (from file mtime / NoteMeta).
     fn selected_mtime_hhmm(&self) -> Option<String> {
         let rel = self.selected.as_ref()?;

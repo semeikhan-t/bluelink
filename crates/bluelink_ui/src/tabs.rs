@@ -15,7 +15,14 @@ const TITLE_SIZE: f32 = 16.0;
 const ICON_SIZE: f32 = 16.0;
 
 /// Browser-style tab strip for open notes.
-pub fn show(ui: &mut Ui, tabs: &[String], active: Option<&str>, dirty: bool) -> TabAction {
+/// `title_of(path)` returns the display title (usually first line of the note).
+pub fn show(
+    ui: &mut Ui,
+    tabs: &[String],
+    active: Option<&str>,
+    dirty: bool,
+    mut title_of: impl FnMut(&str) -> String,
+) -> TabAction {
     let mut action = TabAction::default();
     if tabs.is_empty() {
         return action;
@@ -51,7 +58,7 @@ pub fn show(ui: &mut Ui, tabs: &[String], active: Option<&str>, dirty: bool) -> 
 
             for path in tabs {
                 let is_active = active == Some(path.as_str());
-                let title = tab_title(path);
+                let title = truncate_title(&title_of(path));
                 tab_chip(
                     ui,
                     path,
@@ -227,12 +234,7 @@ fn paint_glyph(ui: &Ui, anchor: egui::Pos2, text: &str, size: f32, color: Color3
     ui.painter().galley(pos, galley, color);
 }
 
-fn tab_title(path: &str) -> String {
-    let raw = path
-        .rsplit('/')
-        .next()
-        .unwrap_or(path)
-        .trim_end_matches(".md");
+fn truncate_title(raw: &str) -> String {
     if raw.chars().count() <= TITLE_MAX {
         return raw.to_string();
     }

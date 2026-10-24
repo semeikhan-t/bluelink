@@ -64,6 +64,7 @@ fn crud_roundtrip() {
 
     let meta = vault.write("inbox/todo.md", "# Todo\n").unwrap();
     assert_eq!(meta.rel_path, "inbox/todo.md");
+    assert_eq!(meta.title, "Todo");
     assert_eq!(meta.size, "# Todo\n".len() as u64);
     assert!(!meta.sha256.is_empty());
 

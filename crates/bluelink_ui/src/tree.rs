@@ -241,12 +241,15 @@ fn note_row(
 
     let id = Id::new(("note_dnd", note.rel_path.as_str()));
     let is_sel = selected == Some(note.rel_path.as_str());
-    let name = note
-        .rel_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(&note.rel_path)
-        .trim_end_matches(".md");
+    let name = if note.title.is_empty() {
+        note.rel_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&note.rel_path)
+            .trim_end_matches(".md")
+    } else {
+        note.title.as_str()
+    };
     let text = format!("{}  {name}", regular::NOTE);
     let label = if is_sel {
         RichText::new(text)
