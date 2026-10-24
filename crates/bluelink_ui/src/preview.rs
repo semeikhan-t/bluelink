@@ -1,11 +1,60 @@
 use bluelink_core::{parse_preview, split_wikilinks, PreviewBlock, Span, Vault};
-use egui::{Color32, CursorIcon, FontFamily, FontId, RichText, Sense, Ui};
+use egui::{Color32, CornerRadius, CursorIcon, FontFamily, FontId, RichText, Sense, Ui};
 
 use crate::theme;
+
+/// Role of a source line inside a fenced code block (``` / ~~~).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceRole {
+    Outside,
+    Open,
+    Body,
+    Close,
+}
+
+/// Update fence state for `line` and return how it should be painted.
+pub fn advance_fence(line: &str, open: &mut Option<String>) -> FenceRole {
+    let trimmed = line.trim_start();
+    if let Some(marker) = open.as_deref() {
+        if is_closing_fence(trimmed, marker) {
+            *open = None;
+            return FenceRole::Close;
+        }
+        return FenceRole::Body;
+    }
+    if let Some(marker) = opening_fence_marker(trimmed) {
+        *open = Some(marker.to_string());
+        return FenceRole::Open;
+    }
+    FenceRole::Outside
+}
+
+fn opening_fence_marker(trimmed: &str) -> Option<&'static str> {
+    if trimmed.starts_with("```") {
+        Some("```")
+    } else if trimmed.starts_with("~~~") {
+        Some("~~~")
+    } else {
+        None
+    }
+}
+
+fn is_closing_fence(trimmed: &str, marker: &str) -> bool {
+    let ch = marker.chars().next().unwrap_or('`');
+    let n = trimmed.chars().take_while(|c| *c == ch).count();
+    n >= marker.chars().count() && trimmed[n..].trim().is_empty()
+}
 
 /// Font for the raw line editor — same size/face as the preview of that line,
 /// so activating a row doesn't jump in height.
 pub fn edit_font(line: &str) -> FontId {
+    edit_font_for(line, FenceRole::Outside)
+}
+
+pub fn edit_font_for(line: &str, role: FenceRole) -> FontId {
+    if !matches!(role, FenceRole::Outside) {
+        return FontId::new(16.0, FontFamily::Monospace);
+    }
     let doc = parse_preview(line);
     match doc.blocks.first() {
         Some(PreviewBlock::Heading { level, .. }) => {
@@ -29,7 +78,15 @@ pub enum LineClick {
 
 /// Compact preview of a single source line.
 /// Wikilinks render as accent underlines; click opens them. Other text click → edit.
-pub fn render_line(ui: &mut Ui, vault: &Vault, line: &str) -> LineClick {
+pub fn render_line_with_role(
+    ui: &mut Ui,
+    vault: &Vault,
+    line: &str,
+    role: FenceRole,
+) -> LineClick {
+    if !matches!(role, FenceRole::Outside) {
+        return render_fence_stripe(ui, line, role);
+    }
     if line.is_empty() {
         let resp =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), Sense::click());
@@ -49,6 +106,65 @@ pub fn render_line(ui: &mut Ui, vault: &Vault, line: &str) -> LineClick {
         click = merge_click(click, render_text_with_wikis(ui, vault, line, 17.0, false, 0));
     }
     click
+}
+
+/// One stripe of a multi-line fenced code block (open / body / close).
+fn render_fence_stripe(ui: &mut Ui, line: &str, role: FenceRole) -> LineClick {
+    let r = theme::ROUND;
+    let corners = match role {
+        FenceRole::Open => CornerRadius {
+            nw: r,
+            ne: r,
+            sw: 0,
+            se: 0,
+        },
+        FenceRole::Close => CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: r,
+            se: r,
+        },
+        FenceRole::Body => CornerRadius::ZERO,
+        FenceRole::Outside => CornerRadius::ZERO,
+    };
+    let (top, bottom) = match role {
+        FenceRole::Open => (8, 2),
+        FenceRole::Close => (2, 8),
+        FenceRole::Body => (2, 2),
+        FenceRole::Outside => (4, 4),
+    };
+    let rich = match role {
+        FenceRole::Open | FenceRole::Close => RichText::new(line)
+            .size(14.0)
+            .monospace()
+            .color(theme::WEAK),
+        FenceRole::Body | FenceRole::Outside => {
+            let shown = if line.is_empty() { " " } else { line };
+            RichText::new(shown).size(16.0).monospace()
+        }
+    };
+
+    let mut clicked = false;
+    // No per-stripe stroke — adjacent stripes stack into one continuous block.
+    egui::Frame::NONE
+        .fill(theme::CODE_BG)
+        .corner_radius(corners)
+        .inner_margin(egui::Margin {
+            left: 12,
+            right: 12,
+            top,
+            bottom,
+        })
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            let resp = ui.add(egui::Label::new(rich).sense(Sense::click()));
+            clicked = resp.clicked();
+        });
+    if clicked {
+        LineClick::Edit
+    } else {
+        LineClick::None
+    }
 }
 
 fn merge_click(a: LineClick, b: LineClick) -> LineClick {
@@ -104,6 +220,11 @@ fn render_block_compact(ui: &mut Ui, vault: &Vault, block: &PreviewBlock) -> Lin
             click
         }
         PreviewBlock::CodeBlock { code, .. } => {
+            // Lone ``` lines parse as empty code blocks — don't draw hollow pills;
+            // multi-line fences are handled via FenceRole in the editor.
+            if code.trim().is_empty() {
+                return render_fence_stripe(ui, "```", FenceRole::Open);
+            }
             let mut clicked = false;
             egui::Frame::NONE
                 .fill(theme::CODE_BG)
@@ -111,6 +232,7 @@ fn render_block_compact(ui: &mut Ui, vault: &Vault, block: &PreviewBlock) -> Lin
                 .corner_radius(theme::round())
                 .inner_margin(egui::Margin::symmetric(12, 8))
                 .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
                     let resp = ui.add(
                         egui::Label::new(
                             RichText::new(code.trim_end_matches('\n'))
@@ -211,11 +333,20 @@ fn render_one_span(
             }
         }
         Span::Code(t) => {
-            let resp = ui.add(
-                egui::Label::new(RichText::new(t).size(size).monospace().code())
-                    .sense(Sense::click()),
-            );
-            if resp.clicked() {
+            // Same CODE_BG as fenced blocks — RichText::code() is too subtle here.
+            let mut clicked = false;
+            egui::Frame::NONE
+                .fill(theme::CODE_BG)
+                .corner_radius(theme::round_sm())
+                .inner_margin(egui::Margin::symmetric(6, 2))
+                .show(ui, |ui| {
+                    let resp = ui.add(
+                        egui::Label::new(RichText::new(t).size(size).monospace())
+                            .sense(Sense::click()),
+                    );
+                    clicked = resp.clicked();
+                });
+            if clicked {
                 LineClick::Edit
             } else {
                 LineClick::None
@@ -287,4 +418,20 @@ fn lighten(c: Color32) -> Color32 {
         c.g().saturating_add(48),
         c.b().saturating_add(36),
     )
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+
+    #[test]
+    fn tracks_fenced_block_roles() {
+        let mut open = None;
+        assert_eq!(advance_fence("```rust", &mut open), FenceRole::Open);
+        assert!(open.is_some());
+        assert_eq!(advance_fence("let x = 1;", &mut open), FenceRole::Body);
+        assert_eq!(advance_fence("```", &mut open), FenceRole::Close);
+        assert!(open.is_none());
+        assert_eq!(advance_fence("after", &mut open), FenceRole::Outside);
+    }
 }

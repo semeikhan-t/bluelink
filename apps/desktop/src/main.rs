@@ -52,6 +52,8 @@ struct DesktopApp {
 
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let t0 = std::time::Instant::now();
+
         if let Some(root) = self.inner.vault_root() {
             let root = root.to_path_buf();
             let needs = self
@@ -69,6 +71,11 @@ impl eframe::App for DesktopApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         self.inner.update(ctx, frame);
+
+        let ms = t0.elapsed().as_millis();
+        if ms > 100 {
+            eprintln!("bluelink: slow frame {ms}ms");
+        }
     }
 }
 

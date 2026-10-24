@@ -1,18 +1,19 @@
 //! Notion-like right-click menu for the live Markdown editor.
+//!
+//! Single `Area` popup (not per-line egui `context_menu`) to avoid freezing the UI.
+//! Submenus are our own side panels — not egui `menu_button`.
 
-use egui::{Ui, ViewportCommand};
+use egui::{Id, Pos2, Rect, Ui, Vec2, ViewportCommand};
 use egui_phosphor::regular;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorAction {
     WikiLink,
     ExternalLink,
-    /// Wrap selection (or insert markers at cursor) with `before` / `after`.
     Wrap {
         before: &'static str,
         after: &'static str,
     },
-    /// Replace Markdown block prefix on the current line (`""` = plain).
     SetLinePrefix(&'static str),
     InsertSnippet(&'static str),
     Cut,
@@ -21,170 +22,228 @@ pub enum EditorAction {
     SelectAll,
 }
 
-/// Draw the context-menu contents. Returns the chosen action, if any.
-pub fn menu_ui(ui: &mut Ui, has_selection: bool) -> Option<EditorAction> {
-    let mut action = None;
-
-    if ui
-        .button(format!("{}  Add link", regular::LINK))
-        .clicked()
-    {
-        action = Some(EditorAction::WikiLink);
-        ui.close_menu();
-    }
-    if ui
-        .button(format!("{}  Add external link", regular::ARROW_SQUARE_OUT))
-        .clicked()
-    {
-        action = Some(EditorAction::ExternalLink);
-        ui.close_menu();
-    }
-
-    ui.separator();
-
-    ui.menu_button(format!("{}  Format", regular::PAINT_BRUSH), |ui| {
-        if ui
-            .button(format!("{}  Bold", regular::TEXT_B))
-            .clicked()
-        {
-            action = Some(EditorAction::Wrap {
-                before: "**",
-                after: "**",
-            });
-            ui.close_menu();
-        }
-        if ui
-            .button(format!("{}  Italic", regular::TEXT_ITALIC))
-            .clicked()
-        {
-            action = Some(EditorAction::Wrap {
-                before: "*",
-                after: "*",
-            });
-            ui.close_menu();
-        }
-        if ui.button(format!("{}  Code", regular::CODE)).clicked() {
-            action = Some(EditorAction::Wrap {
-                before: "`",
-                after: "`",
-            });
-            ui.close_menu();
-        }
-    });
-
-    ui.menu_button(format!("{}  Paragraph", regular::PARAGRAPH), |ui| {
-        if ui
-            .button(format!("{}  Plain text", regular::TEXT_T))
-            .clicked()
-        {
-            action = Some(EditorAction::SetLinePrefix(""));
-            ui.close_menu();
-        }
-        if ui
-            .button(format!("{}  Heading 1", regular::TEXT_H_ONE))
-            .clicked()
-        {
-            action = Some(EditorAction::SetLinePrefix("# "));
-            ui.close_menu();
-        }
-        if ui
-            .button(format!("{}  Heading 2", regular::TEXT_H_TWO))
-            .clicked()
-        {
-            action = Some(EditorAction::SetLinePrefix("## "));
-            ui.close_menu();
-        }
-        if ui
-            .button(format!("{}  Heading 3", regular::TEXT_H_THREE))
-            .clicked()
-        {
-            action = Some(EditorAction::SetLinePrefix("### "));
-            ui.close_menu();
-        }
-        if ui
-            .button(format!("{}  Quote", regular::TEXT_AA))
-            .clicked()
-        {
-            action = Some(EditorAction::SetLinePrefix("> "));
-            ui.close_menu();
-        }
-        if ui
-            .button(format!("{}  Bullet list", regular::LIST_BULLETS))
-            .clicked()
-        {
-            action = Some(EditorAction::SetLinePrefix("- "));
-            ui.close_menu();
-        }
-        if ui
-            .button(format!("{}  Numbered list", regular::LIST_NUMBERS))
-            .clicked()
-        {
-            action = Some(EditorAction::SetLinePrefix("1. "));
-            ui.close_menu();
-        }
-    });
-
-    ui.menu_button(format!("{}  Insert", regular::LIST_PLUS), |ui| {
-        if ui
-            .button(format!("{}  Code block", regular::CODE_BLOCK))
-            .clicked()
-        {
-            action = Some(EditorAction::InsertSnippet("```\n\n```"));
-            ui.close_menu();
-        }
-        if ui
-            .button(format!("{}  Divider", regular::MINUS))
-            .clicked()
-        {
-            action = Some(EditorAction::InsertSnippet("---"));
-            ui.close_menu();
-        }
-    });
-
-    ui.separator();
-
-    ui.add_enabled_ui(has_selection, |ui| {
-        if ui
-            .button(format!("{}  Cut", regular::SCISSORS))
-            .clicked()
-        {
-            action = Some(EditorAction::Cut);
-            ui.close_menu();
-        }
-        if ui.button(format!("{}  Copy", regular::COPY)).clicked() {
-            action = Some(EditorAction::Copy);
-            ui.close_menu();
-        }
-    });
-    if ui
-        .button(format!("{}  Paste", regular::CLIPBOARD))
-        .clicked()
-    {
-        action = Some(EditorAction::Paste);
-        ui.close_menu();
-    }
-    if ui
-        .button(format!("{}  Paste as plain text", regular::CLIPBOARD_TEXT))
-        .clicked()
-    {
-        action = Some(EditorAction::Paste);
-        ui.close_menu();
-    }
-
-    ui.separator();
-
-    if ui
-        .button(format!("{}  Select all", regular::SELECTION_ALL))
-        .clicked()
-    {
-        action = Some(EditorAction::SelectAll);
-        ui.close_menu();
-    }
-
-    action
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubMenu {
+    Format,
+    Paragraph,
+    Insert,
 }
 
-/// Dispatch clipboard viewport commands (TextEdit must be focused).
+/// Where the popup was opened and how to apply the chosen action.
+#[derive(Clone)]
+pub struct CtxMenu {
+    pub pos: Pos2,
+    /// Live-mode line index; `None` = full-document edit buffer.
+    pub line: Option<usize>,
+    pub primary: usize,
+    pub secondary: usize,
+    submenu: Option<SubMenu>,
+}
+
+const CTX_KEY: &str = "bluelink_editor_ctx_menu";
+
+pub fn load_menu(ctx: &egui::Context) -> Option<CtxMenu> {
+    ctx.data_mut(|d| d.get_temp::<Option<CtxMenu>>(Id::new(CTX_KEY)).flatten())
+}
+
+pub fn store_menu(ctx: &egui::Context, menu: Option<CtxMenu>) {
+    ctx.data_mut(|d| d.insert_temp(Id::new(CTX_KEY), menu));
+}
+
+pub fn open_at(
+    ctx: &egui::Context,
+    pos: Pos2,
+    line: Option<usize>,
+    primary: usize,
+    secondary: usize,
+) {
+    store_menu(
+        ctx,
+        Some(CtxMenu {
+            pos,
+            line,
+            primary,
+            secondary,
+            submenu: None,
+        }),
+    );
+}
+
+pub fn close(ctx: &egui::Context) {
+    store_menu(ctx, None);
+}
+
+/// Draw the floating menu if open. Returns the chosen action (and closes).
+pub fn show_popup(ctx: &egui::Context) -> Option<(CtxMenu, EditorAction)> {
+    let Some(mut menu) = load_menu(ctx) else {
+        return None;
+    };
+
+    let has_selection = menu.primary != menu.secondary;
+    let mut action = None;
+    let mut hit_rects: Vec<Rect> = Vec::new();
+
+    let main = egui::Area::new(Id::new("bluelink_editor_ctx_popup"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(menu.pos)
+        .sense(egui::Sense::hover())
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(210.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
+
+                if row(ui, regular::LINK, "Add link", false) {
+                    action = Some(EditorAction::WikiLink);
+                }
+                if row(ui, regular::ARROW_SQUARE_OUT, "Add external link", false) {
+                    action = Some(EditorAction::ExternalLink);
+                }
+
+                ui.separator();
+
+                if row(ui, regular::PAINT_BRUSH, "Format", true) {
+                    menu.submenu = Some(SubMenu::Format);
+                }
+                if row(ui, regular::PARAGRAPH, "Paragraph", true) {
+                    menu.submenu = Some(SubMenu::Paragraph);
+                }
+                if row(ui, regular::LIST_PLUS, "Insert", true) {
+                    menu.submenu = Some(SubMenu::Insert);
+                }
+
+                ui.separator();
+
+                ui.add_enabled_ui(has_selection, |ui| {
+                    if row(ui, regular::SCISSORS, "Cut", false) {
+                        action = Some(EditorAction::Cut);
+                    }
+                    if row(ui, regular::COPY, "Copy", false) {
+                        action = Some(EditorAction::Copy);
+                    }
+                });
+                if row(ui, regular::CLIPBOARD, "Paste", false) {
+                    action = Some(EditorAction::Paste);
+                }
+                if row(ui, regular::CLIPBOARD_TEXT, "Paste as plain text", false) {
+                    action = Some(EditorAction::Paste);
+                }
+
+                ui.separator();
+
+                if row(ui, regular::SELECTION_ALL, "Select all", false) {
+                    action = Some(EditorAction::SelectAll);
+                }
+            });
+        });
+    hit_rects.push(main.response.rect);
+
+    if let Some(sub) = menu.submenu {
+        let sub_pos = Pos2::new(main.response.rect.right() + 4.0, main.response.rect.top());
+        let sub_area = egui::Area::new(Id::new("bluelink_editor_ctx_sub"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(sub_pos)
+            .sense(egui::Sense::hover())
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(180.0);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    match sub {
+                        SubMenu::Format => {
+                            if row(ui, regular::TEXT_B, "Bold", false) {
+                                action = Some(EditorAction::Wrap {
+                                    before: "**",
+                                    after: "**",
+                                });
+                            }
+                            if row(ui, regular::TEXT_ITALIC, "Italic", false) {
+                                action = Some(EditorAction::Wrap {
+                                    before: "*",
+                                    after: "*",
+                                });
+                            }
+                            if row(ui, regular::CODE, "Code", false) {
+                                action = Some(EditorAction::Wrap {
+                                    before: "`",
+                                    after: "`",
+                                });
+                            }
+                        }
+                        SubMenu::Paragraph => {
+                            if row(ui, regular::TEXT_T, "Plain text", false) {
+                                action = Some(EditorAction::SetLinePrefix(""));
+                            }
+                            if row(ui, regular::TEXT_H_ONE, "Heading 1", false) {
+                                action = Some(EditorAction::SetLinePrefix("# "));
+                            }
+                            if row(ui, regular::TEXT_H_TWO, "Heading 2", false) {
+                                action = Some(EditorAction::SetLinePrefix("## "));
+                            }
+                            if row(ui, regular::TEXT_H_THREE, "Heading 3", false) {
+                                action = Some(EditorAction::SetLinePrefix("### "));
+                            }
+                            if row(ui, regular::TEXT_AA, "Quote", false) {
+                                action = Some(EditorAction::SetLinePrefix("> "));
+                            }
+                            if row(ui, regular::LIST_BULLETS, "Bullet list", false) {
+                                action = Some(EditorAction::SetLinePrefix("- "));
+                            }
+                            if row(ui, regular::LIST_NUMBERS, "Numbered list", false) {
+                                action = Some(EditorAction::SetLinePrefix("1. "));
+                            }
+                        }
+                        SubMenu::Insert => {
+                            if row(ui, regular::CODE_BLOCK, "Code block", false) {
+                                action = Some(EditorAction::InsertSnippet("```\n\n```"));
+                            }
+                            if row(ui, regular::MINUS, "Divider", false) {
+                                action = Some(EditorAction::InsertSnippet("---"));
+                            }
+                        }
+                    }
+                });
+            });
+        hit_rects.push(sub_area.response.rect);
+    }
+
+    // Persist submenu open state when no action yet.
+    if action.is_none() {
+        store_menu(ctx, Some(menu.clone()));
+    }
+
+    let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    let click_outside = ctx.input(|i| {
+        i.pointer.primary_clicked()
+            && i.pointer
+                .interact_pos()
+                .is_some_and(|p| hit_rects.iter().all(|r| !r.contains(p)))
+    });
+
+    // Never discard a chosen action — click_outside can race with button clicks.
+    if action.is_some() {
+        close(ctx);
+        return action.map(|a| (menu, a));
+    }
+
+    if escape || click_outside {
+        close(ctx);
+    }
+
+    None
+}
+
+fn row(ui: &mut Ui, icon: &str, label: &str, has_sub: bool) -> bool {
+    let text = if has_sub {
+        format!("{icon}  {label}          ›")
+    } else {
+        format!("{icon}  {label}")
+    };
+    ui.add_sized(
+        Vec2::new(ui.available_width(), ui.spacing().interact_size.y),
+        egui::Button::new(text),
+    )
+    .clicked()
+}
+
 pub fn dispatch_clipboard(ui: &Ui, action: &EditorAction) {
     let cmd = match action {
         EditorAction::Cut => Some(ViewportCommand::RequestCut),
@@ -197,7 +256,6 @@ pub fn dispatch_clipboard(ui: &Ui, action: &EditorAction) {
     }
 }
 
-/// Char index → byte index.
 pub fn char_to_byte(text: &str, char_idx: usize) -> usize {
     text.char_indices()
         .nth(char_idx)
@@ -205,7 +263,6 @@ pub fn char_to_byte(text: &str, char_idx: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-/// Wrap selection (or insert markers at caret). Returns new caret char index.
 pub fn wrap_selection(
     text: &mut String,
     primary: usize,
@@ -223,7 +280,6 @@ pub fn wrap_selection(
     lo + before.chars().count() + selected.chars().count()
 }
 
-/// Strip ATX heading / quote / list prefixes from a single line.
 pub fn strip_line_prefix(line: &str) -> String {
     let s = line.trim_start();
     let s = if let Some(rest) = s.strip_prefix('>') {
@@ -265,7 +321,6 @@ fn numbered_list_rest(s: &str) -> Option<&str> {
     rest.strip_prefix(". ")
 }
 
-/// Replace the Markdown block prefix on a single line.
 pub fn set_line_prefix(line: &str, prefix: &str) -> String {
     let body = strip_line_prefix(line);
     if prefix.is_empty() {
@@ -275,8 +330,6 @@ pub fn set_line_prefix(line: &str, prefix: &str) -> String {
     }
 }
 
-/// Apply a line-prefix change at the caret's line inside a multi-line buffer.
-/// Returns new caret char index (start of body after prefix).
 pub fn set_prefix_at_char(text: &mut String, char_idx: usize, prefix: &str) -> usize {
     let byte = char_to_byte(text, char_idx);
     let line_start = text[..byte].rfind('\n').map(|i| i + 1).unwrap_or(0);
@@ -291,7 +344,6 @@ pub fn set_prefix_at_char(text: &mut String, char_idx: usize, prefix: &str) -> u
     start_chars + prefix.chars().count()
 }
 
-/// Insert (or replace selection) with `snippet`. Returns caret after snippet.
 pub fn insert_at(text: &mut String, primary: usize, secondary: usize, snippet: &str) -> usize {
     let lo = primary.min(secondary);
     let hi = primary.max(secondary);
@@ -301,7 +353,6 @@ pub fn insert_at(text: &mut String, primary: usize, secondary: usize, snippet: &
     lo + snippet.chars().count()
 }
 
-/// Apply text-mutating actions. Returns new primary caret char index when text changed.
 pub fn apply_text_action(
     text: &mut String,
     primary: usize,
@@ -322,7 +373,6 @@ pub fn apply_text_action(
             let lo = primary.min(secondary);
             let hi = primary.max(secondary);
             if lo == hi {
-                // Cursor lands inside the URL placeholder.
                 let caret = insert_at(text, primary, secondary, "[](https://)");
                 Some(caret - ")".chars().count())
             } else {
@@ -331,16 +381,13 @@ pub fn apply_text_action(
                 let selected = text[byte_lo..byte_hi].to_string();
                 let replacement = format!("[{selected}](https://)");
                 text.replace_range(byte_lo..byte_hi, &replacement);
-                // After `](https://` — before closing `)`.
                 Some(lo + selected.chars().count() + "](https://".chars().count())
             }
         }
         EditorAction::Wrap { before, after } => {
             Some(wrap_selection(text, primary, secondary, before, after))
         }
-        EditorAction::SetLinePrefix(prefix) => {
-            Some(set_prefix_at_char(text, primary, prefix))
-        }
+        EditorAction::SetLinePrefix(prefix) => Some(set_prefix_at_char(text, primary, prefix)),
         EditorAction::InsertSnippet(snippet) => {
             Some(insert_at(text, primary, secondary, snippet))
         }
@@ -360,7 +407,7 @@ mod tests {
         let mut s = "hello world".to_string();
         let caret = wrap_selection(&mut s, 0, 5, "**", "**");
         assert_eq!(s, "**hello** world");
-        assert_eq!(caret, 7); // after "**hello"
+        assert_eq!(caret, 7);
     }
 
     #[test]
@@ -385,7 +432,6 @@ mod tests {
     #[test]
     fn set_prefix_in_multiline() {
         let mut s = "a\n## Hello\nc".to_string();
-        // caret on 'H' of Hello
         let caret = set_prefix_at_char(&mut s, 5, "- ");
         assert_eq!(s, "a\n- Hello\nc");
         assert_eq!(&s[char_to_byte(&s, caret)..], "Hello\nc");
