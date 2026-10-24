@@ -206,59 +206,56 @@ fn tab_chip(
 
 /// Browser-tab ear: concave join from the vertical tab edge into the document rule.
 ///
-/// Left ear geometry (right is mirrored):
-/// - clip square sits left of the tab, above the rule
-/// - circle centered at the outer corner of that square
-/// - SE quarter becomes tab/content color → strip keeps a concave bite
-/// - arc stroke continues the document border into the tab side
+/// Fill the ear square with the tab/content color, then cut a strip-colored
+/// quarter-circle from the outer corner. That leaves a convex tab foot and a
+/// concave strip corner — the same trick browser chrome uses.
 fn paint_tab_join(ui: &Ui, left: f32, right: f32, rule_y: f32, strip: Color32, edge: Stroke) {
     let r = theme::ROUND as f32;
 
-    // Hide the sharp L where the side stroke met the rule; the arc replaces it.
-    ui.painter().rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(left - 1.0, rule_y - r),
-            egui::pos2(left + 2.0, rule_y + 1.0),
-        ),
-        egui::CornerRadius::ZERO,
-        theme::BG,
-    );
-    ui.painter().rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(right - 2.0, rule_y - r),
-            egui::pos2(right + 1.0, rule_y + 1.0),
-        ),
-        egui::CornerRadius::ZERO,
-        theme::BG,
-    );
-
     // Left ear
-    let left_clip = egui::Rect::from_min_max(
+    let left_ear = egui::Rect::from_min_max(
         egui::pos2(left - r, rule_y - r),
         egui::pos2(left, rule_y),
     );
-    let left_center = egui::pos2(left - r, rule_y - r);
     ui.painter()
-        .rect_filled(left_clip, egui::CornerRadius::ZERO, strip);
+        .rect_filled(left_ear, egui::CornerRadius::ZERO, theme::BG);
     {
-        let p = ui.painter().with_clip_rect(left_clip);
-        p.circle_filled(left_center, r, theme::BG);
-        p.circle_stroke(left_center, r, edge);
+        let center = egui::pos2(left - r, rule_y - r);
+        let p = ui.painter().with_clip_rect(left_ear);
+        p.circle_filled(center, r, strip);
+        p.circle_stroke(center, r, edge);
     }
+    // Remove the sharp L of the side stroke; the arc takes over from here.
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(left, rule_y - r),
+            egui::pos2(left + 1.5, rule_y + 0.5),
+        ),
+        egui::CornerRadius::ZERO,
+        theme::BG,
+    );
 
     // Right ear
-    let right_clip = egui::Rect::from_min_max(
+    let right_ear = egui::Rect::from_min_max(
         egui::pos2(right, rule_y - r),
         egui::pos2(right + r, rule_y),
     );
-    let right_center = egui::pos2(right + r, rule_y - r);
     ui.painter()
-        .rect_filled(right_clip, egui::CornerRadius::ZERO, strip);
+        .rect_filled(right_ear, egui::CornerRadius::ZERO, theme::BG);
     {
-        let p = ui.painter().with_clip_rect(right_clip);
-        p.circle_filled(right_center, r, theme::BG);
-        p.circle_stroke(right_center, r, edge);
+        let center = egui::pos2(right + r, rule_y - r);
+        let p = ui.painter().with_clip_rect(right_ear);
+        p.circle_filled(center, r, strip);
+        p.circle_stroke(center, r, edge);
     }
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(right - 1.5, rule_y - r),
+            egui::pos2(right, rule_y + 0.5),
+        ),
+        egui::CornerRadius::ZERO,
+        theme::BG,
+    );
 }
 
 enum AlignX {
