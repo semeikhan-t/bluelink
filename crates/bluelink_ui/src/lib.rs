@@ -22,7 +22,16 @@ enum Dialog {
     NewFolder { name: String },
     NewVault { name: String },
     CreateLink { rel_path: String },
-    ConfirmDelete { path: String },
+}
+
+/// One undoable vault change (delete for now).
+enum UndoItem {
+    DeletedNote { path: String, content: String },
+    DeletedFolder {
+        path: String,
+        /// Notes that lived under the folder, with contents.
+        notes: Vec<(String, String)>,
+    },
 }
 
 /// Folder picker supplied by the host (desktop uses `rfd`).
@@ -53,6 +62,7 @@ pub struct App {
     /// SHA of selected note as last loaded/saved — used to detect external edits.
     selected_sha: Option<String>,
     registry: VaultRegistry,
+    undo_stack: Vec<UndoItem>,
 }
 
 impl App {
@@ -87,6 +97,7 @@ impl App {
             pick_folder,
             selected_sha: None,
             registry,
+            undo_stack: Vec::new(),
         };
 
         // --vault wins; otherwise reopen last known vault.
@@ -127,6 +138,7 @@ impl App {
                 let _ = self.registry.save();
                 self.vault = Some(vault);
                 self.open_tabs.clear();
+                self.undo_stack.clear();
                 self.selected = None;
                 self.buffer.clear();
                 self.dirty = false;
@@ -141,6 +153,7 @@ impl App {
                 self.vault = None;
                 self.folders.clear();
                 self.open_tabs.clear();
+                self.undo_stack.clear();
             }
         }
     }
@@ -153,6 +166,7 @@ impl App {
         self.notes.clear();
         self.folders.clear();
         self.open_tabs.clear();
+        self.undo_stack.clear();
         self.selected = None;
         self.buffer.clear();
         self.dirty = false;
@@ -520,18 +534,42 @@ impl App {
         }
     }
 
+    fn push_undo(&mut self, item: UndoItem) {
+        self.undo_stack.push(item);
+        const LIMIT: usize = 32;
+        if self.undo_stack.len() > LIMIT {
+            self.undo_stack.remove(0);
+        }
+    }
+
     fn delete_path(&mut self, rel: &str) {
-        let Some(vault) = self.vault.as_mut() else {
-            return;
-        };
         if self.folders.iter().any(|f| f == rel) {
             let prefix = format!("{rel}/");
+            // Snapshot note contents before delete for undo.
+            let mut notes = Vec::new();
+            if let Some(vault) = &self.vault {
+                for meta in &self.notes {
+                    if meta.rel_path.starts_with(&prefix) {
+                        if let Ok(content) = vault.read(&meta.rel_path) {
+                            notes.push((meta.rel_path.clone(), content));
+                        }
+                    }
+                }
+            }
             let clear_selected = self
                 .selected
                 .as_ref()
                 .is_some_and(|s| s.starts_with(&prefix));
-            match vault.delete_folder(rel) {
-                Ok(()) => {
+            let result = self
+                .vault
+                .as_mut()
+                .map(|v| v.delete_folder(rel));
+            match result {
+                Some(Ok(())) => {
+                    self.push_undo(UndoItem::DeletedFolder {
+                        path: rel.to_string(),
+                        notes,
+                    });
                     self.drop_tabs_with_prefix(rel);
                     if clear_selected {
                         self.selected = None;
@@ -546,14 +584,37 @@ impl App {
                         }
                     }
                     self.refresh_notes();
-                    self.status = format!("deleted folder {rel}");
+                    self.status = format!("deleted folder {rel} — Ctrl+Z to undo");
                 }
-                Err(e) => self.status = format!("delete folder failed: {e}"),
+                Some(Err(e)) => self.status = format!("delete folder failed: {e}"),
+                None => {}
             }
             return;
         }
-        match vault.delete(rel) {
-            Ok(()) => {
+
+        // Prefer unsaved buffer if this is the open note.
+        if self.dirty && self.selected.as_deref() == Some(rel) {
+            self.save_current();
+        }
+        let content = {
+            let Some(vault) = &self.vault else {
+                return;
+            };
+            match vault.read(rel) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.status = format!("delete failed: {e}");
+                    return;
+                }
+            }
+        };
+        let result = self.vault.as_mut().map(|v| v.delete(rel));
+        match result {
+            Some(Ok(())) => {
+                self.push_undo(UndoItem::DeletedNote {
+                    path: rel.to_string(),
+                    content,
+                });
                 let was_active = self.selected.as_deref() == Some(rel);
                 let idx = self.open_tabs.iter().position(|t| t == rel);
                 self.open_tabs.retain(|t| t != rel);
@@ -577,9 +638,65 @@ impl App {
                     }
                 }
                 self.refresh_notes();
-                self.status = format!("deleted {rel}");
+                self.status = format!("deleted {rel} — Ctrl+Z to undo");
             }
-            Err(e) => self.status = format!("delete failed: {e}"),
+            Some(Err(e)) => self.status = format!("delete failed: {e}"),
+            None => {}
+        }
+    }
+
+    fn undo(&mut self) {
+        let Some(item) = self.undo_stack.pop() else {
+            self.status = "nothing to undo".into();
+            return;
+        };
+        match item {
+            UndoItem::DeletedNote { path, content } => {
+                let title = path
+                    .trim_end_matches(".md")
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("Note");
+                let body = if content.is_empty() {
+                    format!("# {title}\n")
+                } else {
+                    content
+                };
+                let result = self.vault.as_mut().map(|v| v.write(&path, &body));
+                match result {
+                    Some(Ok(_)) => {
+                        self.refresh_notes();
+                        self.open_note_in_new_tab(&path);
+                        self.status = format!("restored {path}");
+                    }
+                    Some(Err(e)) => self.status = format!("undo failed: {e}"),
+                    None => {}
+                }
+            }
+            UndoItem::DeletedFolder { path, notes } => {
+                let restore_err = {
+                    let Some(vault) = self.vault.as_mut() else {
+                        return;
+                    };
+                    if let Err(e) = vault.create_folder(&path) {
+                        Some(e)
+                    } else {
+                        notes.iter().find_map(|(note_path, content)| {
+                            vault.write(note_path, content).err()
+                        })
+                    }
+                };
+                if let Some(e) = restore_err {
+                    self.refresh_notes();
+                    self.status = format!("undo failed: {e}");
+                    return;
+                }
+                self.refresh_notes();
+                if let Some((first, _)) = notes.first() {
+                    self.open_note_in_new_tab(first);
+                }
+                self.status = format!("restored folder {path}");
+            }
         }
     }
 
@@ -741,7 +858,6 @@ impl App {
         let mut close = false;
         let mut confirm_create: Option<String> = None;
         let mut confirm_new: Option<String> = None;
-        let mut do_delete: Option<String> = None;
 
         let mut confirm_vault: Option<String> = None;
         let mut confirm_folder: Option<String> = None;
@@ -819,29 +935,6 @@ impl App {
                         });
                     });
             }
-            Some(Dialog::ConfirmDelete { path }) => {
-                let name = path.clone();
-                let kind = if self.folders.iter().any(|f| f == &name) {
-                    "folder"
-                } else {
-                    "note"
-                };
-                egui::Window::new(format!("Delete {kind}"))
-                    .collapsible(false)
-                    .resizable(false)
-                    .show(ctx, |ui| {
-                        ui.label(format!("Delete `{name}`?"));
-                        ui.horizontal(|ui| {
-                            if ui.button("Delete").clicked() {
-                                do_delete = Some(name.clone());
-                                close = true;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                close = true;
-                            }
-                        });
-                    });
-            }
             None => {}
         }
 
@@ -872,9 +965,6 @@ impl App {
             let rel = name.trim().trim_matches('/').to_string();
             self.create_folder(&rel);
         }
-        if let Some(path) = do_delete {
-            self.delete_path(&path);
-        }
     }
 }
 
@@ -898,15 +988,16 @@ impl eframe::App for App {
             }
         }
 
-        // Don't steal Delete from TextEdit / rename fields.
-        let can_bind_delete = !ctx.wants_keyboard_input() && self.dialog.is_none();
-        let (save, new_note, close_tab, next_tab, delete_note) = ctx.input_mut(|i| {
+        // Don't steal Delete/Z from TextEdit / rename fields.
+        let can_bind = !ctx.wants_keyboard_input() && self.dialog.is_none();
+        let (save, new_note, close_tab, next_tab, delete_note, undo) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::T),
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::W),
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab),
-                can_bind_delete && i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
+                can_bind && i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
+                can_bind && i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z),
             )
         });
         if save {
@@ -925,8 +1016,11 @@ impl eframe::App for App {
         }
         if delete_note {
             if let Some(path) = self.selected.clone() {
-                self.dialog = Some(Dialog::ConfirmDelete { path });
+                self.delete_path(&path);
             }
+        }
+        if undo {
+            self.undo();
         }
 
         self.show_dialogs(ctx);
@@ -1013,12 +1107,14 @@ impl eframe::App for App {
 
                 ui.label(egui::RichText::new("Notes").size(14.0).color(theme::WEAK));
                 ui.add_space(8.0);
+                let can_undo = !self.undo_stack.is_empty();
                 let action = tree::show_tree(
                     ui,
                     &self.notes,
                     &self.folders,
                     self.selected.as_deref(),
                     &mut self.renaming,
+                    can_undo,
                 );
                 if let Some(path) = action.select {
                     self.select_note(&path);
@@ -1052,7 +1148,10 @@ impl eframe::App for App {
                     self.rename_path(&from, &to);
                 }
                 if let Some(path) = action.delete {
-                    self.dialog = Some(Dialog::ConfirmDelete { path });
+                    self.delete_path(&path);
+                }
+                if action.undo {
+                    self.undo();
                 }
                 if let Some((from, to)) = action.move_note {
                     self.move_note(&from, &to);

@@ -29,6 +29,8 @@ pub struct TreeAction {
     pub cancel_rename: bool,
     /// Note or folder path to delete.
     pub delete: Option<String>,
+    /// Undo last delete.
+    pub undo: bool,
     /// Move note `from` → `to` (full rel paths).
     pub move_note: Option<(String, String)>,
 }
@@ -40,6 +42,7 @@ pub fn show_tree(
     folders: &[String],
     selected: Option<&str>,
     renaming: &mut Option<InlineRename>,
+    can_undo: bool,
 ) -> TreeAction {
     let mut action = TreeAction::default();
 
@@ -93,7 +96,8 @@ pub fn show_tree(
             by_folder.sort_by(|a, b| a.0.cmp(&b.0));
 
             for (folder, list) in &by_folder {
-                let dropped = folder_block(ui, folder, list, selected, renaming, &mut action);
+                let dropped =
+                    folder_block(ui, folder, list, selected, renaming, can_undo, &mut action);
                 if let Some(from) = dropped {
                     let file = basename(&from);
                     let to = format!("{folder}/{file}");
@@ -119,7 +123,7 @@ pub fn show_tree(
                     ui.add_space(4.0);
                 }
                 for note in &root_notes {
-                    note_row(ui, note, selected, renaming, &mut action);
+                    note_row(ui, note, selected, renaming, can_undo, &mut action);
                 }
                 // Keep a hit area when root is empty so drops still work.
                 if root_notes.is_empty() {
@@ -133,6 +137,10 @@ pub fn show_tree(
                     action.move_note = Some(((*from).clone(), to));
                 }
             }
+
+            // Empty space under the tree — still offers Undo via context menu.
+            let fill = ui.allocate_response(ui.available_size(), Sense::click());
+            panel_context_menu(&fill, can_undo, &mut action);
             }); // left-aligned layout
         });
 
@@ -145,6 +153,7 @@ fn folder_block(
     list: &[&NoteMeta],
     selected: Option<&str>,
     renaming: &mut Option<InlineRename>,
+    can_undo: bool,
     action: &mut TreeAction,
 ) -> Option<std::sync::Arc<String>> {
     let editing = renaming
@@ -169,7 +178,7 @@ fn folder_block(
                 );
             }
             for note in list {
-                note_row(ui, note, selected, renaming, action);
+                note_row(ui, note, selected, renaming, can_undo, action);
             }
         } else {
             let cr = egui::CollapsingHeader::new(
@@ -190,10 +199,10 @@ fn folder_block(
                     );
                 }
                 for note in list {
-                    note_row(ui, note, selected, renaming, action);
+                    note_row(ui, note, selected, renaming, can_undo, action);
                 }
             });
-            path_context_menu(&cr.header_response, folder, action, false);
+            path_context_menu(&cr.header_response, folder, action, false, can_undo);
         }
     });
     resp.response.dnd_release_payload::<String>()
@@ -204,6 +213,7 @@ fn note_row(
     note: &NoteMeta,
     selected: Option<&str>,
     renaming: &mut Option<InlineRename>,
+    can_undo: bool,
     action: &mut TreeAction,
 ) {
     let editing = renaming
@@ -278,7 +288,7 @@ fn note_row(
             action.select = Some(note.rel_path.clone());
         }
     }
-    path_context_menu(&response, &note.rel_path, action, true);
+    path_context_menu(&response, &note.rel_path, action, true, can_undo);
 }
 
 fn rename_field(
@@ -346,8 +356,21 @@ fn path_context_menu(
     path: &str,
     action: &mut TreeAction,
     is_note: bool,
+    can_undo: bool,
 ) {
     response.context_menu(|ui| {
+        ui.add_enabled_ui(can_undo, |ui| {
+            if ui
+                .button(format!("{}  Undo", regular::ARROW_COUNTER_CLOCKWISE))
+                .clicked()
+            {
+                action.undo = true;
+                ui.close_menu();
+            }
+        });
+        if can_undo {
+            ui.separator();
+        }
         if is_note
             && ui
                 .button(format!("{}  Open in new tab", regular::ARROW_SQUARE_OUT))
@@ -370,6 +393,20 @@ fn path_context_menu(
             action.delete = Some(path.to_string());
             ui.close_menu();
         }
+    });
+}
+
+fn panel_context_menu(response: &egui::Response, can_undo: bool, action: &mut TreeAction) {
+    response.context_menu(|ui| {
+        ui.add_enabled_ui(can_undo, |ui| {
+            if ui
+                .button(format!("{}  Undo", regular::ARROW_COUNTER_CLOCKWISE))
+                .clicked()
+            {
+                action.undo = true;
+                ui.close_menu();
+            }
+        });
     });
 }
 
