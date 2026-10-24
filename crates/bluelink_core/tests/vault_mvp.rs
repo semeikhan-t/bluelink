@@ -149,3 +149,17 @@ fn too_large_rejected() {
     let err = vault.write("huge.md", &big).unwrap_err();
     assert!(matches!(err, VaultError::TooLarge));
 }
+
+#[test]
+fn rename_and_delete_folder() {
+    let dir = tempdir().unwrap();
+    let mut vault = Vault::open(dir.path()).unwrap();
+    vault.create_folder("inbox").unwrap();
+    vault.write("inbox/a.md", "hi").unwrap();
+    vault.rename_folder("inbox", "archive").unwrap();
+    assert!(vault.read("archive/a.md").is_ok());
+    assert!(vault.read("inbox/a.md").is_err());
+    vault.delete_folder("archive").unwrap();
+    assert!(vault.read("archive/a.md").is_err());
+    assert!(!dir.path().join("archive").exists());
+}

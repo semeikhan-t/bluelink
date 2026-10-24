@@ -20,9 +20,10 @@ enum Dialog {
     NewNote { name: String },
     NewFolder { name: String },
     NewVault { name: String },
-    Rename { name: String },
+    /// `from` is the current note/folder path; `name` is the editable target.
+    Rename { from: String, name: String },
     CreateLink { rel_path: String },
-    ConfirmDelete,
+    ConfirmDelete { path: String },
 }
 
 /// Folder picker supplied by the host (desktop uses `rfd`).
@@ -324,12 +325,40 @@ impl App {
         }
     }
 
-    fn rename_selected(&mut self, new_name: &str) {
-        let Some(from) = self.selected.clone() else {
+    fn rename_path(&mut self, from: &str, new_name: &str) {
+        if self.folders.iter().any(|f| f == from) {
+            let to = new_name.trim().trim_matches('/').to_string();
+            if to.is_empty() || to == from {
+                return;
+            }
+            let Some(vault) = self.vault.as_mut() else {
+                return;
+            };
+            match vault.rename_folder(from, &to) {
+                Ok(()) => {
+                    let prefix = format!("{from}/");
+                    let selected_was_inside = self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|s| s.starts_with(&prefix));
+                    let new_selected = self.selected.as_ref().and_then(|s| {
+                        s.strip_prefix(&prefix)
+                            .map(|rest| format!("{to}/{rest}"))
+                    });
+                    self.refresh_notes();
+                    if selected_was_inside {
+                        if let Some(path) = new_selected {
+                            self.select_note(&path);
+                        }
+                    }
+                    self.status = format!("renamed folder to {to}");
+                }
+                Err(e) => self.status = format!("rename folder failed: {e}"),
+            }
             return;
-        };
+        }
         let to = normalize_note_path(new_name);
-        self.move_note(&from, &to);
+        self.move_note(from, &to);
     }
 
     fn move_note(&mut self, from: &str, to: &str) {
@@ -354,25 +383,46 @@ impl App {
         }
     }
 
-    fn delete_selected(&mut self) {
-        let Some(rel) = self.selected.clone() else {
-            return;
-        };
+    fn delete_path(&mut self, rel: &str) {
         let Some(vault) = self.vault.as_mut() else {
             return;
         };
-        match vault.delete(&rel) {
-            Ok(()) => {
-                self.selected = None;
-                self.buffer.clear();
-                self.dirty = false;
-                self.readonly = false;
-                self.selected_sha = None;
-                self.active_line = None;
-                self.doc_edit = false;
-                if let Ok(notes) = vault.list() {
-                    self.notes = notes;
+        if self.folders.iter().any(|f| f == rel) {
+            let prefix = format!("{rel}/");
+            let clear_selected = self
+                .selected
+                .as_ref()
+                .is_some_and(|s| s.starts_with(&prefix));
+            match vault.delete_folder(rel) {
+                Ok(()) => {
+                    if clear_selected {
+                        self.selected = None;
+                        self.buffer.clear();
+                        self.dirty = false;
+                        self.readonly = false;
+                        self.selected_sha = None;
+                        self.active_line = None;
+                        self.doc_edit = false;
+                    }
+                    self.refresh_notes();
+                    self.status = format!("deleted folder {rel}");
                 }
+                Err(e) => self.status = format!("delete folder failed: {e}"),
+            }
+            return;
+        }
+        match vault.delete(rel) {
+            Ok(()) => {
+                if self.selected.as_deref() == Some(rel) {
+                    self.selected = None;
+                    self.buffer.clear();
+                    self.dirty = false;
+                    self.readonly = false;
+                    self.selected_sha = None;
+                    self.active_line = None;
+                    self.doc_edit = false;
+                }
+                self.refresh_notes();
                 self.status = format!("deleted {rel}");
             }
             Err(e) => self.status = format!("delete failed: {e}"),
@@ -537,8 +587,8 @@ impl App {
         let mut close = false;
         let mut confirm_create: Option<String> = None;
         let mut confirm_new: Option<String> = None;
-        let mut confirm_rename: Option<String> = None;
-        let mut do_delete = false;
+        let mut confirm_rename: Option<(String, String)> = None;
+        let mut do_delete: Option<String> = None;
 
         let mut confirm_vault: Option<String> = None;
         let mut confirm_folder: Option<String> = None;
@@ -598,7 +648,7 @@ impl App {
                         });
                     });
             }
-            Some(Dialog::Rename { name }) => {
+            Some(Dialog::Rename { from, name }) => {
                 egui::Window::new("Rename")
                     .collapsible(false)
                     .resizable(false)
@@ -606,7 +656,7 @@ impl App {
                         ui.text_edit_singleline(name);
                         ui.horizontal(|ui| {
                             if ui.button("Rename").clicked() {
-                                confirm_rename = Some(name.clone());
+                                confirm_rename = Some((from.clone(), name.clone()));
                                 close = true;
                             }
                             if ui.button("Cancel").clicked() {
@@ -633,16 +683,21 @@ impl App {
                         });
                     });
             }
-            Some(Dialog::ConfirmDelete) => {
-                let name = self.selected.clone().unwrap_or_default();
-                egui::Window::new("Delete note")
+            Some(Dialog::ConfirmDelete { path }) => {
+                let name = path.clone();
+                let kind = if self.folders.iter().any(|f| f == &name) {
+                    "folder"
+                } else {
+                    "note"
+                };
+                egui::Window::new(format!("Delete {kind}"))
                     .collapsible(false)
                     .resizable(false)
                     .show(ctx, |ui| {
                         ui.label(format!("Delete `{name}`?"));
                         ui.horizontal(|ui| {
                             if ui.button("Delete").clicked() {
-                                do_delete = true;
+                                do_delete = Some(name.clone());
                                 close = true;
                             }
                             if ui.button("Cancel").clicked() {
@@ -681,11 +736,11 @@ impl App {
             let rel = name.trim().trim_matches('/').to_string();
             self.create_folder(&rel);
         }
-        if let Some(name) = confirm_rename {
-            self.rename_selected(&name);
+        if let Some((from, name)) = confirm_rename {
+            self.rename_path(&from, &name);
         }
-        if do_delete {
-            self.delete_selected();
+        if let Some(path) = do_delete {
+            self.delete_path(&path);
         }
     }
 }
@@ -810,12 +865,14 @@ impl eframe::App for App {
                         name: "inbox".into(),
                     });
                 }
-                if action.rename {
-                    let current = self.selected.clone().unwrap_or_default();
-                    self.dialog = Some(Dialog::Rename { name: current });
+                if let Some(path) = action.rename {
+                    self.dialog = Some(Dialog::Rename {
+                        from: path.clone(),
+                        name: path,
+                    });
                 }
-                if action.delete {
-                    self.dialog = Some(Dialog::ConfirmDelete);
+                if let Some(path) = action.delete {
+                    self.dialog = Some(Dialog::ConfirmDelete { path });
                 }
                 if let Some((from, to)) = action.move_note {
                     self.move_note(&from, &to);

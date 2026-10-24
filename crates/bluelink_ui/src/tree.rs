@@ -11,8 +11,10 @@ pub struct TreeAction {
     pub select: Option<String>,
     pub new_note: bool,
     pub new_folder: bool,
-    pub rename: bool,
-    pub delete: bool,
+    /// Note or folder path to rename.
+    pub rename: Option<String>,
+    /// Note or folder path to delete.
+    pub delete: Option<String>,
     /// Move note `from` → `to` (full rel paths).
     pub move_note: Option<(String, String)>,
 }
@@ -43,22 +45,6 @@ pub fn show_tree(
         {
             action.new_folder = true;
         }
-        ui.add_enabled_ui(selected.is_some(), |ui| {
-            if ui
-                .add(btn(regular::PENCIL_SIMPLE.to_string()))
-                .on_hover_text("Rename")
-                .clicked()
-            {
-                action.rename = true;
-            }
-            if ui
-                .add(btn(regular::TRASH.to_string()))
-                .on_hover_text("Delete")
-                .clicked()
-            {
-                action.delete = true;
-            }
-        });
     });
     ui.add_space(6.0);
     ui.separator();
@@ -144,7 +130,7 @@ fn folder_block(
 ) -> Option<std::sync::Arc<String>> {
     let resp = ui.vertical(|ui| {
         ui.set_min_width(ui.available_width());
-        egui::CollapsingHeader::new(
+        let cr = egui::CollapsingHeader::new(
             RichText::new(format!("{}  {folder}", regular::FOLDER))
                 .size(18.0)
                 .strong(),
@@ -171,6 +157,7 @@ fn folder_block(
                 note_row(ui, note, selected, action);
             }
         });
+        path_context_menu(&cr.header_response, folder, action);
     });
     resp.response.dnd_release_payload::<String>()
 }
@@ -223,6 +210,20 @@ fn note_row(ui: &mut Ui, note: &NoteMeta, selected: Option<&str>, action: &mut T
     if response.clicked() {
         action.select = Some(note.rel_path.clone());
     }
+    path_context_menu(&response, &note.rel_path, action);
+}
+
+fn path_context_menu(response: &egui::Response, path: &str, action: &mut TreeAction) {
+    response.context_menu(|ui| {
+        if ui.button("Rename").clicked() {
+            action.rename = Some(path.to_string());
+            ui.close_menu();
+        }
+        if ui.button("Delete").clicked() {
+            action.delete = Some(path.to_string());
+            ui.close_menu();
+        }
+    });
 }
 
 fn basename(rel: &str) -> &str {

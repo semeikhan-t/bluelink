@@ -160,6 +160,71 @@ impl Vault {
         note_meta_for(&abs_to, to)
     }
 
+    /// Rename a folder and rewrite index paths for notes inside it.
+    pub fn rename_folder(&mut self, from: &str, to: &str) -> Result<(), VaultError> {
+        let from = from.trim().trim_matches('/');
+        let to = to.trim().trim_matches('/');
+        path::validate_folder_rel(from)?;
+        path::validate_folder_rel(to)?;
+        if from == to {
+            return Ok(());
+        }
+
+        let abs_from = self.folder_abs(from)?;
+        if !abs_from.is_dir() {
+            return Err(VaultError::NotFound);
+        }
+        let abs_to = self.folder_abs(to)?;
+        if abs_to.exists() {
+            return Err(VaultError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "target already exists",
+            )));
+        }
+        if let Some(parent) = abs_to.parent() {
+            fs::create_dir_all(parent).map_err(VaultError::from_io)?;
+        }
+        fs::rename(&abs_from, &abs_to).map_err(VaultError::from_io)?;
+
+        let prefix = format!("{from}/");
+        let notes = self.list()?;
+        for note in notes {
+            if let Some(rest) = note.rel_path.strip_prefix(&prefix) {
+                self.index
+                    .rename_note(&note.rel_path, &format!("{to}/{rest}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete a folder and every note under it.
+    pub fn delete_folder(&mut self, rel: &str) -> Result<(), VaultError> {
+        let rel = rel.trim().trim_matches('/');
+        path::validate_folder_rel(rel)?;
+        let abs = self.folder_abs(rel)?;
+        if !abs.is_dir() {
+            return Err(VaultError::NotFound);
+        }
+
+        let prefix = format!("{rel}/");
+        let notes = self.list()?;
+        for note in notes {
+            if note.rel_path.starts_with(&prefix) {
+                self.index.remove_note(&note.rel_path);
+            }
+        }
+        fs::remove_dir_all(&abs).map_err(VaultError::from_io)?;
+        Ok(())
+    }
+
+    fn folder_abs(&self, rel: &str) -> Result<PathBuf, VaultError> {
+        let abs = self.root.join(rel);
+        if !abs.starts_with(&self.root) {
+            return Err(VaultError::InvalidPath);
+        }
+        Ok(abs)
+    }
+
     fn rebuild_index(&mut self) -> Result<(), VaultError> {
         self.index.clear();
         let notes = self.list()?;
