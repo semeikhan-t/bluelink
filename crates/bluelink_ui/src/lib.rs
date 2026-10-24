@@ -44,6 +44,9 @@ pub struct App {
     folders: Vec<String>,
     /// Open note tabs (browser-style), active = `selected`.
     open_tabs: Vec<String>,
+    /// Browser-style note navigation history.
+    nav_history: Vec<String>,
+    nav_index: usize,
     selected: Option<String>,
     buffer: String,
     dirty: bool,
@@ -83,6 +86,8 @@ impl App {
             notes: Vec::new(),
             folders: Vec::new(),
             open_tabs: Vec::new(),
+            nav_history: Vec::new(),
+            nav_index: 0,
             selected: None,
             buffer: String::new(),
             dirty: false,
@@ -138,6 +143,8 @@ impl App {
                 let _ = self.registry.save();
                 self.vault = Some(vault);
                 self.open_tabs.clear();
+                self.nav_history.clear();
+                self.nav_index = 0;
                 self.undo_stack.clear();
                 self.selected = None;
                 self.buffer.clear();
@@ -153,6 +160,8 @@ impl App {
                 self.vault = None;
                 self.folders.clear();
                 self.open_tabs.clear();
+                self.nav_history.clear();
+                self.nav_index = 0;
                 self.undo_stack.clear();
             }
         }
@@ -166,6 +175,8 @@ impl App {
         self.notes.clear();
         self.folders.clear();
         self.open_tabs.clear();
+        self.nav_history.clear();
+        self.nav_index = 0;
         self.undo_stack.clear();
         self.selected = None;
         self.buffer.clear();
@@ -266,15 +277,15 @@ impl App {
 
     /// Open a note in the current tab (replace), or switch to it if already open.
     fn select_note(&mut self, rel_path: &str) {
-        self.open_note(rel_path, false);
+        self.open_note(rel_path, false, true);
     }
 
     /// Open a note in a new tab (or focus existing tab for that path).
     fn open_note_in_new_tab(&mut self, rel_path: &str) {
-        self.open_note(rel_path, true);
+        self.open_note(rel_path, true, true);
     }
 
-    fn open_note(&mut self, rel_path: &str, new_tab: bool) {
+    fn open_note(&mut self, rel_path: &str, new_tab: bool, record_history: bool) {
         let already_open = self.open_tabs.iter().any(|t| t == rel_path);
         if already_open {
             // Just focus the existing tab.
@@ -315,6 +326,9 @@ impl App {
                     .find(|n| n.rel_path == rel_path)
                     .map(|n| n.sha256.clone());
                 self.status.clear();
+                if record_history {
+                    self.record_nav(rel_path);
+                }
             }
             Err(VaultError::NotUtf8) => {
                 self.buffer.clear();
@@ -326,10 +340,79 @@ impl App {
                 self.selected = Some(rel_path.to_string());
                 self.selected_sha = None;
                 self.status = "note is not UTF-8 (read-only)".into();
+                if record_history {
+                    self.record_nav(rel_path);
+                }
             }
             Err(e) => {
                 self.status = format!("read failed: {e}");
             }
+        }
+    }
+
+    fn record_nav(&mut self, path: &str) {
+        if self.nav_history.get(self.nav_index).map(String::as_str) == Some(path) {
+            return;
+        }
+        if !self.nav_history.is_empty() {
+            self.nav_history.truncate(self.nav_index.saturating_add(1));
+        }
+        self.nav_history.push(path.to_string());
+        self.nav_index = self.nav_history.len() - 1;
+    }
+
+    fn can_go_back(&self) -> bool {
+        self.nav_index > 0
+    }
+
+    fn can_go_forward(&self) -> bool {
+        !self.nav_history.is_empty() && self.nav_index + 1 < self.nav_history.len()
+    }
+
+    fn go_back(&mut self) {
+        while self.nav_index > 0 {
+            self.nav_index -= 1;
+            let path = self.nav_history[self.nav_index].clone();
+            if self.notes.iter().any(|n| n.rel_path == path) {
+                self.open_note(&path, false, false);
+                return;
+            }
+        }
+    }
+
+    fn go_forward(&mut self) {
+        while self.nav_index + 1 < self.nav_history.len() {
+            self.nav_index += 1;
+            let path = self.nav_history[self.nav_index].clone();
+            if self.notes.iter().any(|n| n.rel_path == path) {
+                self.open_note(&path, false, false);
+                return;
+            }
+        }
+    }
+
+    fn show_nav_buttons(&mut self, ui: &mut egui::Ui) {
+        let back = ui
+            .add_enabled(
+                self.can_go_back(),
+                egui::Button::new(egui::RichText::new(regular::ARROW_LEFT).size(16.0))
+                    .min_size(egui::vec2(32.0, 32.0))
+                    .frame(false),
+            )
+            .on_hover_text("Back (Alt+←)");
+        let fwd = ui
+            .add_enabled(
+                self.can_go_forward(),
+                egui::Button::new(egui::RichText::new(regular::ARROW_RIGHT).size(16.0))
+                    .min_size(egui::vec2(32.0, 32.0))
+                    .frame(false),
+            )
+            .on_hover_text("Forward (Alt+→)");
+        if back.clicked() {
+            self.go_back();
+        }
+        if fwd.clicked() {
+            self.go_forward();
         }
     }
 
@@ -990,16 +1073,23 @@ impl eframe::App for App {
 
         // Don't steal Delete/Z from TextEdit / rename fields.
         let can_bind = !ctx.wants_keyboard_input() && self.dialog.is_none();
-        let (save, new_note, close_tab, next_tab, delete_note, undo) = ctx.input_mut(|i| {
-            (
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::T),
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::W),
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab),
-                can_bind && i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
-                can_bind && i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z),
-            )
-        });
+        let (save, new_note, close_tab, next_tab, delete_note, undo, nav_back, nav_fwd) =
+            ctx.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::T),
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::W),
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab),
+                    can_bind && i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
+                    can_bind && i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z),
+                    i.modifiers.alt
+                        && !i.modifiers.command
+                        && i.key_pressed(egui::Key::ArrowLeft),
+                    i.modifiers.alt
+                        && !i.modifiers.command
+                        && i.key_pressed(egui::Key::ArrowRight),
+                )
+            });
         if save {
             self.save_current();
         }
@@ -1021,6 +1111,12 @@ impl eframe::App for App {
         }
         if undo {
             self.undo();
+        }
+        if nav_back {
+            self.go_back();
+        }
+        if nav_fwd {
+            self.go_forward();
         }
 
         self.show_dialogs(ctx);
@@ -1243,29 +1339,32 @@ impl eframe::App for App {
             let mut tab_select: Option<String> = None;
             let mut tab_close: Option<String> = None;
 
-            if self.open_tabs.is_empty() {
+            ui.horizontal(|ui| {
+                ui.add_space(2.0);
+                self.show_nav_buttons(ui);
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new("Note").size(15.0).color(theme::WEAK));
-                ui.add_space(6.0);
-                ui.separator();
-            } else {
-                // Full-bleed tab strip (negative margin cancels panel padding feel).
-                let tab_action = tabs::show(
-                    ui,
-                    &self.open_tabs,
-                    self.selected.as_deref(),
-                    self.dirty,
-                );
-                tab_select = tab_action.select;
-                tab_close = tab_action.close;
-                if self.readonly {
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.colored_label(theme::WARN, "read-only");
-                    });
+                if self.open_tabs.is_empty() {
+                    ui.label(egui::RichText::new("Note").size(15.0).color(theme::WEAK));
+                } else {
+                    let tab_action = tabs::show(
+                        ui,
+                        &self.open_tabs,
+                        self.selected.as_deref(),
+                        self.dirty,
+                    );
+                    tab_select = tab_action.select;
+                    tab_close = tab_action.close;
                 }
+                if self.readonly {
+                    ui.add_space(8.0);
+                    ui.colored_label(theme::WARN, "read-only");
+                }
+            });
+            ui.add_space(4.0);
+            if self.open_tabs.is_empty() {
+                ui.separator();
             }
-            ui.add_space(10.0);
+            ui.add_space(8.0);
 
             if let Some(path) = tab_select {
                 self.select_note(&path);
