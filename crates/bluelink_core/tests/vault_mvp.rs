@@ -116,10 +116,16 @@ fn wikilinks_resolve_and_backlinks() {
     vault.write("note.md", "root note").unwrap();
 
     assert_eq!(
-        vault.index().resolve("Folder/Note|алиас").as_deref(),
+        vault
+            .index()
+            .resolve("Folder/Note|алиас", Some("index.md"))
+            .as_deref(),
         Some("Folder/Note.md")
     );
-    assert_eq!(vault.index().resolve("note").as_deref(), Some("note.md"));
+    assert_eq!(
+        vault.index().resolve("note", Some("index.md")).as_deref(),
+        Some("note.md")
+    );
     assert_eq!(
         vault.index().backlinks("Folder/Note.md"),
         vec!["index.md".to_string()]

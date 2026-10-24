@@ -71,7 +71,8 @@ pub enum LineClick {
     #[default]
     None,
     /// Open / create this wikilink target (raw body inside `[[...]]`).
-    Wiki(String),
+    /// `new_tab` is set when Mod (Ctrl/Cmd) was held on click.
+    Wiki { raw: String, new_tab: bool },
     /// Enter raw edit for this line.
     Edit,
 }
@@ -81,6 +82,7 @@ pub enum LineClick {
 pub fn render_line_with_role(
     ui: &mut Ui,
     vault: &Vault,
+    source_path: Option<&str>,
     line: &str,
     role: FenceRole,
 ) -> LineClick {
@@ -99,13 +101,21 @@ pub fn render_line_with_role(
     let doc = parse_preview(line);
     let mut click = LineClick::None;
     for block in &doc.blocks {
-        let c = render_block_compact(ui, vault, block);
+        let c = render_block_compact(ui, vault, source_path, block);
         click = merge_click(click, c);
     }
     if doc.blocks.is_empty() {
         click = merge_click(
             click,
-            render_text_with_wikis(ui, vault, line, theme::EDITOR_SIZE, false, 0),
+            render_text_with_wikis(
+                ui,
+                vault,
+                source_path,
+                line,
+                theme::EDITOR_SIZE,
+                false,
+                0,
+            ),
         );
     }
     click
@@ -173,24 +183,35 @@ fn render_fence_stripe(ui: &mut Ui, line: &str, role: FenceRole) -> LineClick {
 
 fn merge_click(a: LineClick, b: LineClick) -> LineClick {
     match (&a, &b) {
-        (_, LineClick::Wiki(_)) => b,
-        (LineClick::Wiki(_), _) => a,
+        (_, LineClick::Wiki { .. }) => b,
+        (LineClick::Wiki { .. }, _) => a,
         (_, LineClick::Edit) => b,
         (LineClick::Edit, _) => a,
         _ => a,
     }
 }
 
-fn render_block_compact(ui: &mut Ui, vault: &Vault, block: &PreviewBlock) -> LineClick {
+fn render_block_compact(
+    ui: &mut Ui,
+    vault: &Vault,
+    source_path: Option<&str>,
+    block: &PreviewBlock,
+) -> LineClick {
     match block {
-        PreviewBlock::Heading { level, text } => {
-            render_text_with_wikis(ui, vault, text, theme::heading_size(*level), true, *level)
-        }
+        PreviewBlock::Heading { level, text } => render_text_with_wikis(
+            ui,
+            vault,
+            source_path,
+            text,
+            theme::heading_size(*level),
+            true,
+            *level,
+        ),
         PreviewBlock::Paragraph { spans } => {
             let mut click = LineClick::None;
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                click = render_spans(ui, vault, spans, theme::EDITOR_SIZE, false, 0);
+                click = render_spans(ui, vault, source_path, spans, theme::EDITOR_SIZE, false, 0);
             });
             click
         }
@@ -198,7 +219,7 @@ fn render_block_compact(ui: &mut Ui, vault: &Vault, block: &PreviewBlock) -> Lin
             let mut click = LineClick::None;
             ui.horizontal_wrapped(|ui| {
                 ui.label("•");
-                click = render_spans(ui, vault, spans, theme::EDITOR_SIZE, false, 0);
+                click = render_spans(ui, vault, source_path, spans, theme::EDITOR_SIZE, false, 0);
             });
             click
         }
@@ -206,7 +227,7 @@ fn render_block_compact(ui: &mut Ui, vault: &Vault, block: &PreviewBlock) -> Lin
             let mut click = LineClick::None;
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("{number}."));
-                click = render_spans(ui, vault, spans, theme::EDITOR_SIZE, false, 0);
+                click = render_spans(ui, vault, source_path, spans, theme::EDITOR_SIZE, false, 0);
             });
             click
         }
@@ -218,7 +239,8 @@ fn render_block_compact(ui: &mut Ui, vault: &Vault, block: &PreviewBlock) -> Lin
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        click = render_spans(ui, vault, spans, theme::EDITOR_SIZE, false, 0);
+                        click =
+                            render_spans(ui, vault, source_path, spans, theme::EDITOR_SIZE, false, 0);
                     });
                 });
             click
@@ -264,6 +286,7 @@ fn render_block_compact(ui: &mut Ui, vault: &Vault, block: &PreviewBlock) -> Lin
 fn render_text_with_wikis(
     ui: &mut Ui,
     vault: &Vault,
+    source_path: Option<&str>,
     text: &str,
     size: f32,
     heading: bool,
@@ -273,7 +296,10 @@ fn render_text_with_wikis(
         ui.spacing_mut().item_spacing.x = 4.0;
         let mut click = LineClick::None;
         for span in split_wikilinks(text) {
-            click = merge_click(click, render_one_span(ui, vault, &span, size, heading, level));
+            click = merge_click(
+                click,
+                render_one_span(ui, vault, source_path, &span, size, heading, level),
+            );
         }
         click
     })
@@ -283,6 +309,7 @@ fn render_text_with_wikis(
 fn render_spans(
     ui: &mut Ui,
     vault: &Vault,
+    source_path: Option<&str>,
     spans: &[Span],
     size: f32,
     heading: bool,
@@ -290,7 +317,10 @@ fn render_spans(
 ) -> LineClick {
     let mut click = LineClick::None;
     for span in spans {
-        click = merge_click(click, render_one_span(ui, vault, span, size, heading, level));
+        click = merge_click(
+            click,
+            render_one_span(ui, vault, source_path, span, size, heading, level),
+        );
     }
     click
 }
@@ -298,6 +328,7 @@ fn render_spans(
 fn render_one_span(
     ui: &mut Ui,
     vault: &Vault,
+    source_path: Option<&str>,
     span: &Span,
     size: f32,
     heading: bool,
@@ -372,7 +403,7 @@ fn render_one_span(
             let label = alias
                 .as_deref()
                 .unwrap_or_else(|| raw.split('|').next().unwrap_or(raw));
-            let resolved = vault.index().resolve(raw);
+            let resolved = vault.index().resolve(raw, source_path);
             let base = if resolved.is_some() {
                 theme::ACCENT
             } else {
@@ -414,7 +445,11 @@ fn render_one_span(
                     None => format!("Create {target}"),
                 });
             if response.clicked() {
-                LineClick::Wiki(raw.clone())
+                let new_tab = ui.input(|i| i.modifiers.command);
+                LineClick::Wiki {
+                    raw: raw.clone(),
+                    new_tab,
+                }
             } else {
                 LineClick::None
             }

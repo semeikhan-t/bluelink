@@ -11,6 +11,9 @@ local.properties
 # Verification Ladder (operational evidence, not source)
 .verification/
 
+# Local Obsidian RE dumps (not source)
+.rea-obsidian/
+
 # Editors / OS
 .idea/
 .vscode/

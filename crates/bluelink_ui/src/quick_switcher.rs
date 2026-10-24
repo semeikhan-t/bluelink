@@ -20,22 +20,38 @@ pub struct SearchResult {
 /// Rank notes using their title, relative path, and text content.
 ///
 /// Every whitespace-separated query term must occur somewhere in the note.
-/// Empty queries return notes alphabetically, so the switcher is useful as a
-/// compact vault index before the user starts typing.
-pub fn search<F>(notes: &[NoteMeta], query: &str, mut read: F) -> Vec<SearchResult>
+/// Empty queries prefer `recent` paths that still exist (Obsidian-style);
+/// if `recent` is empty, notes are listed alphabetically.
+pub fn search<F>(
+    notes: &[NoteMeta],
+    query: &str,
+    recent: &[String],
+    mut read: F,
+) -> Vec<SearchResult>
 where
     F: FnMut(&str) -> Option<String>,
 {
     let terms = query_terms(query);
+    if terms.is_empty() && !recent.is_empty() {
+        let mut matches = Vec::new();
+        for path in recent {
+            let Some(note) = notes.iter().find(|n| n.rel_path == *path) else {
+                continue;
+            };
+            matches.push(result_from_note(note, None, 0));
+            if matches.len() >= MAX_RESULTS {
+                break;
+            }
+        }
+        if !matches.is_empty() {
+            return matches;
+        }
+    }
+
     let mut matches = Vec::new();
 
     for note in notes {
-        let title = note.title.trim();
-        let title = if title.is_empty() {
-            fallback_title(&note.rel_path)
-        } else {
-            title.to_string()
-        };
+        let title = display_title(note);
         let haystack_title = title.to_lowercase();
         let haystack_path = note.rel_path.to_lowercase();
         let content = if terms.is_empty() {
@@ -80,6 +96,24 @@ where
     });
     matches.truncate(MAX_RESULTS);
     matches
+}
+
+fn display_title(note: &NoteMeta) -> String {
+    let title = note.title.trim();
+    if title.is_empty() {
+        fallback_title(&note.rel_path)
+    } else {
+        title.to_string()
+    }
+}
+
+fn result_from_note(note: &NoteMeta, snippet: Option<String>, score: u16) -> SearchResult {
+    SearchResult {
+        path: note.rel_path.clone(),
+        title: display_title(note),
+        snippet,
+        score,
+    }
 }
 
 fn query_terms(query: &str) -> Vec<String> {
@@ -135,7 +169,7 @@ fn fallback_title(path: &str) -> String {
         .into()
 }
 
-fn ellipsize(text: &str, max_chars: usize) -> String {
+pub(crate) fn ellipsize(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
     let short: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_some() {
@@ -162,7 +196,7 @@ mod tests {
     #[test]
     fn title_match_outranks_body_match() {
         let notes = vec![note("inbox.md", "Inbox"), note("ideas.md", "Ideas")];
-        let results = search(&notes, "inbox", |path| {
+        let results = search(&notes, "inbox", &[], |path| {
             (path == "ideas.md").then(|| "An inbox item lives here".into())
         });
 
@@ -178,7 +212,7 @@ mod tests {
             note("project.md", "Project plan"),
             note("other.md", "Other"),
         ];
-        let results = search(&notes, "project bluetooth", |path| {
+        let results = search(&notes, "project bluetooth", &[], |path| {
             (path == "project.md").then(|| "Pair over Bluetooth LE nearby".into())
         });
 
@@ -193,11 +227,27 @@ mod tests {
     #[test]
     fn empty_query_lists_notes_by_title() {
         let notes = vec![note("z.md", "Zulu"), note("a.md", "Alpha")];
-        let results = search(&notes, "", |_| None);
+        let results = search(&notes, "", &[], |_| None);
 
         assert_eq!(
             results.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(),
             ["Alpha", "Zulu"]
+        );
+    }
+
+    #[test]
+    fn empty_query_prefers_recent_order() {
+        let notes = vec![
+            note("a.md", "Alpha"),
+            note("b.md", "Bravo"),
+            note("c.md", "Charlie"),
+        ];
+        let recent = vec!["c.md".into(), "a.md".into(), "gone.md".into()];
+        let results = search(&notes, "", &recent, |_| None);
+
+        assert_eq!(
+            results.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            ["c.md", "a.md"]
         );
     }
 }

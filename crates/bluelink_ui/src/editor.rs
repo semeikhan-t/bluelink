@@ -41,9 +41,14 @@ impl PendingClipboard {
     }
 }
 
+pub struct WikiClick {
+    pub raw: String,
+    pub new_tab: bool,
+}
+
 pub struct LiveResult {
     pub changed: bool,
-    pub wikilink: Option<String>,
+    pub wikilink: Option<WikiClick>,
 }
 
 /// Show live editor. `active_line` is the raw-editing line index (0-based).
@@ -51,6 +56,7 @@ pub struct LiveResult {
 pub fn show_live(
     ui: &mut Ui,
     vault: &Vault,
+    source_path: Option<&str>,
     buffer: &mut String,
     active_line: &mut Option<usize>,
     doc_edit: &mut bool,
@@ -353,7 +359,13 @@ pub fn show_live(
                             |ui| {
                                 ui.set_min_width(ui.available_width());
                                 ui.set_min_height(22.0);
-                                preview::render_line_with_role(ui, vault, &line, fence_role)
+                                preview::render_line_with_role(
+                                    ui,
+                                    vault,
+                                    source_path,
+                                    &line,
+                                    fence_role,
+                                )
                             },
                         );
                         let click = row.inner;
@@ -370,8 +382,8 @@ pub fn show_live(
                         }
 
                         match click {
-                            preview::LineClick::Wiki(raw) => {
-                                result.wikilink = Some(raw);
+                            preview::LineClick::Wiki { raw, new_tab } => {
+                                result.wikilink = Some(WikiClick { raw, new_tab });
                             }
                             preview::LineClick::Edit if !readonly => {
                                 request_active = Some(i);

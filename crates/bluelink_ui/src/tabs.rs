@@ -5,8 +5,19 @@ use crate::theme;
 
 #[derive(Default)]
 pub struct TabAction {
-    pub select: Option<String>,
-    pub close: Option<String>,
+    pub select: Option<usize>,
+    pub close: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TabKind {
+    Note,
+    Graph,
+}
+
+pub struct TabView {
+    pub title: String,
+    pub kind: TabKind,
 }
 
 const TAB_H: f32 = 42.0;
@@ -14,15 +25,8 @@ const TITLE_MAX: usize = 28;
 const TITLE_SIZE: f32 = 16.0;
 const ICON_SIZE: f32 = 16.0;
 
-/// Browser-style tab strip for open notes.
-/// `title_of(path)` returns the display title (usually first line of the note).
-pub fn show(
-    ui: &mut Ui,
-    tabs: &[String],
-    active: Option<&str>,
-    dirty: bool,
-    mut title_of: impl FnMut(&str) -> String,
-) -> TabAction {
+/// Browser-style tab strip for open notes and the local graph.
+pub fn show(ui: &mut Ui, tabs: &[TabView], active: Option<usize>, dirty: bool) -> TabAction {
     let mut action = TabAction::default();
     if tabs.is_empty() {
         return action;
@@ -56,15 +60,17 @@ pub fn show(
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.add_space(4.0);
 
-            for path in tabs {
-                let is_active = active == Some(path.as_str());
-                let title = truncate_title(&title_of(path));
+            for (index, tab) in tabs.iter().enumerate() {
+                let is_active = active == Some(index);
+                let title = truncate_title(&tab.title);
+                let show_dirty = dirty && is_active && tab.kind == TabKind::Note;
                 tab_chip(
                     ui,
-                    path,
+                    index,
+                    tab.kind,
                     &title,
                     is_active,
-                    dirty && is_active,
+                    show_dirty,
                     rule_y,
                     &mut action,
                 );
@@ -77,14 +83,15 @@ pub fn show(
 
 fn tab_chip(
     ui: &mut Ui,
-    path: &str,
+    index: usize,
+    kind: TabKind,
     title: &str,
     active: bool,
     dirty: bool,
     rule_y: f32,
     action: &mut TabAction,
 ) {
-    let close_id = ui.id().with(("note_tab_close", path));
+    let close_id = ui.id().with(("note_tab_close", index));
 
     let pad_x = 14.0_f32;
     let icon_w = 18.0_f32;
@@ -151,7 +158,11 @@ fn tab_chip(
     let mut x = rect.left() + pad_x;
     let cy = rect.center().y;
 
-    paint_glyph(ui, egui::pos2(x, cy), regular::NOTE, ICON_SIZE, icon_color, AlignX::Left);
+    let icon = match kind {
+        TabKind::Note => regular::NOTE,
+        TabKind::Graph => regular::SHARE_NETWORK,
+    };
+    paint_glyph(ui, egui::pos2(x, cy), icon, ICON_SIZE, icon_color, AlignX::Left);
     x += icon_w + 8.0;
 
     if dirty {
@@ -196,17 +207,17 @@ fn tab_chip(
         paint_glyph(ui, close_rect.center(), regular::X, 13.0, xc, AlignX::Center);
         close.clone().on_hover_text("Close");
         if close.clicked() {
-            action.close = Some(path.to_string());
+            action.close = Some(index);
             closed = true;
         }
     }
 
     if !closed {
         if response.clicked() {
-            action.select = Some(path.to_string());
+            action.select = Some(index);
         }
         if response.middle_clicked() {
-            action.close = Some(path.to_string());
+            action.close = Some(index);
         }
     }
 

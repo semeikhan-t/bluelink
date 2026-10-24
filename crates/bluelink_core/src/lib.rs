@@ -12,4 +12,6 @@ pub use markdown::{parse_preview, split_wikilinks, PreviewBlock, PreviewDoc, Spa
 pub use meta::DeviceMeta;
 pub use path::{validate_folder_rel, validate_rel_path, MAX_NOTE_BYTES, MAX_REL_PATH_BYTES};
 pub use vault::{title_from_content, NoteMeta, Vault};
-pub use wiki::{extract_wikilinks, normalize_link_target, WikiIndex};
+pub use wiki::{
+    create_path_for_link, extract_wikilinks, normalize_link_target, LocalGraph, WikiIndex,
+};

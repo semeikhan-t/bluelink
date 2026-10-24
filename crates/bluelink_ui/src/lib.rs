@@ -2,6 +2,7 @@
 
 mod editor;
 mod editor_menu;
+mod local_graph;
 mod preview;
 mod quick_switcher;
 mod tabs;
@@ -14,7 +15,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bluelink_core::{title_from_content, validate_rel_path, NoteMeta, Vault, VaultError};
+use bluelink_core::{
+    create_path_for_link, extract_wikilinks, title_from_content, validate_rel_path, NoteMeta, Vault,
+    VaultError, WikiIndex,
+};
 use eframe::egui;
 use egui_phosphor::regular;
 use vault_registry::{validate_vault_name, VaultRegistry};
@@ -23,7 +27,7 @@ enum Dialog {
     NewNote { name: String },
     NewFolder { name: String },
     NewVault { name: String },
-    CreateLink { rel_path: String },
+    CreateLink { rel_path: String, new_tab: bool },
 }
 
 /// One undoable vault change (delete for now).
@@ -39,11 +43,16 @@ enum UndoItem {
 /// Folder picker supplied by the host (desktop uses `rfd`).
 pub type FolderPicker = Box<dyn FnMut() -> Option<PathBuf> + Send>;
 
-/// One editor tab with its own back/forward history.
-struct OpenTab {
-    path: String,
-    history: Vec<String>,
-    history_index: usize,
+/// One strip tab: a note (with back/forward history) or the local graph.
+enum OpenTab {
+    Note {
+        path: String,
+        history: Vec<String>,
+        history_index: usize,
+    },
+    Graph {
+        center_path: String,
+    },
 }
 
 /// State held only while the quick switcher is visible.
@@ -56,12 +65,29 @@ struct QuickSwitcher {
 }
 
 impl OpenTab {
-    fn new(path: &str) -> Self {
-        Self {
+    fn note(path: &str) -> Self {
+        Self::Note {
             path: path.to_string(),
             history: vec![path.to_string()],
             history_index: 0,
         }
+    }
+
+    fn graph(center_path: &str) -> Self {
+        Self::Graph {
+            center_path: center_path.to_string(),
+        }
+    }
+
+    fn note_path(&self) -> Option<&str> {
+        match self {
+            Self::Note { path, .. } => Some(path.as_str()),
+            Self::Graph { .. } => None,
+        }
+    }
+
+    fn is_graph(&self) -> bool {
+        matches!(self, Self::Graph { .. })
     }
 }
 
@@ -70,8 +96,10 @@ pub struct App {
     notes: Vec<NoteMeta>,
     /// Relative folder paths (including empty).
     folders: Vec<String>,
-    /// Open note tabs (browser-style), active = `selected`.
+    /// Open tabs (notes + optional local graph).
     open_tabs: Vec<OpenTab>,
+    /// Index into `open_tabs` for the focused tab.
+    active_tab: Option<usize>,
     selected: Option<String>,
     buffer: String,
     dirty: bool,
@@ -94,6 +122,9 @@ pub struct App {
     registry: VaultRegistry,
     undo_stack: Vec<UndoItem>,
     quick_switcher: Option<QuickSwitcher>,
+    /// Recently opened note paths (most recent first), capped for quick switcher.
+    recent: Vec<String>,
+    local_graph: local_graph::LocalGraphUi,
 }
 
 impl App {
@@ -114,6 +145,7 @@ impl App {
             notes: Vec::new(),
             folders: Vec::new(),
             open_tabs: Vec::new(),
+            active_tab: None,
             selected: None,
             buffer: String::new(),
             dirty: false,
@@ -131,6 +163,8 @@ impl App {
             registry,
             undo_stack: Vec::new(),
             quick_switcher: None,
+            recent: Vec::new(),
+            local_graph: local_graph::LocalGraphUi::default(),
         };
 
         // --vault wins; otherwise reopen last known vault.
@@ -171,7 +205,9 @@ impl App {
                 let _ = self.registry.save();
                 self.vault = Some(vault);
                 self.open_tabs.clear();
+                self.active_tab = None;
                 self.undo_stack.clear();
+                self.recent.clear();
                 self.selected = None;
                 self.buffer.clear();
                 self.dirty = false;
@@ -179,6 +215,7 @@ impl App {
                 self.selected_sha = None;
                 self.active_line = None;
                 self.doc_edit = false;
+                self.local_graph = local_graph::LocalGraphUi::default();
                 self.refresh_notes();
             }
             Err(e) => {
@@ -186,7 +223,9 @@ impl App {
                 self.vault = None;
                 self.folders.clear();
                 self.open_tabs.clear();
+                self.active_tab = None;
                 self.undo_stack.clear();
+                self.recent.clear();
             }
         }
     }
@@ -199,7 +238,9 @@ impl App {
         self.notes.clear();
         self.folders.clear();
         self.open_tabs.clear();
+        self.active_tab = None;
         self.undo_stack.clear();
+        self.recent.clear();
         self.selected = None;
         self.buffer.clear();
         self.dirty = false;
@@ -207,6 +248,7 @@ impl App {
         self.selected_sha = None;
         self.active_line = None;
         self.doc_edit = false;
+        self.local_graph = local_graph::LocalGraphUi::default();
     }
 
     fn pick_open_vault(&mut self) {
@@ -317,13 +359,88 @@ impl App {
         }
     }
 
-    fn tab_paths(&self) -> Vec<String> {
-        self.open_tabs.iter().map(|t| t.path.clone()).collect()
+    fn tab_views(&self) -> Vec<tabs::TabView> {
+        self.open_tabs
+            .iter()
+            .map(|tab| match tab {
+                OpenTab::Note { path, .. } => tabs::TabView {
+                    title: self.note_display_title(path),
+                    kind: tabs::TabKind::Note,
+                },
+                OpenTab::Graph { center_path } => {
+                    let name = self.note_display_title(center_path);
+                    tabs::TabView {
+                        title: format!("Graph: {name}"),
+                        kind: tabs::TabKind::Graph,
+                    }
+                }
+            })
+            .collect()
     }
 
-    fn active_tab_index(&self) -> Option<usize> {
-        let sel = self.selected.as_deref()?;
-        self.open_tabs.iter().position(|t| t.path == sel)
+    fn is_graph_active(&self) -> bool {
+        self.active_tab
+            .and_then(|i| self.open_tabs.get(i))
+            .is_some_and(|t| t.is_graph())
+    }
+
+    fn graph_center(&self) -> Option<&str> {
+        self.active_tab
+            .and_then(|i| self.open_tabs.get(i))
+            .and_then(|t| match t {
+                OpenTab::Graph { center_path } => Some(center_path.as_str()),
+                OpenTab::Note { .. } => None,
+            })
+    }
+
+    fn focus_tab(&mut self, idx: usize) {
+        let Some(tab) = self.open_tabs.get(idx) else {
+            return;
+        };
+        match tab {
+            OpenTab::Note { path, .. } => {
+                let path = path.clone();
+                self.active_tab = Some(idx);
+                if self.selected.as_deref() != Some(path.as_str()) {
+                    let _ = self.load_note_content(&path);
+                }
+            }
+            OpenTab::Graph { .. } => {
+                if self.dirty {
+                    self.save_current();
+                }
+                self.active_tab = Some(idx);
+            }
+        }
+    }
+
+    fn clamp_active_tab(&mut self) {
+        if self.open_tabs.is_empty() {
+            self.active_tab = None;
+            return;
+        }
+        if let Some(i) = self.active_tab {
+            if i >= self.open_tabs.len() {
+                self.active_tab = Some(self.open_tabs.len() - 1);
+            }
+        }
+    }
+
+    /// Open / focus local graph tab centered on the current note.
+    fn toggle_local_graph(&mut self) {
+        if let Some(i) = self.open_tabs.iter().position(|t| t.is_graph()) {
+            if self.active_tab == Some(i) {
+                self.close_tab_at(i);
+            } else {
+                self.focus_tab(i);
+            }
+            return;
+        }
+        let Some(center) = self.selected.clone() else {
+            return;
+        };
+        self.open_tabs.push(OpenTab::graph(&center));
+        self.focus_tab(self.open_tabs.len() - 1);
     }
 
     /// Open a note in the current tab (replace), or switch to it if already open.
@@ -337,31 +454,55 @@ impl App {
     }
 
     fn open_note(&mut self, rel_path: &str, new_tab: bool, record_history: bool) {
-        let already_open = self.open_tabs.iter().any(|t| t.path == rel_path);
-        if already_open {
-            // Just focus the existing tab.
-        } else if new_tab {
-            self.open_tabs.push(OpenTab::new(rel_path));
-        } else if let Some(cur) = self.selected.clone() {
-            // In-place: replace the active tab's path; keep its history stack.
-            if let Some(tab) = self.open_tabs.iter_mut().find(|t| t.path == cur) {
-                tab.path = rel_path.to_string();
-            } else {
-                self.open_tabs.push(OpenTab::new(rel_path));
+        if let Some(i) = self
+            .open_tabs
+            .iter()
+            .position(|t| t.note_path() == Some(rel_path))
+        {
+            self.focus_tab(i);
+            self.push_recent(rel_path);
+            if record_history {
+                self.record_nav(rel_path);
             }
-        } else {
-            self.open_tabs.push(OpenTab::new(rel_path));
+            return;
         }
 
-        if self.selected.as_deref() == Some(rel_path) {
+        if new_tab {
+            self.open_tabs.push(OpenTab::note(rel_path));
+            self.active_tab = Some(self.open_tabs.len() - 1);
+        } else if let Some(i) = self.active_tab {
+            match self.open_tabs.get_mut(i) {
+                Some(OpenTab::Note { path, .. }) => {
+                    *path = rel_path.to_string();
+                }
+                Some(OpenTab::Graph { .. }) | None => {
+                    // Don't replace a graph tab — open the note beside it.
+                    self.open_tabs.push(OpenTab::note(rel_path));
+                    self.active_tab = Some(self.open_tabs.len() - 1);
+                }
+            }
+        } else {
+            self.open_tabs.push(OpenTab::note(rel_path));
+            self.active_tab = Some(self.open_tabs.len() - 1);
+        }
+
+        if self.selected.as_deref() == Some(rel_path) && !self.is_graph_active() {
+            self.push_recent(rel_path);
             return;
         }
         if !self.load_note_content(rel_path) {
             return;
         }
+        self.push_recent(rel_path);
         if record_history {
             self.record_nav(rel_path);
         }
+    }
+
+    fn push_recent(&mut self, path: &str) {
+        self.recent.retain(|p| p != path);
+        self.recent.insert(0, path.to_string());
+        self.recent.truncate(20);
     }
 
     /// Load buffer/selection for `rel_path`. Returns false if the note could not be read.
@@ -409,54 +550,94 @@ impl App {
     }
 
     fn record_nav(&mut self, path: &str) {
-        let Some(tab) = self.open_tabs.iter_mut().find(|t| t.path == path) else {
+        let Some(tab) = self
+            .open_tabs
+            .iter_mut()
+            .find(|t| t.note_path() == Some(path))
+        else {
             return;
         };
-        if tab.history.get(tab.history_index).map(String::as_str) == Some(path) {
+        let OpenTab::Note {
+            history,
+            history_index,
+            ..
+        } = tab
+        else {
+            return;
+        };
+        if history.get(*history_index).map(String::as_str) == Some(path) {
             return;
         }
-        tab.history.truncate(tab.history_index.saturating_add(1));
-        tab.history.push(path.to_string());
-        tab.history_index = tab.history.len() - 1;
+        history.truncate(history_index.saturating_add(1));
+        history.push(path.to_string());
+        *history_index = history.len() - 1;
     }
 
     fn can_go_back(&self) -> bool {
-        self.active_tab_index()
-            .is_some_and(|i| self.open_tabs[i].history_index > 0)
+        self.active_tab.is_some_and(|i| match &self.open_tabs[i] {
+            OpenTab::Note { history_index, .. } => *history_index > 0,
+            OpenTab::Graph { .. } => false,
+        })
     }
 
     fn can_go_forward(&self) -> bool {
-        self.active_tab_index().is_some_and(|i| {
-            let tab = &self.open_tabs[i];
-            tab.history_index + 1 < tab.history.len()
+        self.active_tab.is_some_and(|i| match &self.open_tabs[i] {
+            OpenTab::Note {
+                history,
+                history_index,
+                ..
+            } => history_index + 1 < history.len(),
+            OpenTab::Graph { .. } => false,
         })
     }
 
     fn go_back(&mut self) {
-        let Some(tab_i) = self.active_tab_index() else {
+        let Some(tab_i) = self.active_tab else {
             return;
         };
-        while self.open_tabs[tab_i].history_index > 0 {
-            self.open_tabs[tab_i].history_index -= 1;
-            let path = self.open_tabs[tab_i].history[self.open_tabs[tab_i].history_index].clone();
-            if self.notes.iter().any(|n| n.rel_path == path) {
-                self.open_tabs[tab_i].path = path.clone();
-                let _ = self.load_note_content(&path);
+        loop {
+            let OpenTab::Note {
+                path,
+                history,
+                history_index,
+            } = &mut self.open_tabs[tab_i]
+            else {
+                return;
+            };
+            if *history_index == 0 {
+                return;
+            }
+            *history_index -= 1;
+            let next = history[*history_index].clone();
+            if self.notes.iter().any(|n| n.rel_path == next) {
+                *path = next.clone();
+                let _ = self.load_note_content(&next);
                 return;
             }
         }
     }
 
     fn go_forward(&mut self) {
-        let Some(tab_i) = self.active_tab_index() else {
+        let Some(tab_i) = self.active_tab else {
             return;
         };
-        while self.open_tabs[tab_i].history_index + 1 < self.open_tabs[tab_i].history.len() {
-            self.open_tabs[tab_i].history_index += 1;
-            let path = self.open_tabs[tab_i].history[self.open_tabs[tab_i].history_index].clone();
-            if self.notes.iter().any(|n| n.rel_path == path) {
-                self.open_tabs[tab_i].path = path.clone();
-                let _ = self.load_note_content(&path);
+        loop {
+            let OpenTab::Note {
+                path,
+                history,
+                history_index,
+            } = &mut self.open_tabs[tab_i]
+            else {
+                return;
+            };
+            if *history_index + 1 >= history.len() {
+                return;
+            }
+            *history_index += 1;
+            let next = history[*history_index].clone();
+            if self.notes.iter().any(|n| n.rel_path == next) {
+                *path = next.clone();
+                let _ = self.load_note_content(&next);
                 return;
             }
         }
@@ -497,49 +678,76 @@ impl App {
         if self.open_tabs.len() < 2 {
             return;
         }
-        let idx = self.active_tab_index().unwrap_or(0);
+        let idx = self.active_tab.unwrap_or(0);
         let next = (idx + 1) % self.open_tabs.len();
-        let path = self.open_tabs[next].path.clone();
-        self.select_note(&path);
+        self.focus_tab(next);
     }
 
-    fn close_tab(&mut self, path: &str) {
-        let idx = self.open_tabs.iter().position(|t| t.path == path);
-        let was_active = self.selected.as_deref() == Some(path);
-        self.open_tabs.retain(|t| t.path != path);
-        if !was_active {
+    fn close_tab_at(&mut self, idx: usize) {
+        if idx >= self.open_tabs.len() {
             return;
         }
-        if self.dirty {
+        let was_active = self.active_tab == Some(idx);
+        let closing_note = self.open_tabs[idx].note_path().map(str::to_string);
+        if was_active && closing_note.is_some() && self.dirty {
             self.save_current();
         }
-        let next = idx.and_then(|i| {
-            if i < self.open_tabs.len() {
-                Some(self.open_tabs[i].path.clone())
-            } else {
-                self.open_tabs.last().map(|t| t.path.clone())
+        self.open_tabs.remove(idx);
+
+        if !was_active {
+            if let Some(active) = self.active_tab {
+                if active > idx {
+                    self.active_tab = Some(active - 1);
+                }
             }
-        });
-        self.selected = None;
-        self.buffer.clear();
-        self.dirty = false;
-        self.readonly = false;
-        self.selected_sha = None;
-        self.active_line = None;
-        self.doc_edit = false;
-        if let Some(path) = next {
-            self.select_note(&path);
+            return;
         }
+
+        self.active_tab = None;
+        if closing_note.is_some() {
+            self.selected = None;
+            self.buffer.clear();
+            self.dirty = false;
+            self.readonly = false;
+            self.selected_sha = None;
+            self.active_line = None;
+            self.doc_edit = false;
+        }
+
+        if self.open_tabs.is_empty() {
+            self.selected = None;
+            self.buffer.clear();
+            self.dirty = false;
+            self.readonly = false;
+            self.selected_sha = None;
+            self.active_line = None;
+            self.doc_edit = false;
+            return;
+        }
+
+        let next = idx.min(self.open_tabs.len() - 1);
+        self.focus_tab(next);
     }
 
     fn retarget_tab(&mut self, from: &str, to: &str) {
         for tab in &mut self.open_tabs {
-            if tab.path == from {
-                tab.path = to.to_string();
-            }
-            for entry in &mut tab.history {
-                if entry == from {
-                    *entry = to.to_string();
+            match tab {
+                OpenTab::Note {
+                    path, history, ..
+                } => {
+                    if path == from {
+                        *path = to.to_string();
+                    }
+                    for entry in history {
+                        if entry == from {
+                            *entry = to.to_string();
+                        }
+                    }
+                }
+                OpenTab::Graph { center_path } => {
+                    if center_path == from {
+                        *center_path = to.to_string();
+                    }
                 }
             }
         }
@@ -547,30 +755,50 @@ impl App {
 
     fn drop_tabs_with_prefix(&mut self, prefix: &str) {
         let p = format!("{prefix}/");
-        self.open_tabs
-            .retain(|t| t.path != prefix && !t.path.starts_with(&p));
+        let keep_graph = self.is_graph_active();
+        let keep_note = self.selected.clone();
+        self.open_tabs.retain(|t| match t {
+            OpenTab::Note { path, .. } => path != prefix && !path.starts_with(&p),
+            OpenTab::Graph { center_path } => {
+                center_path != prefix && !center_path.starts_with(&p)
+            }
+        });
+        self.active_tab = if keep_graph {
+            self.open_tabs.iter().position(|t| t.is_graph())
+        } else {
+            keep_note.as_deref().and_then(|sel| {
+                self.open_tabs
+                    .iter()
+                    .position(|t| t.note_path() == Some(sel))
+            })
+        };
+        self.clamp_active_tab();
     }
 
-    fn handle_wikilink(&mut self, raw: &str) {
+    fn handle_wikilink(&mut self, raw: &str, new_tab: bool) {
         let Some(vault) = &self.vault else {
             return;
         };
-        if let Some(path) = vault.index().resolve(raw) {
+        let source = self.selected.as_deref();
+        if let Some(path) = vault.index().resolve(raw, source) {
             let path = path.clone();
-            self.select_note(&path);
+            if new_tab {
+                self.open_note_in_new_tab(&path);
+            } else {
+                self.select_note(&path);
+            }
             return;
         }
 
-        let target = bluelink_core::normalize_link_target(raw);
-        let rel = if target.ends_with(".md") {
-            target
-        } else {
-            format!("{target}.md")
-        };
-        self.dialog = Some(Dialog::CreateLink { rel_path: rel });
+        // Bare `[[Note]]` → create next to the current note (Obsidian openLinkText).
+        let rel = create_path_for_link(raw, source);
+        self.dialog = Some(Dialog::CreateLink {
+            rel_path: rel,
+            new_tab,
+        });
     }
 
-    fn create_note(&mut self, rel_path: &str, initial: &str) {
+    fn create_note(&mut self, rel_path: &str, initial: &str, new_tab: bool) {
         if let Err(e) = validate_rel_path(rel_path) {
             self.status = format!("invalid path: {e}");
             return;
@@ -584,7 +812,11 @@ impl App {
         match vault.write(rel_path, initial) {
             Ok(_) => {
                 self.refresh_notes();
-                self.select_note(rel_path);
+                if new_tab {
+                    self.open_note_in_new_tab(rel_path);
+                } else {
+                    self.select_note(rel_path);
+                }
                 self.status = format!("created {rel_path}");
             }
             Err(e) => self.status = format!("create failed: {e}"),
@@ -596,7 +828,10 @@ impl App {
         let taken = |stem: &str| {
             let path = format!("{stem}.md");
             self.notes.iter().any(|n| n.rel_path == path)
-                || self.open_tabs.iter().any(|t| t.path == path)
+                || self
+                    .open_tabs
+                    .iter()
+                    .any(|t| t.note_path() == Some(path.as_str()))
         };
         if !taken("untitled") {
             return "untitled.md".into();
@@ -646,7 +881,7 @@ impl App {
         let Some(vault) = &self.vault else {
             return Vec::new();
         };
-        quick_switcher::search(&self.notes, query, |path| {
+        quick_switcher::search(&self.notes, query, &self.recent, |path| {
             if selected == Some(path) {
                 if let Some(buffer) = dirty_buffer {
                     return Some(buffer.to_string());
@@ -656,12 +891,34 @@ impl App {
         })
     }
 
+    /// Obsidian openLinkText: open if resolved, else prompt to create beside the active note.
+    fn quick_switch_create_from_query(&mut self, query: &str) {
+        let query = query.trim();
+        if query.is_empty() {
+            return;
+        }
+        let source = self.selected.as_deref();
+        if let Some(vault) = &self.vault {
+            if let Some(path) = vault.index().resolve(query, source) {
+                let path = path.clone();
+                self.select_note(&path);
+                return;
+            }
+        }
+        let rel = create_path_for_link(query, source);
+        self.dialog = Some(Dialog::CreateLink {
+            rel_path: rel,
+            new_tab: false,
+        });
+    }
+
     fn show_quick_switcher(&mut self, ctx: &egui::Context) {
         let Some(mut switcher) = self.quick_switcher.take() else {
             return;
         };
 
         let mut open: Option<(String, bool)> = None;
+        let mut create_query: Option<String> = None;
         let query_id = egui::Id::new("bluelink_quick_switch_query");
 
         let modal = egui::Modal::new(egui::Id::new("bluelink_quick_switcher"))
@@ -699,13 +956,17 @@ impl App {
                 let results = &switcher.results;
                 switcher.selected = switcher.selected.min(results.len().saturating_sub(1));
 
-                let (up, down, open_new, open_current) = ctx.input_mut(|input| {
+                let (up, down, open_new, open_current, create) = ctx.input_mut(|input| {
                     let open_new = input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter);
+                    let create = input.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter);
                     (
                         input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
                         input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
                         open_new,
-                        !open_new && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                        !open_new
+                            && !create
+                            && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                        create,
                     )
                 });
                 if up && !results.is_empty() {
@@ -717,12 +978,17 @@ impl App {
                 if down && !results.is_empty() {
                     switcher.selected = (switcher.selected + 1) % results.len();
                 }
-                if (open_current || open_new) && !results.is_empty() {
+                if create && !switcher.query.trim().is_empty() {
+                    create_query = Some(switcher.query.clone());
+                } else if (open_current || open_new) && !results.is_empty() {
                     open = Some((results[switcher.selected].path.clone(), open_new));
                 }
 
                 ui.add_space(10.0);
-                let count = if results.len() == 1 {
+                let empty_query = switcher.query.trim().is_empty();
+                let count = if empty_query && !self.recent.is_empty() && !results.is_empty() {
+                    format!("{} recent", results.len())
+                } else if results.len() == 1 {
                     "1 note".into()
                 } else {
                     format!("{} notes", results.len())
@@ -731,9 +997,11 @@ impl App {
                     ui.label(egui::RichText::new(count).size(13.0).color(theme::WEAK));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            egui::RichText::new("Enter open  ·  Ctrl+Enter new tab  ·  Esc close")
-                                .size(13.0)
-                                .color(theme::WEAK),
+                            egui::RichText::new(
+                                "Enter open  ·  Ctrl+Enter new tab  ·  Shift+Enter create  ·  Esc",
+                            )
+                            .size(13.0)
+                            .color(theme::WEAK),
                         );
                     });
                 });
@@ -745,11 +1013,40 @@ impl App {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if results.is_empty() {
-                            ui.add_space(18.0);
-                            ui.centered_and_justified(|ui| {
-                                ui.label(egui::RichText::new("No matching notes").color(theme::WEAK));
-                            });
-                            ui.add_space(18.0);
+                            let q = switcher.query.trim();
+                            if q.is_empty() {
+                                ui.add_space(18.0);
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("No notes yet").color(theme::WEAK),
+                                    );
+                                });
+                                ui.add_space(18.0);
+                            } else {
+                                ui.add_space(8.0);
+                                let label = format!("Create \"{q}\"");
+                                let row = egui::Frame::NONE
+                                    .fill(theme::FAINT)
+                                    .inner_margin(egui::Margin::symmetric(10, 10))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.label(
+                                            egui::RichText::new(label)
+                                                .size(17.0)
+                                                .color(theme::TEXT),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("Shift+Enter")
+                                                .size(13.0)
+                                                .color(theme::WEAK),
+                                        );
+                                    })
+                                    .response
+                                    .interact(egui::Sense::click());
+                                if row.clicked() {
+                                    create_query = Some(switcher.query.clone());
+                                }
+                            }
                         }
                         for (index, result) in results.iter().enumerate() {
                             let selected = index == switcher.selected;
@@ -796,6 +1093,10 @@ impl App {
                     });
             });
 
+        if let Some(query) = create_query {
+            self.quick_switch_create_from_query(&query);
+            return;
+        }
         if let Some((path, new_tab)) = open {
             if new_tab {
                 self.open_note_in_new_tab(&path);
@@ -823,12 +1124,23 @@ impl App {
                     let prefix = format!("{from}/");
                     let new_prefix = format!("{to}/");
                     for tab in &mut self.open_tabs {
-                        if let Some(rest) = tab.path.strip_prefix(&prefix) {
-                            tab.path = format!("{new_prefix}{rest}");
-                        }
-                        for entry in &mut tab.history {
-                            if let Some(rest) = entry.strip_prefix(&prefix) {
-                                *entry = format!("{new_prefix}{rest}");
+                        match tab {
+                            OpenTab::Note {
+                                path, history, ..
+                            } => {
+                                if let Some(rest) = path.strip_prefix(&prefix) {
+                                    *path = format!("{new_prefix}{rest}");
+                                }
+                                for entry in history {
+                                    if let Some(rest) = entry.strip_prefix(&prefix) {
+                                        *entry = format!("{new_prefix}{rest}");
+                                    }
+                                }
+                            }
+                            OpenTab::Graph { center_path } => {
+                                if let Some(rest) = center_path.strip_prefix(&prefix) {
+                                    *center_path = format!("{new_prefix}{rest}");
+                                }
                             }
                         }
                     }
@@ -924,8 +1236,9 @@ impl App {
                         self.selected_sha = None;
                         self.active_line = None;
                         self.doc_edit = false;
-                        if let Some(path) = self.open_tabs.first().map(|t| t.path.clone()) {
-                            self.select_note(&path);
+                        self.active_tab = None;
+                        if !self.open_tabs.is_empty() {
+                            self.focus_tab(0);
                         }
                     }
                     self.refresh_notes();
@@ -960,10 +1273,21 @@ impl App {
                     path: rel.to_string(),
                     content,
                 });
-                let was_active = self.selected.as_deref() == Some(rel);
-                let idx = self.open_tabs.iter().position(|t| t.path == rel);
-                self.open_tabs.retain(|t| t.path != rel);
-                if was_active {
+                let note_idx = self
+                    .open_tabs
+                    .iter()
+                    .position(|t| t.note_path() == Some(rel));
+                let was_active = self.active_tab == note_idx
+                    || self
+                        .active_tab
+                        .and_then(|i| self.open_tabs.get(i))
+                        .is_some_and(|t| matches!(t, OpenTab::Graph { center_path } if center_path == rel));
+                // Drop the note tab; drop graph tab if it was centered on this note.
+                self.open_tabs.retain(|t| match t {
+                    OpenTab::Note { path, .. } => path != rel,
+                    OpenTab::Graph { center_path } => center_path != rel,
+                });
+                if was_active || self.selected.as_deref() == Some(rel) {
                     self.selected = None;
                     self.buffer.clear();
                     self.dirty = false;
@@ -971,16 +1295,18 @@ impl App {
                     self.selected_sha = None;
                     self.active_line = None;
                     self.doc_edit = false;
-                    let next = idx.and_then(|i| {
+                    self.active_tab = None;
+                    if let Some(i) = note_idx {
                         if i < self.open_tabs.len() {
-                            Some(self.open_tabs[i].path.clone())
-                        } else {
-                            self.open_tabs.last().map(|t| t.path.clone())
+                            self.focus_tab(i);
+                        } else if !self.open_tabs.is_empty() {
+                            self.focus_tab(self.open_tabs.len() - 1);
                         }
-                    });
-                    if let Some(path) = next {
-                        self.select_note(&path);
+                    } else if !self.open_tabs.is_empty() {
+                        self.focus_tab(0);
                     }
+                } else {
+                    self.clamp_active_tab();
                 }
                 self.refresh_notes();
                 self.status = format!("deleted {rel} — Ctrl+Z to undo");
@@ -1207,7 +1533,7 @@ impl App {
 
     fn show_dialogs(&mut self, ctx: &egui::Context) {
         let mut close = false;
-        let mut confirm_create: Option<String> = None;
+        let mut confirm_create: Option<(String, bool)> = None;
         let mut confirm_new: Option<String> = None;
 
         let mut confirm_vault: Option<String> = None;
@@ -1268,8 +1594,9 @@ impl App {
                         });
                     });
             }
-            Some(Dialog::CreateLink { rel_path }) => {
+            Some(Dialog::CreateLink { rel_path, new_tab }) => {
                 let path = rel_path.clone();
+                let new_tab = *new_tab;
                 egui::Window::new("Create note")
                     .collapsible(false)
                     .resizable(false)
@@ -1277,7 +1604,7 @@ impl App {
                         ui.label(format!("Note `{path}` does not exist. Create it?"));
                         ui.horizontal(|ui| {
                             if ui.button("Create").clicked() {
-                                confirm_create = Some(path.clone());
+                                confirm_create = Some((path.clone(), new_tab));
                                 close = true;
                             }
                             if ui.button("Cancel").clicked() {
@@ -1292,13 +1619,13 @@ impl App {
         if close {
             self.dialog = None;
         }
-        if let Some(path) = confirm_create {
+        if let Some((path, new_tab)) = confirm_create {
             let title = path
                 .trim_end_matches(".md")
                 .rsplit('/')
                 .next()
                 .unwrap_or("Note");
-            self.create_note(&path, &format!("# {title}\n"));
+            self.create_note(&path, &format!("# {title}\n"), new_tab);
         }
         if let Some(name) = confirm_new {
             let path = normalize_note_path(&name);
@@ -1307,7 +1634,7 @@ impl App {
                 .rsplit('/')
                 .next()
                 .unwrap_or("Note");
-            self.create_note(&path, &format!("# {title}\n"));
+            self.create_note(&path, &format!("# {title}\n"), false);
         }
         if let Some(name) = confirm_vault {
             self.create_named_vault(&name);
@@ -1345,7 +1672,12 @@ impl eframe::App for App {
             && self.dialog.is_none()
             && self.quick_switcher.is_none();
         let can_open_switcher = self.dialog.is_none() && self.quick_switcher.is_none();
-        let (save, new_note, close_tab, next_tab, quick_switch, delete_note, undo, nav_back, nav_fwd) =
+        let has_graph_tab = self.open_tabs.iter().any(|t| t.is_graph());
+        let can_toggle_graph = self.vault.is_some()
+            && (self.selected.is_some() || has_graph_tab)
+            && self.dialog.is_none()
+            && self.quick_switcher.is_none();
+        let (save, new_note, close_tab, next_tab, quick_switch, toggle_graph, delete_note, undo, nav_back, nav_fwd) =
             ctx.input_mut(|i| {
                 (
                     i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
@@ -1353,6 +1685,7 @@ impl eframe::App for App {
                     i.consume_key(egui::Modifiers::COMMAND, egui::Key::W),
                     i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab),
                     can_open_switcher && i.consume_key(egui::Modifiers::COMMAND, egui::Key::P),
+                    can_toggle_graph && i.consume_key(egui::Modifiers::COMMAND, egui::Key::G),
                     can_bind && i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
                     can_bind && i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z),
                     i.modifiers.alt
@@ -1370,8 +1703,8 @@ impl eframe::App for App {
             self.create_untitled_tab();
         }
         if close_tab {
-            if let Some(path) = self.selected.clone() {
-                self.close_tab(&path);
+            if let Some(i) = self.active_tab {
+                self.close_tab_at(i);
             }
         }
         if next_tab {
@@ -1380,7 +1713,10 @@ impl eframe::App for App {
         if quick_switch {
             self.open_quick_switcher();
         }
-        if delete_note {
+        if toggle_graph {
+            self.toggle_local_graph();
+        }
+        if delete_note && !self.is_graph_active() {
             if let Some(path) = self.selected.clone() {
                 self.delete_path(&path);
             }
@@ -1486,11 +1822,16 @@ impl eframe::App for App {
                 ui.add_space(8.0);
                 self.sync_live_title();
                 let can_undo = !self.undo_stack.is_empty();
+                let tree_sel = if self.is_graph_active() {
+                    self.graph_center().map(str::to_string)
+                } else {
+                    self.selected.clone()
+                };
                 let action = tree::show_tree(
                     ui,
                     &self.notes,
                     &self.folders,
-                    self.selected.as_deref(),
+                    tree_sel.as_deref(),
                     &mut self.renaming,
                     can_undo,
                 );
@@ -1555,10 +1896,28 @@ impl eframe::App for App {
         }
 
         let mut open_backlink: Option<String> = None;
-        let backlinks: Vec<String> = match (self.selected.as_ref(), self.vault.as_ref()) {
-            (Some(sel), Some(vault)) => vault.index().backlinks(sel),
-            _ => Vec::new(),
+        let backlink_target = if self.is_graph_active() {
+            self.graph_center().map(str::to_string)
+        } else {
+            self.selected.clone()
         };
+        let backlinks: Vec<(String, Option<String>)> =
+            match (backlink_target.as_deref(), self.vault.as_ref()) {
+                (Some(sel), Some(vault)) => {
+                    let paths = vault.index().backlinks(sel);
+                    paths
+                        .into_iter()
+                        .map(|path| {
+                            let snippet = vault
+                                .read(&path)
+                                .ok()
+                                .and_then(|text| backlink_snippet(&text, &path, sel, vault.index()));
+                            (path, snippet)
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
         // show_animated: hide when empty without remounting the panel every note switch
         // (abrupt SidePanel mount/unmount has frozen the Wayland event loop before).
         egui::SidePanel::right("backlinks")
@@ -1579,17 +1938,34 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for path in &backlinks {
+                        for (path, snippet) in &backlinks {
                             let name = self.note_display_title(path);
-                            let label = format!("{}  {name}", regular::LINK);
-                            if ui
-                                .add_sized(
-                                    [ui.available_width(), 28.0],
-                                    egui::SelectableLabel::new(false, label),
-                                )
-                                .on_hover_text(path)
-                                .clicked()
-                            {
+                            let row = egui::Frame::NONE
+                                .inner_margin(egui::Margin::symmetric(4, 6))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{}  {name}",
+                                                regular::LINK
+                                            ))
+                                            .size(14.0)
+                                            .color(theme::TEXT),
+                                        );
+                                        if let Some(snippet) = snippet {
+                                            ui.label(
+                                                egui::RichText::new(snippet)
+                                                    .size(12.0)
+                                                    .color(theme::WEAK),
+                                            );
+                                        }
+                                    });
+                                })
+                                .response
+                                .interact(egui::Sense::click())
+                                .on_hover_text(path);
+                            if row.clicked() {
                                 open_backlink = Some(path.clone());
                             }
                         }
@@ -1600,8 +1976,8 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let mut tab_select: Option<String> = None;
-            let mut tab_close: Option<String> = None;
+            let mut tab_select: Option<usize> = None;
+            let mut tab_close: Option<usize> = None;
 
             ui.horizontal(|ui| {
                 ui.add_space(2.0);
@@ -1619,21 +1995,36 @@ impl eframe::App for App {
                     self.open_quick_switcher();
                 }
                 ui.add_space(4.0);
+                {
+                    let has_graph = self.open_tabs.iter().any(|t| t.is_graph());
+                    let graph_enabled =
+                        self.vault.is_some() && (self.selected.is_some() || has_graph);
+                    let graph_btn = ui.add_enabled(
+                        graph_enabled,
+                        egui::Button::new(egui::RichText::new(regular::SHARE_NETWORK).size(16.0))
+                            .min_size(egui::vec2(32.0, 32.0))
+                            .frame(false),
+                    );
+                    let graph_btn = if graph_enabled {
+                        graph_btn.on_hover_text("Local graph (Ctrl+G)")
+                    } else {
+                        graph_btn.on_disabled_hover_text("Open a note to show its local graph")
+                    };
+                    if graph_btn.clicked() {
+                        self.toggle_local_graph();
+                    }
+                }
+                ui.add_space(4.0);
                 if self.open_tabs.is_empty() {
                     ui.label(egui::RichText::new("Note").size(15.0).color(theme::WEAK));
                 } else {
-                    let paths = self.tab_paths();
-                    let tab_action = tabs::show(
-                        ui,
-                        &paths,
-                        self.selected.as_deref(),
-                        self.dirty,
-                        |path| self.note_display_title(path),
-                    );
+                    let views = self.tab_views();
+                    let tab_action =
+                        tabs::show(ui, &views, self.active_tab, self.dirty && !self.is_graph_active());
                     tab_select = tab_action.select;
                     tab_close = tab_action.close;
                 }
-                if self.readonly {
+                if self.readonly && !self.is_graph_active() {
                     ui.add_space(8.0);
                     ui.colored_label(theme::WARN, "read-only");
                 }
@@ -1644,11 +2035,16 @@ impl eframe::App for App {
             }
             ui.add_space(8.0);
 
-            if let Some(path) = tab_select {
-                self.select_note(&path);
+            if let Some(i) = tab_select {
+                self.focus_tab(i);
             }
-            if let Some(path) = tab_close {
-                self.close_tab(&path);
+            if let Some(i) = tab_close {
+                self.close_tab_at(i);
+            }
+
+            if self.is_graph_active() {
+                self.show_local_graph_panel(ui);
+                return;
             }
 
             if self.selected.is_none() {
@@ -1669,6 +2065,7 @@ impl eframe::App for App {
                 let live = editor::show_live(
                     ui,
                     v,
+                    self.selected.as_deref(),
                     &mut self.buffer,
                     &mut self.active_line,
                     &mut self.doc_edit,
@@ -1682,8 +2079,8 @@ impl eframe::App for App {
                 wiki_click = live.wikilink;
             }
             self.vault = vault;
-            if let Some(raw) = wiki_click {
-                self.handle_wikilink(&raw);
+            if let Some(click) = wiki_click {
+                self.handle_wikilink(&click.raw, click.new_tab);
             }
         });
 
@@ -1692,8 +2089,58 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn show_local_graph_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(center) = self.graph_center().map(str::to_string) else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new("No note to center the graph on")
+                        .size(20.0)
+                        .color(theme::WEAK),
+                );
+            });
+            return;
+        };
+        if center.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new("No note to center the graph on")
+                        .size(20.0)
+                        .color(theme::WEAK),
+                );
+            });
+            return;
+        }
+
+        let graph = match &self.vault {
+            Some(vault) => vault.index().local_graph(&center, local_graph::MAX_NODES),
+            None => return,
+        };
+        let titles: std::collections::HashMap<String, String> = graph
+            .nodes
+            .iter()
+            .map(|path| (path.clone(), self.note_display_title(path)))
+            .collect();
+
+        let clicked = local_graph::show_panel(ui, &mut self.local_graph, &graph, |path| {
+            titles
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| path.to_string())
+        });
+        if let Some(path) = clicked {
+            if let Some(i) = self.active_tab {
+                if let Some(OpenTab::Graph { center_path }) = self.open_tabs.get_mut(i) {
+                    *center_path = path;
+                }
+            }
+        }
+    }
+
     /// Keep the open note's sidebar/tab title in sync with the buffer's first line.
     fn sync_live_title(&mut self) {
+        if self.is_graph_active() {
+            return;
+        }
         let Some(sel) = self.selected.clone() else {
             return;
         };
@@ -1734,6 +2181,26 @@ fn normalize_note_path(input: &str) -> String {
     } else {
         format!("{trimmed}.md")
     }
+}
+
+/// First line in `source` whose wikilink resolves to `target` (cheap backlink snippet).
+fn backlink_snippet(
+    content: &str,
+    source: &str,
+    target: &str,
+    index: &WikiIndex,
+) -> Option<String> {
+    for line in content.lines() {
+        for link in extract_wikilinks(line) {
+            if index.resolve(&link, Some(source)).as_deref() == Some(target) {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    return Some(quick_switcher::ellipsize(trimmed, 96));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn hhmm_from_unix_ms(ms: u64) -> String {
