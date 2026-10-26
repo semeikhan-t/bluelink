@@ -75,8 +75,8 @@ fn main() -> eframe::Result<()> {
                 Some(pick_file),
                 Some(sync_handle),
             );
-            // Defer watcher + BlueZ until AccessKit has painted a few frames.
-            // Starting BlueZ on frame 0 blocked the UI ~13s on D-Bus (Plasma ANR).
+            // Defer file watcher until a few frames paint. BlueZ starts only on Sync
+            // (EnsureBle) — auto-start on vault open caused Plasma ANR via D-Bus/atspi.
             let pending_vault = app.vault_root().map(|r| r.to_path_buf()).or(vault_for_ui);
             Ok(Box::new(DesktopApp {
                 inner: app,
@@ -92,8 +92,7 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// Frames to paint before watcher/BlueZ. AccessKit (atspi) and bluer share D-Bus;
-/// overlapping them on the first pass freezes the UI long enough for Plasma ANR.
+/// Frames to paint before attaching the vault file watcher.
 const POST_MAP_FRAMES: u8 = 4;
 
 struct DesktopApp {

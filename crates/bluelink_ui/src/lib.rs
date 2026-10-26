@@ -2082,6 +2082,9 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.screen != sync_panels::Screen::Sync {
+                self.sync_panel.reset_ensure_ble();
+            }
             match self.screen {
                 sync_panels::Screen::Devices => {
                     ui.add_space(8.0);

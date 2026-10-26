@@ -275,6 +275,9 @@ async fn tcp_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>, bind: Sock
                         io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
                         emit_log(&io, "cancelled");
                     }
+                    SyncUiCommand::EnsureBle => {
+                        // TCP host has no BlueZ radio.
+                    }
                     SyncUiCommand::Join(_) | SyncUiCommand::Sync => {
                         io.emit(SyncUiEvent::Error(
                             "this process is the Host — run Initiator with --initiator --connect"
@@ -512,6 +515,9 @@ async fn tcp_initiator_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>, conne
                             "Initiator cannot Show code — use the Host window".into(),
                         ));
                     }
+                    SyncUiCommand::EnsureBle => {
+                        // Initiator has no BlueZ peripheral.
+                    }
                 }
             }
         }
@@ -523,7 +529,9 @@ async fn tcp_initiator_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>, conne
 #[cfg(feature = "bluez")]
 async fn start_ble(io: &SyncRuntimeIo) -> Result<BluezPeripheral, String> {
     emit_log(io, "starting BlueZ peripheral…");
-    BluezPeripheral::start(BluezPeripheralConfig {
+    eprintln!("bluelink: start_ble begin");
+    let t0 = std::time::Instant::now();
+    let result = BluezPeripheral::start(BluezPeripheralConfig {
         local_name: "BlueLink".into(),
         pairing_open: false,
     })
@@ -533,7 +541,9 @@ async fn start_ble(io: &SyncRuntimeIo) -> Result<BluezPeripheral, String> {
             "BLE adapter start timed out (15s) — is bluetoothd stuck?".into()
         }
         other => format!("BLE adapter unavailable: {other}"),
-    })
+    });
+    eprintln!("bluelink: start_ble end {}ms", t0.elapsed().as_millis());
+    result
 }
 
 #[cfg(feature = "bluez")]
@@ -543,8 +553,9 @@ struct BleSession {
     ble_failed: bool,
 }
 
+/// Bind vault + trust list only — no BlueZ/D-Bus. Radio starts via [`ensure_ble_radio`].
 #[cfg(feature = "bluez")]
-async fn apply_vault_ble(
+async fn bind_vault_ble(
     io: &SyncRuntimeIo,
     path: Option<PathBuf>,
     cancel: &AtomicBool,
@@ -558,30 +569,50 @@ async fn apply_vault_ble(
         return None;
     };
 
-    emit_log(io, format!("vault {}", root.display()));
+    emit_log(io, format!("vault {} (BLE idle until Sync)", root.display()));
     emit_trusted(io, &root);
+    io.emit(SyncUiEvent::Status(SyncStatus::Idle));
+    Some(BleSession {
+        root,
+        peripheral: None,
+        ble_failed: false,
+    })
+}
 
+/// Start GATT peripheral if this session has a vault and no live radio yet.
+#[cfg(feature = "bluez")]
+async fn ensure_ble_radio(io: &SyncRuntimeIo, sess: &mut BleSession) -> bool {
+    if sess.peripheral.is_some() {
+        return true;
+    }
     match start_ble(io).await {
         Ok(p) => {
+            sess.peripheral = Some(p);
+            sess.ble_failed = false;
             io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
             emit_log(io, "BLE advertising (waiting for peer)");
-            Some(BleSession {
-                root,
-                peripheral: Some(p),
-                ble_failed: false,
-            })
+            true
         }
         Err(msg) => {
+            sess.ble_failed = true;
             io.emit(SyncUiEvent::Error(msg.clone()));
             io.emit(SyncUiEvent::Status(SyncStatus::Error));
             emit_log(io, format!("{msg} — tip: --sync-tcp 127.0.0.1:7878"));
-            Some(BleSession {
-                root,
-                peripheral: None,
-                ble_failed: true,
-            })
+            false
         }
     }
+}
+
+/// Re-bind vault and start radio (link restart / recovery after transport death).
+#[cfg(feature = "bluez")]
+async fn apply_vault_ble(
+    io: &SyncRuntimeIo,
+    path: Option<PathBuf>,
+    cancel: &AtomicBool,
+) -> Option<BleSession> {
+    let mut session = bind_vault_ble(io, path, cancel).await?;
+    let _ = ensure_ble_radio(io, &mut session).await;
+    Some(session)
 }
 
 #[cfg(feature = "bluez")]
@@ -717,7 +748,8 @@ async fn ble_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                             return;
                         }
                         Control::SetVault(path) => {
-                            session = apply_vault_ble(&io, path, &cancel).await;
+                            // Vault only — no BlueZ until EnsureBle / ShowCode.
+                            session = bind_vault_ble(&io, path, &cancel).await;
                             restart_backoff = Duration::from_millis(250);
                         }
                     }
@@ -737,13 +769,14 @@ async fn ble_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
             continue;
         };
 
-        if sess.ble_failed || sess.peripheral.is_none() {
+        // Vault bound, radio not up yet (or last start failed).
+        if sess.peripheral.is_none() {
             tokio::select! {
                 ctrl = poll_ctrl(&ctrl_rx) => {
                     match ctrl {
                         Control::Shutdown => return,
                         Control::SetVault(path) => {
-                            session = apply_vault_ble(&io, path, &cancel).await;
+                            session = bind_vault_ble(&io, path, &cancel).await;
                             restart_backoff = Duration::from_millis(250);
                         }
                     }
@@ -751,11 +784,18 @@ async fn ble_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                 cmd = poll_cmd(&io.cmd_rx) => {
                     let Some(cmd) = cmd else { return };
                     match cmd {
+                        SyncUiCommand::EnsureBle => {
+                            let _ = ensure_ble_radio(&io, sess).await;
+                            restart_backoff = Duration::from_millis(250);
+                        }
                         SyncUiCommand::ShowCode => {
-                            io.emit(SyncUiEvent::Error(
-                                "BLE adapter unavailable — cannot show pairing code".into(),
-                            ));
-                            io.emit(SyncUiEvent::Status(SyncStatus::Error));
+                            if ensure_ble_radio(&io, sess).await {
+                                restart_backoff = Duration::from_millis(250);
+                                let root = sess.root.clone();
+                                let peri = sess.peripheral.as_mut().expect("just started");
+                                cancel.store(false, Ordering::SeqCst);
+                                run_pairing_ble(&io, peri, &root, &cancel).await;
+                            }
                         }
                         SyncUiCommand::Revoke(id) => revoke_device(&io, &sess.root, &id),
                         SyncUiCommand::Cancel => {
@@ -796,7 +836,8 @@ async fn ble_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                     }
                     Control::SetVault(path) => {
                         cancel.store(true, Ordering::SeqCst);
-                        session = apply_vault_ble(&io, path, &cancel).await;
+                        // Drop radio with vault change; Sync screen will EnsureBle again.
+                        session = bind_vault_ble(&io, path, &cancel).await;
                         restart_backoff = Duration::from_millis(250);
                     }
                 }
@@ -804,6 +845,9 @@ async fn ble_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
             cmd = poll_cmd(&io.cmd_rx) => {
                 let Some(cmd) = cmd else { return };
                 match cmd {
+                    SyncUiCommand::EnsureBle => {
+                        // Already advertising.
+                    }
                     SyncUiCommand::ShowCode => {
                         cancel.store(false, Ordering::SeqCst);
                         run_pairing_ble(&io, peri, &root, &cancel).await;

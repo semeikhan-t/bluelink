@@ -44,6 +44,8 @@ pub struct SyncPanelState {
     last_error: Option<String>,
     /// Initiator: draft 6-digit code for Join.
     pub join_code: String,
+    /// Host: [`SyncUiCommand::EnsureBle`] already sent for this Sync visit.
+    ensure_ble_sent: bool,
 }
 
 impl SyncPanelState {
@@ -101,6 +103,11 @@ impl SyncPanelState {
                 self.status = SyncStatus::Waiting;
             }
         }
+    }
+
+    /// Allow another [`SyncUiCommand::EnsureBle`] the next time Sync is opened.
+    pub fn reset_ensure_ble(&mut self) {
+        self.ensure_ble_sent = false;
     }
 }
 
@@ -354,6 +361,15 @@ pub fn show_sync(
     state.tick_pairing();
 
     let initiator = handle.map(|h| h.is_initiator()).unwrap_or(false);
+    // Host BLE stays off until Sync is opened (vault open alone must not touch BlueZ).
+    if !initiator {
+        if let Some(h) = handle {
+            if !state.ensure_ble_sent {
+                h.send(SyncUiCommand::EnsureBle);
+                state.ensure_ble_sent = true;
+            }
+        }
+    }
 
     ui.label(
         egui::RichText::new("Sync")

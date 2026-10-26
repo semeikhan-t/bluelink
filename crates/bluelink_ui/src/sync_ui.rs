@@ -57,6 +57,8 @@ pub enum SyncUiEvent {
 pub enum SyncUiCommand {
     /// Show a new 6-digit pairing code (TTL [`PAIRING_TTL_MS`], [`PAIRING_ATTEMPTS`] tries).
     ShowCode,
+    /// Host BLE: start advertising (lazy — not on vault open; avoids Plasma ANR on D-Bus).
+    EnsureBle,
     /// Initiator: dial peer and complete SPAKE2 join with this 6-digit code.
     Join(String),
     /// Initiator: dial peer and run sync as Initiator (after trust exists).
