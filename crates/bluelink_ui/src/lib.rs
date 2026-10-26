@@ -3,6 +3,7 @@
 mod editor;
 mod editor_menu;
 mod find_bar;
+mod fold;
 mod footnote;
 mod local_graph;
 mod math_block;
@@ -137,8 +138,8 @@ pub struct App {
     last_edit: Option<Instant>,
     /// Line currently shown as raw Markdown in the live editor.
     active_line: Option<usize>,
-    /// Full-document multiline edit (entered via Ctrl+A).
-    doc_edit: bool,
+    /// Live / Reading / Source — one buffer, different widgets.
+    view_mode: editor::ViewMode,
     status: String,
     dialog: Option<Dialog>,
     /// Sidebar inline rename (note or folder).
@@ -202,7 +203,7 @@ impl App {
             readonly: false,
             last_edit: None,
             active_line: None,
-            doc_edit: false,
+            view_mode: editor::ViewMode::Live,
             status: String::new(),
             dialog: None,
             renaming: None,
@@ -294,7 +295,7 @@ impl App {
                 self.readonly = false;
                 self.selected_sha = None;
                 self.active_line = None;
-                self.doc_edit = false;
+                self.view_mode = editor::ViewMode::Live;
                 self.local_graph = local_graph::LocalGraphUi::default();
                 self.refresh_notes();
             }
@@ -333,7 +334,7 @@ impl App {
         self.readonly = false;
         self.selected_sha = None;
         self.active_line = None;
-        self.doc_edit = false;
+        self.view_mode = editor::ViewMode::Live;
         self.local_graph = local_graph::LocalGraphUi::default();
     }
 
@@ -637,7 +638,7 @@ impl App {
                 self.dirty = false;
                 self.last_edit = None;
                 self.active_line = None;
-                self.doc_edit = false;
+                self.view_mode = editor::ViewMode::Live;
                 // NoteHistory undo + redo stacks; vault delete undo is separate.
                 self.note_history.clear();
                 self.scroll_to_line = None;
@@ -660,7 +661,7 @@ impl App {
                 self.dirty = false;
                 self.last_edit = None;
                 self.active_line = None;
-                self.doc_edit = false;
+                self.view_mode = editor::ViewMode::Live;
                 self.note_history.clear();
                 self.scroll_to_line = None;
                 self.outline_renaming = None;
@@ -824,7 +825,7 @@ impl App {
             self.readonly = false;
             self.selected_sha = None;
             self.active_line = None;
-            self.doc_edit = false;
+            self.view_mode = editor::ViewMode::Live;
         }
 
         if self.open_tabs.is_empty() {
@@ -834,7 +835,7 @@ impl App {
             self.readonly = false;
             self.selected_sha = None;
             self.active_line = None;
-            self.doc_edit = false;
+            self.view_mode = editor::ViewMode::Live;
             return;
         }
 
@@ -928,7 +929,7 @@ impl App {
         };
         self.scroll_to_line = Some(line);
         self.active_line = Some(line);
-        self.doc_edit = false;
+        self.view_mode = editor::ViewMode::Live;
     }
 
     fn line_of_byte(text: &str, byte: usize) -> usize {
@@ -948,7 +949,7 @@ impl App {
         let line = Self::line_of_byte(&self.buffer, start);
         self.scroll_to_line = Some(line);
         self.active_line = Some(line);
-        self.doc_edit = false;
+        self.view_mode = editor::ViewMode::Live;
         self.status = format!("match {}/{}", self.find_bar.cursor + 1, matches.len());
     }
 
@@ -966,55 +967,90 @@ impl App {
         self.find_jump_current();
     }
 
-    fn find_replace_one(&mut self) {
+    fn find_replace_one(&mut self, ctx: &egui::Context) {
         if self.readonly || self.find_bar.query.is_empty() {
             return;
         }
         let q = self.find_bar.query.clone();
         let repl = self.find_bar.replace.clone();
         let idx = self.find_bar.cursor;
+        let Some(&(start, end)) = find_bar::find_matches(&self.buffer, &q).get(idx) else {
+            return;
+        };
         self.note_history.checkpoint(&self.buffer);
-        if find_bar::replace_one(&mut self.buffer, &q, &repl, idx) {
-            self.dirty = true;
-            self.last_edit = Some(Instant::now());
-            self.find_jump_current();
-        }
+        self.shift_note_folds(ctx, start, end, &repl);
+        self.buffer.replace_range(start..end, &repl);
+        self.dirty = true;
+        self.last_edit = Some(Instant::now());
+        self.find_jump_current();
     }
 
-    fn find_replace_all(&mut self) {
+    fn find_replace_all(&mut self, ctx: &egui::Context) {
         if self.readonly || self.find_bar.query.is_empty() {
             return;
         }
         let q = self.find_bar.query.clone();
         let repl = self.find_bar.replace.clone();
-        self.note_history.checkpoint(&self.buffer);
-        let n = find_bar::replace_all(&mut self.buffer, &q, &repl);
-        if n > 0 {
-            self.dirty = true;
-            self.last_edit = Some(Instant::now());
-            self.find_bar.cursor = 0;
-            self.status = format!("replaced {n}");
+        let matches = find_bar::find_matches(&self.buffer, &q);
+        let n = matches.len();
+        if n == 0 {
+            return;
         }
+        self.note_history.checkpoint(&self.buffer);
+        // End to start, so an earlier match's bytes stay put while later folds move.
+        for &(start, end) in matches.iter().rev() {
+            self.shift_note_folds(ctx, start, end, &repl);
+            self.buffer.replace_range(start..end, &repl);
+        }
+        self.dirty = true;
+        self.last_edit = Some(Instant::now());
+        self.find_bar.cursor = 0;
+        self.status = format!("replaced {n}");
     }
 
-    fn undo_note_or_file(&mut self) {
+    fn shift_note_folds(&self, ctx: &egui::Context, start: usize, end: usize, new_text: &str) {
+        let Some(path) = self.selected.as_deref() else {
+            return;
+        };
+        let key = egui::Id::new(("bluelink_folds", path));
+        let mut folds: Vec<usize> = ctx.data(|d| d.get_temp(key)).unwrap_or_default();
+        if folds.is_empty() {
+            return;
+        }
+        editor::shift_folds_in_text(&mut folds, &self.buffer, start, end, new_text);
+        ctx.data_mut(|d| d.insert_temp(key, folds));
+    }
+
+    /// History restores text, not line indexes, so session folds would point at the wrong rows.
+    fn clear_note_folds(&self, ctx: &egui::Context) {
+        let Some(path) = self.selected.as_deref() else {
+            return;
+        };
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(("bluelink_folds", path)), Vec::<usize>::new());
+        });
+    }
+
+    fn undo_note_or_file(&mut self, ctx: &egui::Context) {
         if self.note_history.undo(&mut self.buffer) {
+            self.clear_note_folds(ctx);
             self.dirty = true;
             self.last_edit = Some(Instant::now());
             self.active_line = None;
-            self.doc_edit = false;
+            self.view_mode = editor::ViewMode::Live;
             self.status = "undo".into();
             return;
         }
         self.undo();
     }
 
-    fn redo_note(&mut self) {
+    fn redo_note(&mut self, ctx: &egui::Context) {
         if self.note_history.redo(&mut self.buffer) {
+            self.clear_note_folds(ctx);
             self.dirty = true;
             self.last_edit = Some(Instant::now());
             self.active_line = None;
-            self.doc_edit = false;
+            self.view_mode = editor::ViewMode::Live;
             self.status = "redo".into();
         }
     }
@@ -1499,7 +1535,7 @@ impl App {
                         self.readonly = false;
                         self.selected_sha = None;
                         self.active_line = None;
-                        self.doc_edit = false;
+                        self.view_mode = editor::ViewMode::Live;
                         self.active_tab = None;
                         if !self.open_tabs.is_empty() {
                             self.focus_tab(0);
@@ -1558,7 +1594,7 @@ impl App {
                     self.readonly = false;
                     self.selected_sha = None;
                     self.active_line = None;
-                    self.doc_edit = false;
+                    self.view_mode = editor::ViewMode::Live;
                     self.active_tab = None;
                     if let Some(i) = note_idx {
                         if i < self.open_tabs.len() {
@@ -1716,7 +1752,7 @@ impl App {
                 self.selected_sha = new_sha;
                 self.acked_external_sha = None;
                 self.active_line = None;
-                self.doc_edit = false;
+                self.view_mode = editor::ViewMode::Live;
                 self.note_history.clear();
                 self.scroll_to_line = None;
                 self.outline_renaming = None;
@@ -1730,7 +1766,7 @@ impl App {
                 self.selected_sha = new_sha;
                 self.acked_external_sha = None;
                 self.active_line = None;
-                self.doc_edit = false;
+                self.view_mode = editor::ViewMode::Live;
                 self.note_history.clear();
                 self.scroll_to_line = None;
                 self.status = "note is not UTF-8 (read-only)".into();
@@ -1824,10 +1860,10 @@ impl App {
             self.find_next(false);
         }
         if do_replace {
-            self.find_replace_one();
+            self.find_replace_one(ui.ctx());
         }
         if do_replace_all {
-            self.find_replace_all();
+            self.find_replace_all(ui.ctx());
         }
     }
 
@@ -2135,10 +2171,10 @@ impl eframe::App for App {
             }
         }
         if undo && on_notes {
-            self.undo_note_or_file();
+            self.undo_note_or_file(ctx);
         }
         if redo && on_notes {
-            self.redo_note();
+            self.redo_note(ctx);
         }
         if find && on_notes && !self.is_graph_active() && self.selected.is_some() {
             self.find_bar.open = true;
@@ -2343,7 +2379,7 @@ impl eframe::App for App {
                         self.delete_path(&path);
                     }
                     if action.undo {
-                        self.undo_note_or_file();
+                        self.undo_note_or_file(ctx);
                     }
                     if let Some((from, to)) = action.move_note {
                         self.move_note(&from, &to);
@@ -2507,7 +2543,7 @@ impl eframe::App for App {
         if let Some(line) = outline_jump {
             self.scroll_to_line = Some(line);
             self.active_line = Some(line);
-            self.doc_edit = false;
+            self.view_mode = editor::ViewMode::Live;
         }
         if let Some((line, old, new)) = outline_rename {
             self.apply_heading_rename(line, &old, &new);
@@ -2596,6 +2632,14 @@ impl eframe::App for App {
                             tab_select = tab_action.select;
                             tab_close = tab_action.close;
                         }
+                        if !self.is_graph_active() && self.selected.is_some() {
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(self.view_mode.label())
+                                    .size(12.0)
+                                    .color(theme::WEAK),
+                            );
+                        }
                         if self.readonly && !self.is_graph_active() {
                             ui.add_space(8.0);
                             ui.colored_label(theme::WARN, "read-only");
@@ -2638,7 +2682,9 @@ impl eframe::App for App {
             }
 
             {
-                let props = properties_panel::show(ui, &self.buffer, self.readonly);
+                let props_locked =
+                    self.readonly || self.view_mode == editor::ViewMode::Reading;
+                let props = properties_panel::show(ui, &self.buffer, props_locked);
                 if let Some(next) = props.rewritten {
                     if next != self.buffer {
                         if !self.props_burst {
@@ -2669,7 +2715,7 @@ impl eframe::App for App {
                     self.selected.as_deref(),
                     &mut self.buffer,
                     &mut self.active_line,
-                    &mut self.doc_edit,
+                    &mut self.view_mode,
                     self.readonly,
                     scroll_to,
                     &mut self.note_history,

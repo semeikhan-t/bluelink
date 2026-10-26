@@ -24,6 +24,8 @@ pub enum Span {
     Emphasis(String),
     Strike(String),
     Highlight(String),
+    /// Obsidian `%%…%%` comment body (delimiters not stored; UI paints them when shown).
+    Comment(String),
     /// Inline TeX from `$...$` (not `$$` blocks).
     InlineMath { formula: String },
     Code(String),
@@ -521,6 +523,7 @@ fn push_span(
             | Span::Emphasis(t)
             | Span::Strike(t)
             | Span::Highlight(t)
+            | Span::Comment(t)
             | Span::Code(t) => heading.push_str(t),
             Span::InlineMath { formula } => heading.push_str(formula),
             _ => {}
@@ -536,19 +539,23 @@ fn push_span(
     }
 }
 
-/// Split plain text into highlight / inline math / text; `%%…%%` comments are dropped.
+/// Split plain text into comment / highlight / inline math / text.
+///
+/// Closed `%%…%%` becomes [`Span::Comment`] (body only). Unclosed `%%` stays as text.
+/// First closer wins (no nesting). Live editor parses per line, so multi-line pairs do not match.
 fn split_inline_marks(text: &str) -> Vec<Span> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
     let mut last = 0;
     while i < bytes.len() {
-        // `%%…%%` — omit from preview
+        // `%%…%%` comment
         if i + 1 < bytes.len() && bytes[i] == b'%' && bytes[i + 1] == b'%' {
             if let Some(end) = find_close(bytes, i + 2, b"%%") {
                 if last < i {
                     out.push(Span::Text(text[last..i].to_string()));
                 }
+                out.push(Span::Comment(text[i + 2..end].to_string()));
                 i = end + 2;
                 last = i;
                 continue;
@@ -928,10 +935,12 @@ mod tests {
     }
 
     #[test]
-    fn comment_omitted_from_preview() {
+    fn comment_emitted_as_span() {
         let spans = para_spans(&parse_preview("keep %%secret%% visible"));
         assert!(
-            !spans.iter().any(|s| matches!(s, Span::Text(t) if t.contains("secret"))),
+            spans
+                .iter()
+                .any(|s| matches!(s, Span::Comment(t) if t == "secret")),
             "spans={spans:?}"
         );
         assert!(
@@ -942,6 +951,44 @@ mod tests {
             spans
                 .iter()
                 .any(|s| matches!(s, Span::Text(t) if t.contains("visible"))),
+            "spans={spans:?}"
+        );
+        assert!(
+            !spans
+                .iter()
+                .any(|s| matches!(s, Span::Text(t) if t.contains("secret"))),
+            "spans={spans:?}"
+        );
+    }
+
+    #[test]
+    fn comment_unclosed_stays_text() {
+        let spans = para_spans(&parse_preview("keep %%open"));
+        assert!(
+            !spans.iter().any(|s| matches!(s, Span::Comment(_))),
+            "spans={spans:?}"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| matches!(s, Span::Text(t) if t.contains("%%open"))),
+            "spans={spans:?}"
+        );
+    }
+
+    #[test]
+    fn comment_first_closer_wins() {
+        let spans = para_spans(&parse_preview("%% a %% b %%"));
+        assert!(
+            spans
+                .iter()
+                .any(|s| matches!(s, Span::Comment(t) if t == " a ")),
+            "spans={spans:?}"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| matches!(s, Span::Text(t) if t.contains("b") && t.contains("%%"))),
             "spans={spans:?}"
         );
     }

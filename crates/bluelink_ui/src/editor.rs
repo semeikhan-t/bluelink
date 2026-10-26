@@ -1,5 +1,8 @@
 //! Line-based live preview: active line is raw Markdown, others are rendered.
-//! Ctrl+A opens full-document edit with everything selected.
+//!
+//! View modes: [`ViewMode::Live`] (default), [`ViewMode::Reading`] (preview only),
+//! [`ViewMode::Source`] (full-buffer monospace). Ctrl+A enters Source with select-all.
+//! BlueLink hotkeys: Ctrl+E = toggle reading, Ctrl+Shift+E = toggle source.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -9,6 +12,7 @@ use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{FontFamily, FontId, Id, Key, Order, TextEdit, Ui};
 
 use crate::editor_menu::{self, EditorAction};
+use crate::fold;
 use crate::footnote;
 use crate::math_block::{self, MathRole};
 use crate::media;
@@ -16,6 +20,41 @@ use crate::note_history::NoteHistory;
 use crate::preview;
 use crate::table::{self, Place};
 use crate::theme;
+
+/// How the note body is shown. One shared buffer; modes only change the widget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewMode {
+    #[default]
+    Live,
+    Reading,
+    Source,
+}
+
+impl ViewMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Live => "Live",
+            Self::Reading => "Reading",
+            Self::Source => "Source",
+        }
+    }
+
+    /// Reading ↔ Live; from Source goes to Reading.
+    pub fn toggle_reading(self) -> Self {
+        match self {
+            Self::Reading => Self::Live,
+            _ => Self::Reading,
+        }
+    }
+
+    /// Source ↔ Live; from Reading goes to Source.
+    pub fn toggle_source(self) -> Self {
+        match self {
+            Self::Source => Self::Live,
+            _ => Self::Source,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum PendingClipboard {
@@ -170,14 +209,21 @@ fn gap_after_row(i: usize, n: usize, role: preview::FenceRole) -> f32 {
 }
 
 /// `prefix[i]` = y of row `i` start; `prefix[n]` = total content height (incl. top pad).
-fn row_prefix_heights(heights: &[f32], roles: &[preview::FenceRole]) -> Vec<f32> {
+/// Folded lines take no height and no gap, so the scroll height matches what is drawn.
+fn row_prefix_heights(heights: &[f32], roles: &[preview::FenceRole], hidden: &[bool]) -> Vec<f32> {
     let n = heights.len();
     debug_assert_eq!(n, roles.len());
     let mut prefix = Vec::with_capacity(n + 1);
     prefix.push(TOP_PAD);
     for i in 0..n {
-        let h = heights[i].max(1.0);
-        prefix.push(prefix[i] + h + gap_after_row(i, n, roles[i]));
+        let gone = hidden.get(i).copied().unwrap_or(false);
+        let h = if gone { 0.0 } else { heights[i].max(1.0) };
+        let gap = if gone {
+            0.0
+        } else {
+            gap_after_row(i, n, roles[i])
+        };
+        prefix.push(prefix[i] + h + gap);
     }
     prefix
 }
@@ -245,7 +291,7 @@ fn row_at_local_y(prefix: &[f32], heights: &[f32], local_y: f32) -> Option<usize
 }
 
 /// Show live editor. `active_line` is the raw-editing line index (0-based).
-/// `doc_edit` — full-buffer multiline mode (Ctrl+A).
+/// `view_mode` selects Live / Reading / Source widgets over one buffer.
 struct PaintedRow {
     height: f32,
     skip_gap: bool,
@@ -349,8 +395,13 @@ fn paint_structured_row(
         .copied()
         .unwrap_or(preview::CalloutPlace::None)
     {
-        preview::CalloutPlace::Tail { start, end: block_end } => {
-            if active_line.is_some_and(|a| (start..block_end).contains(&a)) {
+        preview::CalloutPlace::Tail {
+            start,
+            end: block_end,
+        } => {
+            let header = lines.get(start).map(String::as_str).unwrap_or("");
+            let collapsed = preview::callout_collapsed(header);
+            if !collapsed && active_line.is_some_and(|a| (start..block_end).contains(&a)) {
                 return None;
             }
             return Some(PaintedRow {
@@ -359,11 +410,18 @@ fn paint_structured_row(
             });
         }
         preview::CalloutPlace::Head { end: block_end } => {
-            if active_line.is_some_and(|a| (i..block_end).contains(&a)) {
-                // Editing inside the callout — fall through to raw lines.
-            } else {
+            let collapsed = preview::callout_collapsed(line);
+            let editing = !collapsed && active_line.is_some_and(|a| (i..block_end).contains(&a));
+            if !editing {
                 let top = ui.cursor().top();
-                if let Some(clicked) = preview::paint_callout(ui, lines, i, block_end) {
+                let hit = preview::paint_callout(ui, lines, i, block_end);
+                // A click on a collapsed title expands it; the chevron toggles either way.
+                let expand_title = collapsed && hit.edit.is_some();
+                if (hit.toggle_fold || expand_title) && !readonly {
+                    if let Some(next) = preview::set_callout_collapsed(line, !collapsed) {
+                        *splice = Some((start, end, next));
+                    }
+                } else if let Some(clicked) = hit.edit {
                     if !readonly {
                         *request_active = Some(clicked);
                     }
@@ -415,6 +473,7 @@ fn apply_table_choice(
     buffer: &mut String,
     ranges: &[(usize, usize)],
     choice: table::MenuChoice,
+    folds: &mut Vec<usize>,
 ) -> bool {
     let lines: Vec<String> = ranges
         .iter()
@@ -438,6 +497,8 @@ fn apply_table_choice(
     let Some(&(_, b1)) = ranges.get(end - 1) else {
         return false;
     };
+    let delta = fold::line_delta(buffer.get(b0..b1).unwrap_or(""), &text);
+    fold::shift_lines(folds, choice.start + 1, delta);
     buffer.replace_range(b0..b1, &text);
     true
 }
@@ -474,7 +535,7 @@ pub fn show_live(
     source_path: Option<&str>,
     buffer: &mut String,
     active_line: &mut Option<usize>,
-    doc_edit: &mut bool,
+    view_mode: &mut ViewMode,
     readonly: bool,
     scroll_to_line: Option<usize>,
     history: &mut NoteHistory,
@@ -488,25 +549,69 @@ pub fn show_live(
         tag_query: None,
     };
 
-    if readonly {
-        *doc_edit = false;
+    // Disk-locked notes cannot enter Source (no typing). Reading still works.
+    if readonly && *view_mode == ViewMode::Source {
+        *view_mode = ViewMode::Live;
     }
     table::set_cell_focused(ui.ctx(), false);
 
-    // Drops / clipboard images before TextEdit so paste does not also insert text.
-    if !readonly {
-        if let Some(note) = source_path {
-            handle_dropped_files(ui, vault, note, buffer, *active_line, history, &mut result);
-            handle_clipboard_image_paste(ui, vault, note, buffer, *active_line, history, &mut result);
+    let fold_key = Id::new(("bluelink_folds", source_path.unwrap_or("")));
+    let mut folds: Vec<usize> = ui.ctx().data(|d| d.get_temp(fold_key)).unwrap_or_default();
+
+    // BlueLink: Ctrl+E = reading, Ctrl+Shift+E = source (not Obsidian-identical keymap).
+    {
+        let (toggle_reading, toggle_source) = ui.input(|i| {
+            let cmd = i.modifiers.command && !i.modifiers.alt;
+            (
+                cmd && !i.modifiers.shift && i.key_pressed(Key::E),
+                cmd && i.modifiers.shift && i.key_pressed(Key::E),
+            )
+        });
+        if toggle_source && !readonly {
+            history.end_burst(buffer);
+            *view_mode = view_mode.toggle_source();
+            *active_line = None;
+        } else if toggle_reading {
+            history.end_burst(buffer);
+            *view_mode = view_mode.toggle_reading();
+            *active_line = None;
         }
     }
 
-    // Ctrl+A → select entire note in full edit mode.
-    if !readonly
-        && ui.input(|i| i.modifiers.command && i.key_pressed(Key::A))
-    {
+    let can_edit = !readonly && *view_mode == ViewMode::Live;
+    let show_comments = *view_mode != ViewMode::Reading;
+
+    // Drops / clipboard images before TextEdit so paste does not also insert text.
+    if can_edit {
+        if let Some(note) = source_path {
+            handle_dropped_files(
+                ui,
+                vault,
+                note,
+                buffer,
+                *active_line,
+                history,
+                &mut result,
+                &mut folds,
+            );
+            handle_clipboard_image_paste(
+                ui,
+                vault,
+                note,
+                buffer,
+                *active_line,
+                history,
+                &mut result,
+                &mut folds,
+            );
+        }
+    }
+
+    // Ctrl+A → Source with entire note selected.
+    if can_edit && ui.input(|i| i.modifiers.command && i.key_pressed(Key::A)) {
         history.end_burst(buffer);
-        *doc_edit = true;
+        // ponytail: Source uses a different ScrollArea; caret/scroll are not mapped back.
+        *view_mode = ViewMode::Source;
         *active_line = None;
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new("live_select_all"), true));
@@ -516,7 +621,7 @@ pub fn show_live(
     {
         let hist_key = Id::new(("live_hist_focus", source_path.unwrap_or("")));
         let prev: Option<HistFocus> = ui.ctx().data(|d| d.get_temp(hist_key));
-        let now = if *doc_edit {
+        let now = if *view_mode == ViewMode::Source {
             HistFocus::Doc
         } else if let Some(i) = *active_line {
             HistFocus::Line(i)
@@ -534,13 +639,14 @@ pub fn show_live(
         }
     }
 
-    if *doc_edit {
+    if *view_mode == ViewMode::Source {
+        ui.ctx().data_mut(|d| d.insert_temp(fold_key, folds));
         return show_doc_edit(
             ui,
             vault,
             source_path,
             buffer,
-            doc_edit,
+            view_mode,
             active_line,
             history,
             result,
@@ -548,6 +654,17 @@ pub fn show_live(
     }
 
     boost_note_scroll(ui);
+
+    // Expanding a callout writes `+`/`-` into the note — only while editing.
+    if can_edit {
+        if let Some(target) = scroll_to_line {
+            if let Some(next) = preview::expand_collapsed_callout_at(buffer, target) {
+                history.checkpoint(buffer);
+                *buffer = next;
+                result.changed = true;
+            }
+        }
+    }
 
     let mut ranges = line_ranges(buffer);
     if ranges.is_empty() {
@@ -606,6 +723,47 @@ pub fn show_live(
         (roles, langs)
     };
 
+    let (regions, hidden, jump_to) = {
+        let fold_lines: Vec<&str> = ranges
+            .iter()
+            .map(|&(start, end)| buffer.get(start..end).unwrap_or(""))
+            .collect();
+        let in_fence: Vec<bool> = fence_roles
+            .iter()
+            .map(|role| !matches!(role, preview::FenceRole::Outside))
+            .collect();
+        let regions = fold::regions(&fold_lines, &in_fence);
+        fold::retain_valid(&mut folds, &regions);
+        if let Some(target) = scroll_to_line {
+            fold::unfold_containing(&mut folds, &regions, target);
+        }
+        let mut hidden = fold::hidden(fold_lines.len(), &regions, &folds);
+        for (i, tail) in preview::collapsed_callout_tails(&fold_lines)
+            .into_iter()
+            .enumerate()
+        {
+            if tail {
+                hidden[i] = true;
+            }
+        }
+        let jump_to: Vec<Option<usize>> = (0..fold_lines.len())
+            .map(|i| {
+                if hidden[i] {
+                    fold::visible_anchor(&regions, &folds, i)
+                        .or_else(|| preview::callout_at(&fold_lines, i).map(|(header, _)| header))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        (regions, hidden, jump_to)
+    };
+    if let Some(i) = *active_line {
+        if hidden.get(i).copied().unwrap_or(false) {
+            *active_line = jump_to.get(i).copied().flatten();
+        }
+    }
+
     // Scroll target from prefix heights (virtual rows are not in the tessellator).
     let layout_id = Id::new(("live_layout", vault.root(), source_path.unwrap_or("")));
     let mut scroll_area = egui::ScrollArea::vertical()
@@ -615,7 +773,7 @@ pub fn show_live(
         if let Some(cache) = ui.ctx().data(|d| d.get_temp::<LiveLayoutCache>(layout_id)) {
             if cache.lines.len() == ranges.len() {
                 let heights: Vec<f32> = cache.lines.iter().map(|l| l.height.max(1.0)).collect();
-                let prefix = row_prefix_heights(&heights, &fence_roles);
+                let prefix = row_prefix_heights(&heights, &fence_roles, &hidden);
                 let idx = target.min(prefix.len().saturating_sub(1));
                 let offset = prefix.get(idx).copied().unwrap_or(TOP_PAD);
                 scroll_area = scroll_area.vertical_scroll_offset(offset);
@@ -641,13 +799,13 @@ pub fn show_live(
             let mut layout = layout.expect("live layout cache initialized");
 
             let heights: Vec<f32> = layout.lines.iter().map(|l| l.height.max(1.0)).collect();
-            let prefix = row_prefix_heights(&heights, &fence_roles);
+        let prefix = row_prefix_heights(&heights, &fence_roles, &hidden);
             let content_top = ui.cursor().top();
             let pane = ui.available_rect_before_wrap();
             // Registered before the lines so text, links, and embeds stay on top.
             // Empty space at the same height (side margins and the tail of a short line)
             // still hits this widget and opens that row.
-            let margin = if readonly {
+            let margin = if !can_edit {
                 None
             } else {
                 let total = *prefix.last().unwrap_or(&TOP_PAD);
@@ -675,15 +833,14 @@ pub fn show_live(
                 ui.spacing_mut().item_spacing.y = 0.0;
 
                 let n = ranges.len();
-                let force = if readonly {
-                    None
-                } else {
-                    active_line
-                        .filter(|&i| i < n)
-                        .or_else(|| scroll_to_line.filter(|&i| i < n))
-                };
-                let (first, last) =
-                    visible_row_range(&prefix, viewport.min.y, viewport.max.y, force);
+                let force = scroll_to_line.filter(|&i| i < n).or_else(|| {
+                    if can_edit {
+                        active_line.filter(|&i| i < n)
+                    } else {
+                        None
+                    }
+                });
+            let (first, last) = visible_row_range(&prefix, viewport.min.y, viewport.max.y, force);
 
                 ui.add_space(prefix[first]);
 
@@ -700,12 +857,29 @@ pub fn show_live(
                         .is_some_and(|span| span.role != MathRole::Outside);
                 }
 
+            let mut fold_clicked: Option<usize> = None;
                 for i in first..last {
+                if hidden.get(i).copied().unwrap_or(false) {
+                    continue;
+                }
+                let row_top = ui.cursor().top();
+                if regions.iter().any(|region| region.start == i) {
+                    let collapsed = folds.contains(&i);
+                    let center = egui::pos2(column_left - 14.0, row_top + 11.0);
+                    if fold_chevron(
+                        ui,
+                        Id::new(("fold_chevron", source_path.unwrap_or(""), i)),
+                        center,
+                        collapsed,
+                    ) {
+                        fold_clicked = Some(i);
+                    }
+                }
                     let (start, end) = ranges[i];
                     let fence_role = fence_roles[i];
                     let fence_lang = fence_langs[i].as_deref();
                     let in_fence = !matches!(fence_role, preview::FenceRole::Outside);
-                    let is_active = !readonly && *active_line == Some(i);
+                    let is_active = can_edit && *active_line == Some(i);
 
                     let line = buffer.get(start..end).unwrap_or("");
 
@@ -721,7 +895,7 @@ pub fn show_live(
                         &callout_places,
                         &ranges,
                         *active_line,
-                        readonly,
+                        !can_edit,
                         &mut splice,
                         &mut table_edit,
                         &mut request_active,
@@ -841,16 +1015,13 @@ pub fn show_live(
                         // Format shortcuts when the line field has focus (not S/P/Z/F/A/W/T/G).
                         if focused && splice.is_none() {
                             let wrap = ui.input(|inp| {
-                                if !inp.modifiers.command || inp.modifiers.shift || inp.modifiers.alt
-                                {
+                            if !inp.modifiers.command || inp.modifiers.shift || inp.modifiers.alt {
                                     return None;
                                 }
                                 if inp.key_pressed(Key::B) {
                                     Some(("**", "**"))
                                 } else if inp.key_pressed(Key::I) {
                                     Some(("*", "*"))
-                                } else if inp.key_pressed(Key::E) {
-                                    Some(("`", "`"))
                                 } else if inp.key_pressed(Key::K) {
                                     Some(("[[", "]]"))
                                 } else {
@@ -874,13 +1045,7 @@ pub fn show_live(
                         active_sel = Some((i, primary, secondary));
                         if response.secondary_clicked() {
                             if let Some(pos) = response.interact_pointer_pos() {
-                                editor_menu::open_at(
-                                    ui.ctx(),
-                                    pos,
-                                    Some(i),
-                                    primary,
-                                    secondary,
-                                );
+                            editor_menu::open_at(ui.ctx(), pos, Some(i), primary, secondary);
                             }
                         }
 
@@ -911,15 +1076,12 @@ pub fn show_live(
                         let show_wiki = wiki_open.is_some() && (focused || grace > 0);
                         if let Some((brack_at, query)) = wiki_open {
                             if show_wiki {
-                                let candidates =
-                                    wiki_candidates(&vault.index().note_paths(), &query);
+                            let candidates = wiki_candidates(&vault.index().note_paths(), &query);
                                 let mut picked: Option<String> = None;
                                 if !candidates.is_empty() {
                                     egui::Area::new(Id::new(("wiki_ac", i)))
                                         .order(Order::Foreground)
-                                        .fixed_pos(
-                                            response.rect.left_bottom() + egui::vec2(0.0, 4.0),
-                                        )
+                                    .fixed_pos(response.rect.left_bottom() + egui::vec2(0.0, 4.0))
                                         .show(ui.ctx(), |ui| {
                                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                                 ui.set_min_width(220.0);
@@ -941,9 +1103,8 @@ pub fn show_live(
                                             });
                                         });
                                     if enter && focused {
-                                        picked = Some(
-                                            candidates[0].trim_end_matches(".md").to_string(),
-                                        );
+                                    picked =
+                                        Some(candidates[0].trim_end_matches(".md").to_string());
                                         wiki_consumed_enter = true;
                                     }
                                 }
@@ -960,8 +1121,7 @@ pub fn show_live(
                         ui.ctx().data_mut(|d| d.insert_temp(grace_key, grace));
 
                         // singleline TextEdit loses focus on Enter — newline, unless wiki picked.
-                        let enter_here =
-                            enter && focused && !wiki_consumed_enter && splice.is_none();
+                    let enter_here = enter && focused && !wiki_consumed_enter && splice.is_none();
                         if enter_here {
                             let left = draft[..byte_idx].to_string();
                             let right = draft[byte_idx..].to_string();
@@ -973,12 +1133,7 @@ pub fn show_live(
                                         splice = Some((start, end, cont.clear_to));
                                         leave_edit_after_wiki = true;
                                     } else {
-                                        split_at_cursor = Some((
-                                            start,
-                                            end,
-                                            left,
-                                            cont.next_prefix,
-                                        ));
+                                    split_at_cursor = Some((start, end, left, cont.next_prefix));
                                     }
                                 } else {
                                     split_at_cursor = Some((start, end, left, right));
@@ -1002,9 +1157,7 @@ pub fn show_live(
                         // (draft == line means TextEdit did not consume the key).
                         let cursor_at_start = output
                             .cursor_range
-                            .map(|r| {
-                                r.primary.ccursor.index == 0 && r.secondary.ccursor.index == 0
-                            })
+                        .map(|r| r.primary.ccursor.index == 0 && r.secondary.ccursor.index == 0)
                             .unwrap_or(false);
                         if backspace
                             && i > 0
@@ -1044,13 +1197,14 @@ pub fn show_live(
                                     fence_role,
                                     fence_lang,
                                     preview,
+                                    show_comments,
                                 )
                             },
                         );
                         let click = row.inner;
                         measured_h = row.response.rect.height().max(1.0);
 
-                        if !readonly && row.response.secondary_clicked() {
+                        if can_edit && row.response.secondary_clicked() {
                             let n = line.chars().count();
                             if let Some(pos) = row.response.interact_pointer_pos() {
                                 editor_menu::open_at(ui.ctx(), pos, Some(i), n, n);
@@ -1072,7 +1226,7 @@ pub fn show_live(
                             preview::LineClick::Tag { query } => {
                                 result.tag_query = Some(query);
                             }
-                            preview::LineClick::ToggleCheck if !readonly => {
+                            preview::LineClick::ToggleCheck if can_edit => {
                                 if let Some(next) = preview::toggle_checklist_line(line) {
                                     structural_checkpoint = true;
                                     splice = Some((start, end, next));
@@ -1082,18 +1236,16 @@ pub fn show_live(
                                 target,
                                 width,
                                 height,
-                            } if !readonly => {
+                            } if can_edit => {
                                 history.checkpoint(buffer);
-                                if media::rewrite_embed_size(
-                                    buffer, Some(i), &target, width, height,
-                                ) {
+                            if media::rewrite_embed_size(buffer, Some(i), &target, width, height) {
                                     result.changed = true;
                                     if *active_line == Some(i) {
                                         history.begin_burst(buffer);
                                     }
                                 }
                             }
-                            preview::LineClick::Edit if !readonly => {
+                            preview::LineClick::Edit if can_edit => {
                                 request_active = Some(i);
                             }
                             _ => {}
@@ -1114,6 +1266,25 @@ pub fn show_live(
                         ui.add_space(gap);
                     }
                 }
+            if let Some(i) = fold_clicked {
+                let closed_now = if let Some(pos) = folds.iter().position(|&start| start == i) {
+                    folds.remove(pos);
+                    false
+                } else {
+                    folds.push(i);
+                    true
+                };
+                if closed_now {
+                    if let Some(active) = *active_line {
+                        let covers = regions.iter().any(|region| {
+                            region.start == i && region.start < active && active < region.end
+                        });
+                        if covers {
+                            request_active = Some(i);
+                        }
+                    }
+                }
+            }
                 let total = *prefix.last().unwrap_or(&TOP_PAD);
                 let after = (total - prefix[last]).max(0.0);
                 if after > 0.0 {
@@ -1127,7 +1298,10 @@ pub fn show_live(
                 if primary || secondary {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let local_y = pos.y - column_top;
-                        if let Some(i) = row_at_local_y(&prefix, &heights, local_y) {
+                    if let Some(mut i) = row_at_local_y(&prefix, &heights, local_y) {
+                        if hidden.get(i).copied().unwrap_or(false) {
+                            i = jump_to.get(i).copied().flatten().unwrap_or(i);
+                        }
                             let n = ranges
                                 .get(i)
                                 .and_then(|&(s, e)| buffer.get(s..e))
@@ -1150,7 +1324,7 @@ pub fn show_live(
 
             ui.ctx().data_mut(|d| d.insert_temp(layout_id, layout));
 
-            if !readonly {
+            if can_edit {
                 let used = (ui.cursor().top() - content_top).max(0.0);
                 // Full editor width (not only the centered column) + at least the viewport.
                 let fill_h = (viewport_h - used).max(120.0);
@@ -1179,7 +1353,7 @@ pub fn show_live(
         });
 
         // One floating menu for the whole editor (not per-line egui context_menu).
-        if !readonly {
+        if can_edit {
             let menu_was_open = editor_menu::load_menu(ui.ctx()).is_some();
             let table_was_open = table::menu_open(ui.ctx());
             if let Some((menu, action)) = editor_menu::show_popup(ui.ctx()) {
@@ -1209,6 +1383,7 @@ pub fn show_live(
                                 menu.line.or(*active_line),
                                 history,
                                 &mut result,
+                            &mut folds,
                             ) {
                                 // Image consumed; skip RequestPaste.
                             } else {
@@ -1243,8 +1418,11 @@ pub fn show_live(
                         } else {
                             0
                         };
-                        let caret =
-                            insert_isolated_block(buffer, primary, secondary, snip, caret_in);
+                    let nl_before = buffer.matches('\n').count() as i32;
+                    let insert_line = menu.line.unwrap_or(0);
+                    let caret = insert_isolated_block(buffer, primary, secondary, snip, caret_in);
+                    let delta = buffer.matches('\n').count() as i32 - nl_before;
+                    fold::shift_lines(&mut folds, insert_line + 1, delta);
                         let (line, col) = caret_line_col(buffer, caret);
                         request_active = Some(line);
                         ui.ctx().data_mut(|d| {
@@ -1280,6 +1458,28 @@ pub fn show_live(
                             result.changed = true;
                         }
                     }
+                EditorAction::FoldMore
+                | EditorAction::FoldLess
+                | EditorAction::FoldAll
+                | EditorAction::UnfoldAll => {
+                    let line = menu.line.or(*active_line).unwrap_or(0);
+                    if let Some(next) = apply_fold_action(buffer, &mut folds, line, &action) {
+                        history.checkpoint(buffer);
+                        *buffer = next;
+                        history.begin_burst(buffer);
+                        result.changed = true;
+                    }
+                }
+                EditorAction::ToggleReading => {
+                    history.end_burst(buffer);
+                    *view_mode = view_mode.toggle_reading();
+                    *active_line = None;
+                }
+                EditorAction::ToggleSource => {
+                    history.end_burst(buffer);
+                    *view_mode = view_mode.toggle_source();
+                    *active_line = None;
+                }
                     ref text_action => {
                         if let Some(i) = menu.line {
                             if let Some(&(s, e)) = ranges.get(i) {
@@ -1298,10 +1498,7 @@ pub fn show_live(
                                     request_active = Some(i);
                                     ui.ctx().data_mut(|d| {
                                         d.insert_temp(egui::Id::new(("live_focus", i)), true);
-                                        d.insert_temp(
-                                            egui::Id::new(("live_cursor", i)),
-                                            caret,
-                                        );
+                                    d.insert_temp(egui::Id::new(("live_cursor", i)), caret);
                                     });
                                 }
                             }
@@ -1313,7 +1510,7 @@ pub fn show_live(
             if let Some(choice) = table::show_menu(ui.ctx()) {
                 if table_edit.is_none() && !result.changed {
                     history.checkpoint(buffer);
-                    if apply_table_choice(buffer, &ranges, choice) {
+                if apply_table_choice(buffer, &ranges, choice, &mut folds) {
                         result.changed = true;
                     }
                 }
@@ -1327,10 +1524,9 @@ pub fn show_live(
     // Shift+↑/↓ → full-doc edit with selection extended by one line.
     // A focused table cell owns the arrows.
     let in_table_cell = table::cell_focused(ui.ctx());
-    if !readonly && !request_select_all && !in_table_cell {
+    if can_edit && !request_select_all && !in_table_cell {
         let (shift_up, shift_down) = ui.input(|i| {
-            let shift_only =
-                i.modifiers.shift && !i.modifiers.command && !i.modifiers.alt;
+            let shift_only = i.modifiers.shift && !i.modifiers.command && !i.modifiers.alt;
             (
                 shift_only && i.key_pressed(Key::ArrowUp),
                 shift_only && i.key_pressed(Key::ArrowDown),
@@ -1360,7 +1556,7 @@ pub fn show_live(
                 .unwrap_or(0);
             let target_col = primary.min(target_len);
             let moving = line_char_offset(buffer, &ranges, target_line, target_col);
-            *doc_edit = true;
+            *view_mode = ViewMode::Source;
             *active_line = None;
             ui.ctx().data_mut(|d| {
                 d.insert_temp(egui::Id::new("live_select_range"), (anchor, moving));
@@ -1369,7 +1565,7 @@ pub fn show_live(
     }
 
     // ↑/↓ move the active raw line (commit edits via splice above first).
-    if !readonly && request_active.is_none() && !request_select_all && !in_table_cell {
+    if can_edit && request_active.is_none() && !request_select_all && !in_table_cell {
         let (up, down) = ui.input(|i| {
             let no_chord = !i.modifiers.command && !i.modifiers.alt && !i.modifiers.shift;
             (
@@ -1378,13 +1574,11 @@ pub fn show_live(
             )
         });
         if up || down {
-            let last = ranges.len().saturating_sub(1);
-            request_active = match (*active_line, up, down) {
-                (Some(i), true, _) if i > 0 => Some(i - 1),
-                (Some(i), _, true) if i < last => Some(i + 1),
-                (None, _, true) => Some(0),
-                (None, true, _) => Some(last),
-                _ => None,
+            request_active = match (*active_line, up) {
+                (Some(i), true) => fold::step_visible(&hidden, i, false).or(Some(i)),
+                (Some(i), false) => fold::step_visible(&hidden, i, true).or(Some(i)),
+                (None, false) => fold::first_visible(&hidden),
+                (None, true) => fold::last_visible(&hidden),
             };
         }
     }
@@ -1411,7 +1605,11 @@ pub fn show_live(
     }
 
     if let Some((n, start, end)) = erase_footnote {
+        let at = line_index_at(&ranges, start);
+        let breaks_before = buffer.matches('\n').count() as i32;
         let caret = footnote::erase(buffer, n, start, end);
+        let delta = buffer.matches('\n').count() as i32 - breaks_before;
+        fold::shift_lines(&mut folds, at, delta);
         let (line, col) = caret_line_col(buffer, caret);
         *active_line = Some(line);
         ui.ctx().data_mut(|d| {
@@ -1422,7 +1620,9 @@ pub fn show_live(
         result.changed = true;
     } else if let Some((start, end, left, right)) = split_at_cursor {
         let i = active_line.unwrap_or(0);
-        buffer.replace_range(start..end, &format!("{left}\n{right}"));
+        let new_text = format!("{left}\n{right}");
+        shift_folds_for_replace(&mut folds, &ranges, start, end, &new_text, buffer);
+        buffer.replace_range(start..end, &new_text);
         *active_line = Some(i + 1);
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new(("live_focus", i + 1)), true));
@@ -1433,9 +1633,11 @@ pub fn show_live(
         history.begin_burst(buffer);
         result.changed = true;
     } else if let Some((start, end, new_text)) = table_edit {
+        shift_folds_for_replace(&mut folds, &ranges, start, end, &new_text, buffer);
         buffer.replace_range(start..end, &new_text);
         result.changed = true;
     } else if let Some((start, end, new_text)) = splice {
+        shift_folds_for_replace(&mut folds, &ranges, start, end, &new_text, buffer);
         buffer.replace_range(start..end, &new_text);
         if structural_checkpoint {
             history.begin_burst(buffer);
@@ -1449,6 +1651,8 @@ pub fn show_live(
             if let Some(&(ps, pe)) = ranges.get(i - 1) {
                 if pe < buffer.len() && buffer.as_bytes()[pe] == b'\n' {
                     let join_at = buffer[ps..pe].chars().count();
+                    let at = line_index_at(&ranges, pe);
+                    fold::shift_lines(&mut folds, at + 1, fold::line_delta("\n", ""));
                     buffer.replace_range(pe..pe + 1, "");
                     *active_line = Some(i - 1);
                     ui.ctx().data_mut(|d| {
@@ -1462,12 +1666,13 @@ pub fn show_live(
     }
 
     if request_select_all {
-        *doc_edit = true;
+        *view_mode = ViewMode::Source;
         *active_line = None;
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new("live_select_all"), true));
     }
 
+    ui.ctx().data_mut(|d| d.insert_temp(fold_key, folds));
     result
 }
 
@@ -1476,20 +1681,22 @@ fn show_doc_edit(
     vault: &Vault,
     source_path: Option<&str>,
     buffer: &mut String,
-    doc_edit: &mut bool,
+    view_mode: &mut ViewMode,
     active_line: &mut Option<usize>,
     history: &mut NoteHistory,
     mut result: LiveResult,
 ) -> LiveResult {
     if ui.input(|i| i.key_pressed(Key::Escape)) {
         history.end_burst(buffer);
-        *doc_edit = false;
+        *view_mode = ViewMode::Live;
         *active_line = None;
         return result;
     }
 
     let id = egui::Id::new("live_doc_edit");
     let font = FontId::new(theme::EDITOR_SIZE, FontFamily::Monospace);
+    // Captured before TextEdit mutates the buffer.
+    let newlines_before = buffer.matches('\n').count();
 
     boost_note_scroll(ui);
 
@@ -1565,6 +1772,19 @@ fn show_doc_edit(
 
                 if response.changed() {
                     result.changed = true;
+                    // ponytail: this path has no edit span, so shift_lines cannot
+                    // run. A net newline change drops session folds. A paste that
+                    // keeps the same newline count can still leave them on the
+                    // wrong rows until retain_valid.
+                    let newlines_after = buffer.matches('\n').count();
+                    if newlines_before != newlines_after {
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(
+                                Id::new(("bluelink_folds", source_path.unwrap_or(""))),
+                                Vec::<usize>::new(),
+                            );
+                        });
+                    }
                 }
             });
         });
@@ -1578,8 +1798,6 @@ fn show_doc_edit(
                 Some(("**", "**"))
             } else if inp.key_pressed(Key::I) {
                 Some(("*", "*"))
-            } else if inp.key_pressed(Key::E) {
-                Some(("`", "`"))
             } else if inp.key_pressed(Key::K) {
                 Some(("[[", "]]"))
             } else {
@@ -1588,15 +1806,9 @@ fn show_doc_edit(
         });
         if let Some((before, after)) = wrap {
             history.checkpoint(buffer);
-            let caret = editor_menu::wrap_selection(
-                buffer,
-                caret_primary,
-                caret_secondary,
-                before,
-                after,
-            );
-            let mut state =
-                egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+            let caret =
+                editor_menu::wrap_selection(buffer, caret_primary, caret_secondary, before, after);
+            let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
             state
                 .cursor
                 .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
@@ -1617,6 +1829,9 @@ fn show_doc_edit(
             }
             EditorAction::Paste => {
                 if let Some(note) = source_path {
+                    let fold_key = Id::new(("bluelink_folds", source_path.unwrap_or("")));
+                    let mut folds: Vec<usize> =
+                        ui.ctx().data(|d| d.get_temp(fold_key)).unwrap_or_default();
                     if !try_insert_clipboard_image(
                         vault,
                         note,
@@ -1624,15 +1839,43 @@ fn show_doc_edit(
                         None,
                         history,
                         &mut result,
+                        &mut folds,
                     ) {
                         editor_menu::dispatch_clipboard(ui, &EditorAction::Paste);
                     }
+                    ui.ctx().data_mut(|d| d.insert_temp(fold_key, folds));
                 } else {
                     editor_menu::dispatch_clipboard(ui, &EditorAction::Paste);
                 }
             }
             EditorAction::Cut | EditorAction::Copy => {
                 editor_menu::dispatch_clipboard(ui, &action);
+            }
+            EditorAction::FoldMore
+            | EditorAction::FoldLess
+            | EditorAction::FoldAll
+            | EditorAction::UnfoldAll => {
+                let fold_key = Id::new(("bluelink_folds", source_path.unwrap_or("")));
+                let mut folds: Vec<usize> =
+                    ui.ctx().data(|d| d.get_temp(fold_key)).unwrap_or_default();
+                let (line, _) = caret_line_col(buffer, caret_primary);
+                if let Some(next) = apply_fold_action(buffer, &mut folds, line, &action) {
+                    history.checkpoint(buffer);
+                    *buffer = next;
+                    history.begin_burst(buffer);
+                    result.changed = true;
+                }
+                ui.ctx().data_mut(|d| d.insert_temp(fold_key, folds));
+            }
+            EditorAction::ToggleReading => {
+                history.end_burst(buffer);
+                *view_mode = view_mode.toggle_reading();
+                *active_line = None;
+            }
+            EditorAction::ToggleSource => {
+                history.end_burst(buffer);
+                *view_mode = view_mode.toggle_source();
+                *active_line = None;
             }
             ref text_action => {
                 history.checkpoint(buffer);
@@ -1642,8 +1885,8 @@ fn show_doc_edit(
                     menu.secondary,
                     text_action,
                 ) {
-                    let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id)
-                        .unwrap_or_default();
+                    let mut state =
+                        egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
                     state
                         .cursor
                         .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
@@ -1666,8 +1909,11 @@ fn handle_dropped_files(
     active_line: Option<usize>,
     history: &mut NoteHistory,
     result: &mut LiveResult,
+    folds: &mut Vec<usize>,
 ) {
-    let dropped = ui.ctx().input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+    let dropped = ui
+        .ctx()
+        .input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
     if dropped.is_empty() {
         return;
     }
@@ -1694,7 +1940,11 @@ fn handle_dropped_files(
                             history.checkpoint(buffer);
                             checked = true;
                         }
+                        let grew = embed_insert_line(buffer, active_line);
                         media::insert_embed(buffer, active_line, &rel);
+                        if let Some(i) = grew {
+                            fold::shift_lines(folds, i + 1, 1);
+                        }
                         embedded += 1;
                         result.changed = true;
                     }
@@ -1709,7 +1959,11 @@ fn handle_dropped_files(
                     history.checkpoint(buffer);
                     checked = true;
                 }
+                let grew = embed_insert_line(buffer, active_line);
                 media::insert_embed(buffer, active_line, &rel);
+                if let Some(i) = grew {
+                    fold::shift_lines(folds, i + 1, 1);
+                }
                 embedded += 1;
                 result.changed = true;
             }
@@ -1736,6 +1990,7 @@ fn handle_clipboard_image_paste(
     active_line: Option<usize>,
     history: &mut NoteHistory,
     result: &mut LiveResult,
+    folds: &mut Vec<usize>,
 ) {
     let wants_paste = ui.input(|i| {
         let key = i.modifiers.command && i.key_pressed(Key::V) && !i.modifiers.shift;
@@ -1745,13 +2000,20 @@ fn handle_clipboard_image_paste(
     if !wants_paste {
         return;
     }
-    if !try_insert_clipboard_image(vault, active_note, buffer, active_line, history, result) {
+    if !try_insert_clipboard_image(
+        vault,
+        active_note,
+        buffer,
+        active_line,
+        history,
+        result,
+        folds,
+    ) {
         return;
     }
     // Swallow text paste so TextEdit does not also insert clipboard text.
     ui.ctx().input_mut(|i| {
-        i.events
-            .retain(|e| !matches!(e, egui::Event::Paste(_)));
+        i.events.retain(|e| !matches!(e, egui::Event::Paste(_)));
         let _ = i.consume_key(egui::Modifiers::COMMAND, Key::V);
     });
 }
@@ -1763,6 +2025,7 @@ fn try_insert_clipboard_image(
     active_line: Option<usize>,
     history: &mut NoteHistory,
     result: &mut LiveResult,
+    folds: &mut Vec<usize>,
 ) -> bool {
     let Some(png) = media::clipboard_image_png() else {
         return false;
@@ -1771,7 +2034,11 @@ fn try_insert_clipboard_image(
     match media::save_bytes(vault, &stem, "png", &png, active_note) {
         Ok(rel) => {
             history.checkpoint(buffer);
+            let grew = embed_insert_line(buffer, active_line);
             media::insert_embed(buffer, active_line, &rel);
+            if let Some(i) = grew {
+                fold::shift_lines(folds, i + 1, 1);
+            }
             history.begin_burst(buffer);
             result.changed = true;
             result.status = Some(format!("pasted {rel}"));
@@ -1939,10 +2206,7 @@ fn unindent_line(s: &mut String, primary: usize, secondary: usize) -> (usize, us
         return (primary, secondary);
     };
     *s = s.chars().skip(n).collect();
-    (
-        primary.saturating_sub(n),
-        secondary.saturating_sub(n),
-    )
+    (primary.saturating_sub(n), secondary.saturating_sub(n))
 }
 
 /// Line and column for an absolute char caret. A caret past the last line
@@ -1954,7 +2218,10 @@ fn caret_line_col(buffer: &str, caret: usize) -> (usize, usize) {
     }
     let mut chars = 0usize;
     for (j, &(start, end)) in ranges.iter().enumerate() {
-        let line_chars = buffer.get(start..end).map(|t| t.chars().count()).unwrap_or(0);
+        let line_chars = buffer
+            .get(start..end)
+            .map(|t| t.chars().count())
+            .unwrap_or(0);
         let line_end = chars + line_chars;
         let last = j + 1 == ranges.len();
         if caret <= line_end || last {
@@ -2013,17 +2280,156 @@ fn line_ranges(s: &str) -> Vec<(usize, usize)> {
     out
 }
 
+/// Line whose content contains `byte`, or the line that ends at that newline.
+fn line_index_at(ranges: &[(usize, usize)], byte: usize) -> usize {
+    for (i, &(_, end)) in ranges.iter().enumerate() {
+        if byte <= end {
+            return i;
+        }
+    }
+    ranges.len().saturating_sub(1)
+}
+
+pub(crate) fn shift_folds_in_text(
+    folds: &mut Vec<usize>,
+    buffer: &str,
+    start: usize,
+    end: usize,
+    new_text: &str,
+) {
+    let ranges = line_ranges(buffer);
+    shift_folds_for_replace(folds, &ranges, start, end, new_text, buffer);
+}
+
+fn shift_folds_for_replace(
+    folds: &mut Vec<usize>,
+    ranges: &[(usize, usize)],
+    start: usize,
+    end: usize,
+    new_text: &str,
+    buffer: &str,
+) {
+    let old = buffer.get(start..end).unwrap_or("");
+    let at = line_index_at(ranges, start);
+    fold::shift_lines(folds, at + 1, fold::line_delta(old, new_text));
+}
+
+/// Line index when an embed will be inserted *after* a non-empty line.
+fn embed_insert_line(buffer: &str, active_line: Option<usize>) -> Option<usize> {
+    let i = active_line?;
+    let (start, end) = line_ranges(buffer).get(i).copied()?;
+    (start != end).then_some(i)
+}
+
+fn fold_chevron(ui: &Ui, id: Id, center: egui::Pos2, collapsed: bool) -> bool {
+    let rect = egui::Rect::from_center_size(center, egui::vec2(18.0, 18.0));
+    let response = ui.interact(rect, id, egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let icon = if collapsed {
+        egui_phosphor::regular::CARET_RIGHT
+    } else {
+        egui_phosphor::regular::CARET_DOWN
+    };
+    let color = if response.hovered() {
+        theme::TEXT
+    } else {
+        theme::WEAK
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        color,
+    );
+    response.clicked()
+}
+
+/// `Some(new buffer)` when the note text changed. Heading and indent folds
+/// update `folds` either way.
+fn apply_fold_action(
+    buffer: &str,
+    folds: &mut Vec<usize>,
+    line: usize,
+    action: &EditorAction,
+) -> Option<String> {
+    let lines: Vec<&str> = buffer.split('\n').collect();
+    let mut in_fence = vec![false; lines.len()];
+    let mut open = None;
+    for (i, line_text) in lines.iter().enumerate() {
+        let role = preview::advance_fence(line_text, &mut open);
+        in_fence[i] = !matches!(role, preview::FenceRole::Outside);
+    }
+    let regions = fold::regions(&lines, &in_fence);
+    fold::retain_valid(folds, &regions);
+    let callout = preview::callout_at(&lines, line)
+        .map(|(header, end)| (header, end, lines[header].to_string()));
+
+    match action {
+        EditorAction::FoldAll => {
+            *folds = regions.iter().map(|region| region.start).collect();
+            preview::set_all_callouts_collapsed(buffer, true)
+        }
+        EditorAction::UnfoldAll => {
+            folds.clear();
+            preview::set_all_callouts_collapsed(buffer, false)
+        }
+        EditorAction::FoldMore => {
+            if let Some((header, end, text)) = callout {
+                let has_body = end > header + 1;
+                if has_body && !preview::callout_collapsed(&text) {
+                    let next = preview::set_callout_collapsed(&text, true)?;
+                    return replace_line(buffer, header, &next);
+                }
+            }
+            fold::fold_more(&regions, folds, line);
+            None
+        }
+        EditorAction::FoldLess => {
+            if fold::fold_less(&regions, folds, line) {
+                return None;
+            }
+            let (header, _, text) = callout?;
+            if !preview::callout_collapsed(&text) {
+                return None;
+            }
+            let next = preview::set_callout_collapsed(&text, false)?;
+            replace_line(buffer, header, &next)
+        }
+        _ => None,
+    }
+}
+
+fn replace_line(buffer: &str, line: usize, next: &str) -> Option<String> {
+    let (start, end) = line_ranges(buffer).get(line).copied()?;
+    let mut out = buffer.to_string();
+    out.replace_range(start..end, next);
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         caret_line_col, estimate_row_height, gap_after_row, insert_isolated_block, line_below_last,
-        line_char_offset, line_ranges, note_scroll_boost,
-        open_wiki_query, row_at_local_y, row_prefix_heights, unindent_line, visible_row_range,
-        wiki_candidates,
+        line_char_offset, line_ranges, note_scroll_boost, open_wiki_query, row_at_local_y,
+        row_prefix_heights, unindent_line, visible_row_range, wiki_candidates, ViewMode,
         NOTE_TRACKPAD_BOOST, NOTE_WHEEL_BOOST, ROW_GAP, TOP_PAD,
     };
     use crate::math_block;
     use crate::preview::FenceRole;
+
+    #[test]
+    fn view_mode_toggles() {
+        assert_eq!(ViewMode::Live.toggle_reading(), ViewMode::Reading);
+        assert_eq!(ViewMode::Reading.toggle_reading(), ViewMode::Live);
+        assert_eq!(ViewMode::Source.toggle_reading(), ViewMode::Reading);
+
+        assert_eq!(ViewMode::Live.toggle_source(), ViewMode::Source);
+        assert_eq!(ViewMode::Source.toggle_source(), ViewMode::Live);
+        assert_eq!(ViewMode::Reading.toggle_source(), ViewMode::Source);
+    }
 
     #[test]
     fn note_scroll_boost_scales_discrete_notches() {
@@ -2043,7 +2449,7 @@ mod tests {
             FenceRole::Outside,
         ];
         let heights = [22.0_f32, 22.0, 22.0, 22.0, 22.0];
-        let prefix = row_prefix_heights(&heights, &roles);
+        let prefix = row_prefix_heights(&heights, &roles, &[]);
         assert_eq!(prefix.len(), 6);
         assert_eq!(prefix[0], TOP_PAD);
         // After normal: height + ROW_GAP
@@ -2063,7 +2469,7 @@ mod tests {
     fn click_y_selects_the_row_at_that_height() {
         let roles = [FenceRole::Outside, FenceRole::Outside];
         let heights = [22.0, 22.0];
-        let prefix = row_prefix_heights(&heights, &roles);
+        let prefix = row_prefix_heights(&heights, &roles, &[]);
         assert_eq!(row_at_local_y(&prefix, &heights, 0.0), Some(0));
         assert_eq!(row_at_local_y(&prefix, &heights, TOP_PAD + 10.0), Some(0));
         let gap_start = prefix[1] - ROW_GAP;
@@ -2076,7 +2482,7 @@ mod tests {
     fn visible_range_includes_forced_active_line() {
         let roles = [FenceRole::Outside; 10];
         let heights = [20.0_f32; 10];
-        let prefix = row_prefix_heights(&heights, &roles);
+        let prefix = row_prefix_heights(&heights, &roles, &[]);
         // Viewport far below content — without `force` the range would be empty at end.
         let (first, last) = visible_row_range(&prefix, 10_000.0, 10_100.0, Some(1));
         assert!(first <= 1, "active row must not be clipped away");
@@ -2113,7 +2519,8 @@ mod tests {
     #[test]
     fn math_block_caret_lands_on_the_blank_line() {
         let mut s = "hello".to_string();
-        let caret = insert_isolated_block(&mut s, 5, 5, math_block::SNIPPET, "$$\n".chars().count());
+        let caret =
+            insert_isolated_block(&mut s, 5, 5, math_block::SNIPPET, "$$\n".chars().count());
         assert_eq!(s, "hello\n$$\n\n$$");
         assert_eq!(caret_line_col(&s, caret), (2, 0));
     }
@@ -2146,10 +2553,7 @@ mod tests {
     #[test]
     fn wiki_query_detects_open_brackets() {
         let s = "see [[Hel";
-        assert_eq!(
-            open_wiki_query(s, s.len()),
-            Some((4, "Hel".into()))
-        );
+        assert_eq!(open_wiki_query(s, s.len()), Some((4, "Hel".into())));
         assert!(open_wiki_query("see [[Hel]] x", 13).is_none());
     }
 
@@ -2164,5 +2568,30 @@ mod tests {
         assert!(found.iter().any(|p| p == "hello.md"));
         assert!(found.iter().any(|p| p == "inbox/Hello.md"));
         assert!(!found.iter().any(|p| p == "Other.md"));
+    }
+
+    #[test]
+    fn replace_newline_shifts_the_fold_below_and_keeps_the_one_above() {
+        let buffer = "# A\nkeep\n# B\n";
+        let mut folds = vec![0, 2];
+        let start = buffer.find("keep").unwrap();
+        super::shift_folds_in_text(&mut folds, buffer, start, start + 4, "keep\nextra");
+        assert_eq!(folds, vec![0, 3]);
+    }
+
+    #[test]
+    fn fold_more_collapses_callout_before_the_heading() {
+        let buffer = "# H\n> [!note] T\n> body\n";
+        let mut folds = Vec::new();
+        let next = super::apply_fold_action(
+            buffer,
+            &mut folds,
+            2,
+            &crate::editor_menu::EditorAction::FoldMore,
+        );
+        assert!(folds.is_empty());
+        let next = next.expect("callout marker");
+        assert!(next.contains("> [!note]- T"));
+        assert!(next.starts_with("# H\n"));
     }
 }

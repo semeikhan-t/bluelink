@@ -20,6 +20,18 @@ pub enum EditorAction {
     AttachFile,
     /// `[^N]` at the caret and `[^N]: ` at the end of the note.
     Footnote,
+    /// Wrap / unwrap `%%…%%` on the selection or current line.
+    ToggleComments,
+    /// Collapse the innermost open fold at the caret (callout, then heading/indent).
+    FoldMore,
+    /// Open the innermost closed fold at the caret.
+    FoldLess,
+    FoldAll,
+    UnfoldAll,
+    /// Host toggles [`crate::editor::ViewMode::Reading`].
+    ToggleReading,
+    /// Host toggles [`crate::editor::ViewMode::Source`].
+    ToggleSource,
     Cut,
     Copy,
     Paste,
@@ -31,6 +43,8 @@ enum SubMenu {
     Format,
     Paragraph,
     Insert,
+    Fold,
+    View,
 }
 
 /// Where the popup was opened and how to apply the chosen action.
@@ -115,6 +129,12 @@ pub fn show_popup(ctx: &egui::Context) -> Option<(CtxMenu, EditorAction)> {
                 if row(ui, regular::LIST_PLUS, "Insert", true) {
                     menu.submenu = Some(SubMenu::Insert);
                 }
+                if row(ui, regular::CARET_DOWN, "Fold", true) {
+                    menu.submenu = Some(SubMenu::Fold);
+                }
+                if row(ui, regular::EYE, "View", true) {
+                    menu.submenu = Some(SubMenu::View);
+                }
 
                 ui.separator();
 
@@ -184,6 +204,9 @@ pub fn show_popup(ctx: &egui::Context) -> Option<(CtxMenu, EditorAction)> {
                                     after: "==",
                                 });
                             }
+                            if row(ui, regular::CHAT_CIRCLE, "Toggle comments", false) {
+                                action = Some(EditorAction::ToggleComments);
+                            }
                         }
                         SubMenu::Paragraph => {
                             if row(ui, regular::TEXT_T, "Plain text", false) {
@@ -234,10 +257,34 @@ pub fn show_popup(ctx: &egui::Context) -> Option<(CtxMenu, EditorAction)> {
                                 action = Some(EditorAction::InsertSnippet("```\n\n```"));
                             }
                             if row(ui, regular::MATH_OPERATIONS, "Math block", false) {
-                                action = Some(EditorAction::InsertSnippet(crate::math_block::SNIPPET));
+                                action =
+                                    Some(EditorAction::InsertSnippet(crate::math_block::SNIPPET));
                             }
                             if row(ui, regular::PAPERCLIP, "Attach file…", false) {
                                 action = Some(EditorAction::AttachFile);
+                            }
+                        }
+                        SubMenu::Fold => {
+                            if row(ui, regular::CARET_RIGHT, "Fold", false) {
+                                action = Some(EditorAction::FoldMore);
+                            }
+                            if row(ui, regular::CARET_DOWN, "Unfold", false) {
+                                action = Some(EditorAction::FoldLess);
+                            }
+                            ui.separator();
+                            if row(ui, regular::CARET_DOUBLE_UP, "Fold all", false) {
+                                action = Some(EditorAction::FoldAll);
+                            }
+                            if row(ui, regular::CARET_DOUBLE_DOWN, "Unfold all", false) {
+                                action = Some(EditorAction::UnfoldAll);
+                            }
+                        }
+                        SubMenu::View => {
+                            if row(ui, regular::BOOK_OPEN_TEXT, "Toggle reading view", false) {
+                                action = Some(EditorAction::ToggleReading);
+                            }
+                            if row(ui, regular::CODE, "Toggle source", false) {
+                                action = Some(EditorAction::ToggleSource);
                             }
                         }
                     }
@@ -319,6 +366,53 @@ pub fn wrap_selection(
     let replacement = format!("{before}{selected}{after}");
     text.replace_range(byte_lo..byte_hi, &replacement);
     lo + before.chars().count() + selected.chars().count()
+}
+
+/// If `s` is wrapped in outer `%%…%%`, return the inner body.
+fn strip_outer_comment(s: &str) -> Option<&str> {
+    if s.len() >= 4 && s.starts_with("%%") && s.ends_with("%%") {
+        Some(&s[2..s.len() - 2])
+    } else {
+        None
+    }
+}
+
+/// Toggle `%%…%%` on the selection, or on the caret's line when the selection is empty.
+pub fn toggle_comments(text: &mut String, primary: usize, secondary: usize) -> usize {
+    let lo = primary.min(secondary);
+    let hi = primary.max(secondary);
+    if lo != hi {
+        let byte_lo = char_to_byte(text, lo);
+        let byte_hi = char_to_byte(text, hi);
+        let selected = text[byte_lo..byte_hi].to_string();
+        if let Some(inner) = strip_outer_comment(&selected) {
+            text.replace_range(byte_lo..byte_hi, inner);
+            lo + inner.chars().count()
+        } else {
+            let replacement = format!("%%{selected}%%");
+            text.replace_range(byte_lo..byte_hi, &replacement);
+            lo + "%%".chars().count() + selected.chars().count()
+        }
+    } else {
+        let byte = char_to_byte(text, primary);
+        let line_start = text[..byte].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let line_end = text[byte..]
+            .find('\n')
+            .map(|i| byte + i)
+            .unwrap_or(text.len());
+        let line = text[line_start..line_end].to_string();
+        let trimmed = line.trim();
+        let lead = line.len() - line.trim_start().len();
+        let trail = line.len() - line.trim_end().len();
+        let new_line = if let Some(inner) = strip_outer_comment(trimmed) {
+            format!("{}{}{}", &line[..lead], inner, &line[line.len() - trail..])
+        } else {
+            format!("%%{line}%%")
+        };
+        text.replace_range(line_start..line_end, &new_line);
+        let start_chars = text[..line_start].chars().count();
+        start_chars + new_line.chars().count()
+    }
 }
 
 pub fn strip_line_prefix(line: &str) -> String {
@@ -476,16 +570,21 @@ pub fn apply_text_action(
         EditorAction::Wrap { before, after } => {
             Some(wrap_selection(text, primary, secondary, before, after))
         }
+        EditorAction::ToggleComments => Some(toggle_comments(text, primary, secondary)),
         EditorAction::SetLinePrefix(prefix) => Some(set_prefix_at_char(text, primary, prefix)),
-        EditorAction::InsertSnippet(snippet) => {
-            Some(insert_at(text, primary, secondary, snippet))
-        }
+        EditorAction::InsertSnippet(snippet) => Some(insert_at(text, primary, secondary, snippet)),
         EditorAction::Footnote => Some(insert_footnote(text, primary, secondary)),
         EditorAction::Cut
         | EditorAction::Copy
         | EditorAction::Paste
         | EditorAction::SelectAll
-        | EditorAction::AttachFile => None,
+        | EditorAction::AttachFile
+        | EditorAction::FoldMore
+        | EditorAction::FoldLess
+        | EditorAction::FoldAll
+        | EditorAction::UnfoldAll
+        | EditorAction::ToggleReading
+        | EditorAction::ToggleSource => None,
     }
 }
 
@@ -507,6 +606,29 @@ mod tests {
         let caret = wrap_selection(&mut s, 1, 1, "`", "`");
         assert_eq!(s, "a``b");
         assert_eq!(caret, 2);
+    }
+
+    #[test]
+    fn toggle_comments_wraps_and_unwraps_selection() {
+        let mut s = "hello world".to_string();
+        let caret = toggle_comments(&mut s, 0, 5);
+        assert_eq!(s, "%%hello%% world");
+        assert_eq!(caret, 7);
+        let caret = toggle_comments(&mut s, 0, 9);
+        assert_eq!(s, "hello world");
+        assert_eq!(caret, 5);
+    }
+
+    #[test]
+    fn toggle_comments_wraps_and_unwraps_line() {
+        let mut s = "a\nsecret\nc".to_string();
+        // caret on "secret"
+        let caret = toggle_comments(&mut s, 3, 3);
+        assert_eq!(s, "a\n%%secret%%\nc");
+        assert_eq!(&s[char_to_byte(&s, caret)..], "\nc");
+        let caret = toggle_comments(&mut s, 5, 5);
+        assert_eq!(s, "a\nsecret\nc");
+        assert_eq!(&s[char_to_byte(&s, caret)..], "\nc");
     }
 
     #[test]

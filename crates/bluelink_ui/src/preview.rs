@@ -1,9 +1,7 @@
 use bluelink_core::{parse_preview, split_wikilinks, PreviewBlock, PreviewDoc, Span, Vault};
-use egui::{
-    Color32, CornerRadius, CursorIcon, FontFamily, FontId, OpenUrl, RichText, Sense, Ui,
-};
-use egui_phosphor::regular;
 use egui::text::{LayoutJob, TextFormat};
+use egui::{Color32, CornerRadius, CursorIcon, FontFamily, FontId, OpenUrl, RichText, Sense, Ui};
+use egui_phosphor::regular;
 
 use crate::math_block;
 use crate::media;
@@ -148,8 +146,13 @@ pub fn toggle_checklist_line(line: &str) -> Option<String> {
 pub enum CalloutPlace {
     None,
     /// First line; `end` exclusive.
-    Head { end: usize },
-    Tail { start: usize, end: usize },
+    Head {
+        end: usize,
+    },
+    Tail {
+        start: usize,
+        end: usize,
+    },
 }
 
 pub fn callout_places(lines: &[String]) -> Vec<CalloutPlace> {
@@ -188,6 +191,139 @@ pub fn callout_type(line: &str) -> Option<&str> {
         return None;
     }
     Some(ty)
+}
+
+/// `true` when the callout header ends the type with `-` (`> [!note]-`).
+pub fn callout_collapsed(line: &str) -> bool {
+    marker_after_type(line) == Some('-')
+}
+
+/// Rewrite the `+`/`-` fold marker. `None` when the line is already in that state
+/// or is not a callout. Collapsing inserts `-` when the marker is absent.
+/// Expanding turns `-` into `+` and leaves an unmarked callout alone.
+pub fn set_callout_collapsed(line: &str, collapsed: bool) -> Option<String> {
+    let bracket = type_bracket(line)?;
+    let want = if collapsed { '-' } else { '+' };
+    let next = line[bracket + 1..].chars().next();
+    match next {
+        Some(marker) if marker == want && (marker == '-' || marker == '+') => None,
+        Some('-') | Some('+') => {
+            let mut rewritten = line.to_string();
+            let replacement = if collapsed { "-" } else { "+" };
+            rewritten.replace_range(bracket + 1..bracket + 2, replacement);
+            Some(rewritten)
+        }
+        _ if collapsed => {
+            let mut rewritten = line.to_string();
+            rewritten.insert(bracket + 1, '-');
+            Some(rewritten)
+        }
+        _ => None,
+    }
+}
+
+/// Apply [`set_callout_collapsed`] to every callout header. `None` if nothing changed.
+/// Lines inside a code fence are left alone.
+pub fn set_all_callouts_collapsed(text: &str, collapsed: bool) -> Option<String> {
+    let mut changed = false;
+    let mut out = String::with_capacity(text.len());
+    let mut fence = None;
+    for piece in text.split_inclusive('\n') {
+        let (line, newline) = match piece.strip_suffix('\n') {
+            Some(body) => (body, true),
+            None => (piece, false),
+        };
+        let in_fence = !matches!(advance_fence(line, &mut fence), FenceRole::Outside);
+        if !in_fence {
+            if let Some(next) = set_callout_collapsed(line, collapsed) {
+                changed = true;
+                out.push_str(&next);
+                if newline {
+                    out.push('\n');
+                }
+                continue;
+            }
+        }
+        out.push_str(line);
+        if newline {
+            out.push('\n');
+        }
+    }
+    changed.then_some(out)
+}
+
+/// `(header, end)` of the callout that contains `line`, header included.
+/// A callout-shaped line inside a code fence is not a callout.
+pub fn callout_at(lines: &[&str], line: usize) -> Option<(usize, usize)> {
+    let mut i = 0;
+    let mut fence = None;
+    while i < lines.len() {
+        let in_fence = !matches!(advance_fence(lines[i], &mut fence), FenceRole::Outside);
+        if !in_fence && callout_type(lines[i]).is_some() {
+            let mut end = i + 1;
+            while end < lines.len() && lines[end].trim_start().starts_with('>') {
+                let _ = advance_fence(lines[end], &mut fence);
+                end += 1;
+            }
+            if (i..end).contains(&line) {
+                return Some((i, end));
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Body lines of callouts whose header marker is `-`.
+/// Fence lines are never hidden by this.
+pub fn collapsed_callout_tails(lines: &[&str]) -> Vec<bool> {
+    let mut hidden = vec![false; lines.len()];
+    let mut i = 0;
+    let mut fence = None;
+    while i < lines.len() {
+        let in_fence = !matches!(advance_fence(lines[i], &mut fence), FenceRole::Outside);
+        if !in_fence && callout_collapsed(lines[i]) {
+            let mut end = i + 1;
+            while end < lines.len() && lines[end].trim_start().starts_with('>') {
+                let _ = advance_fence(lines[end], &mut fence);
+                hidden[end] = true;
+                end += 1;
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    hidden
+}
+
+/// Expand a collapsed callout when `line` is in its body. Header clicks stay collapsed.
+pub fn expand_collapsed_callout_at(text: &str, line: usize) -> Option<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let (header, _) = callout_at(&lines, line)?;
+    if header == line || !callout_collapsed(lines[header]) {
+        return None;
+    }
+    let next = set_callout_collapsed(lines[header], false)?;
+    let mut owned: Vec<String> = lines.into_iter().map(str::to_string).collect();
+    owned[header] = next;
+    Some(owned.join("\n"))
+}
+
+fn type_bracket(line: &str) -> Option<usize> {
+    if callout_type(line).is_none() {
+        return None;
+    }
+    let bang = line.find("[!")?;
+    let close = line[bang + 2..].find(']')?;
+    Some(bang + 2 + close)
+}
+
+fn marker_after_type(line: &str) -> Option<char> {
+    let bracket = type_bracket(line)?;
+    line[bracket + 1..].chars().next()
 }
 
 fn is_quote_line(line: &str) -> bool {
@@ -299,16 +435,17 @@ pub fn render_line_with_preview(
     role: FenceRole,
     lang: Option<&str>,
     preview: Option<&PreviewDoc>,
+    // Live: true (muted glyphs). Reading mode (stage 3) can pass false to hide.
+    show_comments: bool,
 ) -> LineClick {
     if !matches!(role, FenceRole::Outside) {
         return render_fence_stripe(ui, line, role, lang);
     }
     if let Some((mark, body)) = parse_checklist(line) {
-        return render_checklist(ui, vault, source_path, mark, body);
+        return render_checklist(ui, vault, source_path, mark, body, show_comments);
     }
     if line.is_empty() {
-        let resp =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), Sense::click());
+        let resp = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), Sense::click());
         return if resp.1.clicked() {
             LineClick::Edit
         } else {
@@ -325,21 +462,13 @@ pub fn render_line_with_preview(
     };
     let mut click = LineClick::None;
     for block in &doc.blocks {
-        let c = render_block_compact(ui, vault, source_path, block);
+        let c = render_block_compact(ui, vault, source_path, block, show_comments);
         click = merge_click(click, c);
     }
     if doc.blocks.is_empty() {
         click = merge_click(
             click,
-            render_text_with_wikis(
-                ui,
-                vault,
-                source_path,
-                line,
-                theme::EDITOR_SIZE,
-                false,
-                0,
-            ),
+            render_text_with_wikis(ui, vault, source_path, line, theme::EDITOR_SIZE, false, 0),
         );
     }
     click
@@ -351,6 +480,7 @@ fn render_checklist(
     source_path: Option<&str>,
     mark: CheckMark,
     body: &str,
+    show_comments: bool,
 ) -> LineClick {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
@@ -403,17 +533,18 @@ fn render_checklist(
                 })
                 .unwrap_or(&[]);
             if spans.is_empty() {
-                render_text_with_wikis(
+                render_text_with_wikis(ui, vault, source_path, body, theme::EDITOR_SIZE, false, 0)
+            } else {
+                render_spans(
                     ui,
                     vault,
                     source_path,
-                    body,
+                    spans,
                     theme::EDITOR_SIZE,
                     false,
                     0,
+                    show_comments,
                 )
-            } else {
-                render_spans(ui, vault, source_path, spans, theme::EDITOR_SIZE, false, 0)
             }
         };
         merge_click(click, body_click)
@@ -572,13 +703,29 @@ fn keywords_for(lang: Option<&str>) -> &'static [&'static str] {
             "typeof", "of", "in",
         ],
         Some("python" | "py") => &[
-            "def", "class", "return", "if", "elif", "else", "for", "while", "import", "from",
-            "as", "True", "False", "None", "with", "try", "except", "async", "await", "yield",
-            "lambda", "pass",
+            "def", "class", "return", "if", "elif", "else", "for", "while", "import", "from", "as",
+            "True", "False", "None", "with", "try", "except", "async", "await", "yield", "lambda",
+            "pass",
         ],
         Some("go") => &[
-            "func", "return", "if", "else", "for", "range", "package", "import", "var", "const",
-            "type", "struct", "interface", "go", "defer", "true", "false", "nil",
+            "func",
+            "return",
+            "if",
+            "else",
+            "for",
+            "range",
+            "package",
+            "import",
+            "var",
+            "const",
+            "type",
+            "struct",
+            "interface",
+            "go",
+            "defer",
+            "true",
+            "false",
+            "nil",
         ],
         // mermaid / unknown: no keyword paint
         _ => &[],
@@ -606,6 +753,7 @@ fn render_block_compact(
     vault: &Vault,
     source_path: Option<&str>,
     block: &PreviewBlock,
+    show_comments: bool,
 ) -> LineClick {
     match block {
         PreviewBlock::Heading { level, text } => render_text_with_wikis(
@@ -621,7 +769,16 @@ fn render_block_compact(
             let mut click = LineClick::None;
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                click = render_spans(ui, vault, source_path, spans, theme::EDITOR_SIZE, false, 0);
+                click = render_spans(
+                    ui,
+                    vault,
+                    source_path,
+                    spans,
+                    theme::EDITOR_SIZE,
+                    false,
+                    0,
+                    show_comments,
+                );
             });
             click
         }
@@ -629,7 +786,16 @@ fn render_block_compact(
             let mut click = LineClick::None;
             ui.horizontal_wrapped(|ui| {
                 ui.label("•");
-                click = render_spans(ui, vault, source_path, spans, theme::EDITOR_SIZE, false, 0);
+                click = render_spans(
+                    ui,
+                    vault,
+                    source_path,
+                    spans,
+                    theme::EDITOR_SIZE,
+                    false,
+                    0,
+                    show_comments,
+                );
             });
             click
         }
@@ -637,7 +803,16 @@ fn render_block_compact(
             let mut click = LineClick::None;
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("{number}."));
-                click = render_spans(ui, vault, source_path, spans, theme::EDITOR_SIZE, false, 0);
+                click = render_spans(
+                    ui,
+                    vault,
+                    source_path,
+                    spans,
+                    theme::EDITOR_SIZE,
+                    false,
+                    0,
+                    show_comments,
+                );
             });
             click
         }
@@ -649,8 +824,16 @@ fn render_block_compact(
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        click =
-                            render_spans(ui, vault, source_path, spans, theme::EDITOR_SIZE, false, 0);
+                        click = render_spans(
+                            ui,
+                            vault,
+                            source_path,
+                            spans,
+                            theme::EDITOR_SIZE,
+                            false,
+                            0,
+                            show_comments,
+                        );
                     });
                 });
             click
@@ -694,10 +877,8 @@ fn render_block_compact(
         }
         PreviewBlock::ThematicBreak => {
             // ui.separator() uses STROKE on the near-black canvas and disappears.
-            let (rect, resp) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), 16.0),
-                Sense::click(),
-            );
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 16.0), Sense::click());
             ui.painter().hline(
                 rect.x_range(),
                 rect.center().y,
@@ -727,7 +908,7 @@ fn render_text_with_wikis(
         for span in split_wikilinks(text) {
             click = merge_click(
                 click,
-                render_one_span(ui, vault, source_path, &span, size, heading, level),
+                render_one_span(ui, vault, source_path, &span, size, heading, level, true),
             );
         }
         click
@@ -743,12 +924,22 @@ fn render_spans(
     size: f32,
     heading: bool,
     level: u8,
+    show_comments: bool,
 ) -> LineClick {
     let mut click = LineClick::None;
     for span in spans {
         click = merge_click(
             click,
-            render_one_span(ui, vault, source_path, span, size, heading, level),
+            render_one_span(
+                ui,
+                vault,
+                source_path,
+                span,
+                size,
+                heading,
+                level,
+                show_comments,
+            ),
         );
     }
     click
@@ -762,9 +953,26 @@ fn render_one_span(
     size: f32,
     heading: bool,
     level: u8,
+    show_comments: bool,
 ) -> LineClick {
     match span {
         Span::Text(t) => render_text_chunks(ui, t, size, heading, level),
+        Span::Comment(body) => {
+            if !show_comments {
+                return LineClick::None;
+            }
+            // Paint delimiters so inactive-line width matches the buffer.
+            let shown = format!("%%{body}%%");
+            let resp = ui.add(
+                egui::Label::new(RichText::new(shown).size(size).color(theme::WEAK))
+                    .sense(Sense::click()),
+            );
+            if resp.clicked() {
+                LineClick::Edit
+            } else {
+                LineClick::None
+            }
+        }
         Span::Strong(t) => {
             let resp = ui.add(
                 egui::Label::new(RichText::new(t).size(size).strong().color(theme::TEXT))
@@ -973,13 +1181,7 @@ fn embed_draw_width(ui: &Ui, width: Option<u32>) -> f32 {
 }
 
 /// Split plain text on `#tags` (Obsidian-style: `#` + non-space run).
-fn render_text_chunks(
-    ui: &mut Ui,
-    text: &str,
-    size: f32,
-    heading: bool,
-    level: u8,
-) -> LineClick {
+fn render_text_chunks(ui: &mut Ui, text: &str, size: f32, heading: bool, level: u8) -> LineClick {
     let mut click = LineClick::None;
     let mut rest = text;
     while !rest.is_empty() {
@@ -1027,13 +1229,7 @@ fn render_text_chunks(
     click
 }
 
-fn paint_plain_text(
-    ui: &mut Ui,
-    text: &str,
-    size: f32,
-    heading: bool,
-    level: u8,
-) -> LineClick {
+fn paint_plain_text(ui: &mut Ui, text: &str, size: f32, heading: bool, level: u8) -> LineClick {
     if text.is_empty() {
         return LineClick::None;
     }
@@ -1051,12 +1247,7 @@ fn paint_plain_text(
 }
 
 /// `![[Note]]` card: title + first few lines. Click opens the note.
-fn render_note_embed(
-    ui: &mut Ui,
-    vault: &Vault,
-    path: &str,
-    alias: Option<&str>,
-) -> LineClick {
+fn render_note_embed(ui: &mut Ui, vault: &Vault, path: &str, alias: Option<&str>) -> LineClick {
     let content = vault.read(path).unwrap_or_default();
     let title = alias
         .map(str::to_string)
@@ -1092,11 +1283,7 @@ fn render_note_embed(
                 .clicked();
             for line in preview_lines {
                 let resp = ui.add(
-                    egui::Label::new(
-                        RichText::new(line)
-                            .size(13.0)
-                            .color(theme::WEAK),
-                    )
+                    egui::Label::new(RichText::new(line).size(13.0).color(theme::WEAK))
                     .sense(Sense::click()),
                 );
                 open |= resp.clicked();
@@ -1112,25 +1299,35 @@ fn render_note_embed(
     }
 }
 
-/// Paint a callout card for lines `[start, end)`. Returns clicked source line.
-pub fn paint_callout(
-    ui: &mut Ui,
-    lines: &[String],
-    start: usize,
-    end: usize,
-) -> Option<usize> {
-    let first = lines.get(start)?;
+/// Click on a callout card: edit a source line, or toggle the `+`/`-` marker.
+pub struct CalloutClick {
+    pub edit: Option<usize>,
+    pub toggle_fold: bool,
+}
+
+/// Paint a callout card for lines `[start, end)`. A `-` marker hides the body.
+pub fn paint_callout(ui: &mut Ui, lines: &[String], start: usize, end: usize) -> CalloutClick {
+    let Some(first) = lines.get(start) else {
+        return CalloutClick {
+            edit: None,
+            toggle_fold: false,
+        };
+    };
+    let collapsed = callout_collapsed(first);
     let ty = callout_type(first).unwrap_or("note");
     let title = {
         let t = first.trim_start();
         let after_gt = t.strip_prefix('>').map(str::trim_start).unwrap_or(t);
-        after_gt
-            .find(']')
-            .map(|i| after_gt[i + 1..].trim())
-            .unwrap_or("")
-            .to_string()
+        let rest = after_gt.find(']').map(|i| &after_gt[i + 1..]).unwrap_or("");
+        let rest = if rest.starts_with('+') || rest.starts_with('-') {
+            &rest[1..]
+        } else {
+            rest
+        };
+        rest.trim().to_string()
     };
-    let mut clicked_line = None;
+    let mut edit = None;
+    let mut toggle_fold = false;
     egui::Frame::NONE
         .fill(ui.visuals().faint_bg_color)
         .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT))
@@ -1139,6 +1336,22 @@ pub fn paint_callout(
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
+                ui.spacing_mut().interact_size.y = 18.0;
+                let icon = if collapsed {
+                    regular::CARET_RIGHT
+                } else {
+                    regular::CARET_DOWN
+                };
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(icon).size(14.0).color(theme::WEAK))
+                            .frame(false),
+                    )
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    toggle_fold = true;
+                }
                 ui.label(
                     RichText::new(ty.to_ascii_uppercase())
                         .size(12.0)
@@ -1156,10 +1369,11 @@ pub fn paint_callout(
                         .sense(Sense::click()),
                     );
                     if resp.clicked() {
-                        clicked_line = Some(start);
+                        edit = Some(start);
                     }
                 }
             });
+            if !collapsed {
             for (k, line) in lines.iter().enumerate().take(end).skip(start + 1) {
                 let body = line
                     .trim_start()
@@ -1168,25 +1382,27 @@ pub fn paint_callout(
                     .unwrap_or(line.as_str());
                 let shown = if body.is_empty() { " " } else { body };
                 let resp = ui.add(
-                    egui::Label::new(RichText::new(shown).size(theme::EDITOR_SIZE).color(theme::TEXT))
+                        egui::Label::new(
+                            RichText::new(shown)
+                                .size(theme::EDITOR_SIZE)
+                                .color(theme::TEXT),
+                        )
                         .sense(Sense::click()),
                 );
                 if resp.clicked() {
-                    clicked_line = Some(k);
+                        edit = Some(k);
+                    }
                 }
             }
-            // Click on empty title area still opens the header line.
             if title.is_empty() {
-                let resp = ui.allocate_response(
-                    egui::vec2(ui.available_width(), 4.0),
-                    Sense::click(),
-                );
+                let resp =
+                    ui.allocate_response(egui::vec2(ui.available_width(), 4.0), Sense::click());
                 if resp.clicked() {
-                    clicked_line = Some(start);
+                    edit = Some(start);
                 }
             }
         });
-    clicked_line
+    CalloutClick { edit, toggle_fold }
 }
 
 /// Embed / local image: capped async texture (not egui file:// decode), other media as open-externally.
@@ -1201,7 +1417,9 @@ fn render_media_embed(
     let display = alias.unwrap_or(target);
     // Cache resolve across frames — avoid even `is_file` / dir walks while scrolling.
     let resolve_id = egui::Id::new(("bl_media_resolve", target));
-    let abs = ui.ctx().data(|d| d.get_temp::<Option<std::path::PathBuf>>(resolve_id));
+    let abs = ui
+        .ctx()
+        .data(|d| d.get_temp::<Option<std::path::PathBuf>>(resolve_id));
     let abs = match abs {
         Some(cached) => cached,
         None => {
@@ -1259,7 +1477,10 @@ fn render_media_embed(
             }
             None => {
                 // Decode in flight or failed — keep layout stable while loading.
-                let ph_h = height.map(|h| h as f32).unwrap_or(draw_w * 0.55).clamp(40.0, 320.0);
+                let ph_h = height
+                    .map(|h| h as f32)
+                    .unwrap_or(draw_w * 0.55)
+                    .clamp(40.0, 320.0);
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(draw_w, ph_h), Sense::hover());
                 ui.painter()
                     .rect_filled(rect, theme::round_sm(), theme::CODE_BG);
@@ -1286,11 +1507,9 @@ fn render_media_embed(
     } else {
         let kind = media_placeholder_kind(&ext);
         let box_w = draw_w.min(avail);
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(box_w, 40.0),
-            Sense::click(),
-        );
-        ui.painter().rect_filled(rect, theme::round_sm(), theme::CODE_BG);
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(box_w, 40.0), Sense::click());
+        ui.painter()
+            .rect_filled(rect, theme::round_sm(), theme::CODE_BG);
         ui.painter().text(
             rect.left_center() + egui::vec2(10.0, 0.0),
             egui::Align2::LEFT_CENTER,
@@ -1387,8 +1606,7 @@ fn paint_resize_handle(
     );
     let dragging = ui.ctx().data(|d| d.get_temp::<f32>(drag_id)).is_some();
     let hover = ui.input(|i| i.pointer.hover_pos());
-    let show = dragging
-        || hover.is_some_and(|p| media_rect.contains(p) || handle_rect.contains(p));
+    let show = dragging || hover.is_some_and(|p| media_rect.contains(p) || handle_rect.contains(p));
     if !show {
         return None;
     }
@@ -1496,6 +1714,35 @@ mod fence_tests {
         assert_eq!(places[4], CalloutPlace::None);
         assert_eq!(callout_type("> [!warning]"), Some("warning"));
         assert_eq!(callout_type("> plain"), None);
+    }
+
+    #[test]
+    fn callout_fold_marker_round_trip() {
+        assert!(!callout_collapsed("> [!note] Title"));
+        assert!(callout_collapsed("> [!note]- Title"));
+        assert_eq!(
+            set_callout_collapsed("> [!note] Title", true).as_deref(),
+            Some("> [!note]- Title")
+        );
+        assert_eq!(
+            set_callout_collapsed("> [!note]- Title", false).as_deref(),
+            Some("> [!note]+ Title")
+        );
+        assert!(set_callout_collapsed("> [!note]+ Title", false).is_none());
+        let text = "> [!faq]- Q\n> A\n\n> [!note] open\n";
+        let folded = set_all_callouts_collapsed(text, false).unwrap();
+        assert!(folded.contains("> [!faq]+ Q"));
+        assert!(folded.contains("> [!note] open"));
+        let src = "> [!note]- T\n> body\nafter";
+        assert!(expand_collapsed_callout_at(src, 1).unwrap().contains("+ T"));
+        assert!(expand_collapsed_callout_at(src, 0).is_none());
+        let fenced = "```\n> [!note] inside\n```\n> [!note] out\n";
+        let folded = set_all_callouts_collapsed(fenced, true).unwrap();
+        assert!(folded.contains("```\n> [!note] inside\n```"));
+        assert!(folded.contains("> [!note]- out"));
+        let fenced_lines: Vec<&str> = fenced.split('\n').collect();
+        assert!(callout_at(&fenced_lines, 1).is_none());
+        assert_eq!(callout_at(&fenced_lines, 3), Some((3, 4)));
     }
 
     #[test]
