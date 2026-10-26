@@ -1,5 +1,114 @@
 use std::collections::{HashMap, HashSet};
 
+/// Display form for a renamed note's wiki target (no `#` / `|`).
+///
+/// Obsidian `MetadataCache.fileToLinktext` (shortest): unique basename, else
+/// vault-relative path; both without `.md`.
+pub fn preferred_wikilink_text(target_rel_path: &str, notes_after: &HashSet<String>) -> String {
+    let path = normalize_path_separators(target_rel_path);
+    let without_md = strip_md_suffix(&path);
+    let base = file_stem(&path);
+    let lookup = format!("{base}.md");
+    let unique = notes_after
+        .iter()
+        .filter(|n| file_name(n).eq_ignore_ascii_case(&lookup))
+        .count()
+        == 1;
+    if unique {
+        base.to_string()
+    } else {
+        without_md
+    }
+}
+
+/// Rebuild a wikilink body with a new path display, keeping `#heading` and `|alias`.
+pub fn rewrite_wikilink_body(old_body: &str, new_target_display: &str) -> String {
+    let (before_alias, alias) = match old_body.split_once('|') {
+        Some((path_heading, alias)) => (path_heading, Some(alias)),
+        None => (old_body, None),
+    };
+    let heading = before_alias.find('#').map(|i| &before_alias[i..]);
+    let mut out = new_target_display.to_string();
+    if let Some(h) = heading {
+        out.push_str(h);
+    }
+    if let Some(a) = alias {
+        out.push('|');
+        out.push_str(a);
+    }
+    out
+}
+
+/// Rewrite `[[wikilinks]]` (and embeds `![[...]]`) whose resolve target is in `renames`.
+///
+/// `renames`: old rel_path → new rel_path. `notes_after` is the note set after those renames
+/// (used for unique-basename vs path display). Resolution uses the pre-rename `index`.
+pub fn rewrite_wikilinks_in_content(
+    content: &str,
+    source_path: &str,
+    index: &WikiIndex,
+    renames: &HashMap<String, String>,
+    notes_after: &HashSet<String>,
+) -> String {
+    if renames.is_empty() {
+        return content.to_string();
+    }
+
+    let bytes = content.as_bytes();
+    let mut out = String::with_capacity(content.len());
+    let mut i = 0;
+    let mut last = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            let start = i + 2;
+            let mut j = start;
+            while j + 1 < bytes.len() {
+                if bytes[j] == b']' && bytes[j + 1] == b']' {
+                    out.push_str(&content[last..i]);
+                    let body = &content[start..j];
+                    let trimmed = body.trim();
+                    let replacement = if !trimmed.is_empty() {
+                        index
+                            .resolve(trimmed, Some(source_path))
+                            .and_then(|resolved| renames.get(&resolved).cloned())
+                            .map(|new_path| {
+                                let display = preferred_wikilink_text(&new_path, notes_after);
+                                rewrite_wikilink_body(trimmed, &display)
+                            })
+                    } else {
+                        None
+                    };
+                    out.push_str("[[");
+                    match replacement {
+                        Some(new_body) => out.push_str(&new_body),
+                        None => out.push_str(body),
+                    }
+                    out.push_str("]]");
+                    i = j + 2;
+                    last = i;
+                    break;
+                }
+                j += 1;
+            }
+            if j + 1 >= bytes.len() {
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&content[last..]);
+    out
+}
+
+/// Note paths after applying `old → new` renames (for display-form uniqueness).
+pub fn notes_after_renames(notes: &[String], renames: &HashMap<String, String>) -> HashSet<String> {
+    notes
+        .iter()
+        .map(|p| renames.get(p).cloned().unwrap_or_else(|| p.clone()))
+        .collect()
+}
+
 /// 1-hop neighborhood around a note for the local graph view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalGraph {
@@ -288,6 +397,18 @@ fn normalize_path_separators(s: &str) -> String {
 
 fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+fn strip_md_suffix(path: &str) -> String {
+    match path.strip_suffix(".md") {
+        Some(rest) => rest.to_string(),
+        None => path.to_string(),
+    }
+}
+
+fn file_stem(path: &str) -> &str {
+    let name = file_name(path);
+    name.strip_suffix(".md").unwrap_or(name)
 }
 
 fn parent_dir(path: &str) -> String {
@@ -621,5 +742,74 @@ mod tests {
             create_path_for_link("/Abs", Some("proj/a.md")),
             "Abs.md"
         );
+    }
+
+    #[test]
+    fn preferred_text_unique_basename_vs_path() {
+        let unique: HashSet<String> = ["deep/x/Note.md".into()].into_iter().collect();
+        assert_eq!(preferred_wikilink_text("deep/x/Note.md", &unique), "Note");
+
+        let clash: HashSet<String> = ["a/Note.md".into(), "b/Note.md".into()].into_iter().collect();
+        assert_eq!(preferred_wikilink_text("a/Note.md", &clash), "a/Note");
+        assert_eq!(preferred_wikilink_text("b/Note.md", &clash), "b/Note");
+    }
+
+    #[test]
+    fn rewrite_body_keeps_heading_and_alias() {
+        assert_eq!(rewrite_wikilink_body("Old#H|a", "New"), "New#H|a");
+        assert_eq!(rewrite_wikilink_body("folder/Old|алиас", "New"), "New|алиас");
+        assert_eq!(rewrite_wikilink_body("Old#H", "path/New"), "path/New#H");
+        assert_eq!(rewrite_wikilink_body("Old", "New"), "New");
+    }
+
+    #[test]
+    fn rewrite_content_relative_and_embed() {
+        let mut i = WikiIndex::new();
+        i.set_note("proj/b.md", "");
+        i.set_note("proj/sub/src.md", "");
+
+        let renames: HashMap<String, String> =
+            [("proj/b.md".into(), "proj/renamed.md".into())].into_iter().collect();
+        let notes_after = notes_after_renames(
+            &["proj/b.md".into(), "proj/sub/src.md".into()],
+            &renames,
+        );
+        let out = rewrite_wikilinks_in_content(
+            "see [[../b]] and ![[../b#h|x]] and [[missing]]",
+            "proj/sub/src.md",
+            &i,
+            &renames,
+            &notes_after,
+        );
+        assert_eq!(out, "see [[renamed]] and ![[renamed#h|x]] and [[missing]]");
+    }
+
+    #[test]
+    fn rewrite_content_basename_clash_uses_path() {
+        let mut i = WikiIndex::new();
+        i.set_note("a/Note.md", "");
+        i.set_note("b/Note.md", "");
+        i.set_note("index.md", "[[a/Note#H|alias]] [[b/Note]]");
+
+        let renames: HashMap<String, String> =
+            [("a/Note.md".into(), "a/Renamed.md".into())].into_iter().collect();
+        let notes_after = notes_after_renames(
+            &["a/Note.md".into(), "b/Note.md".into(), "index.md".into()],
+            &renames,
+        );
+        // After rename: a/Renamed.md + b/Note.md — Renamed is unique, Note clash remains for b.
+        assert_eq!(
+            preferred_wikilink_text("a/Renamed.md", &notes_after),
+            "Renamed"
+        );
+
+        let out = rewrite_wikilinks_in_content(
+            "[[a/Note#H|alias]] [[b/Note]]",
+            "index.md",
+            &i,
+            &renames,
+            &notes_after,
+        );
+        assert_eq!(out, "[[Renamed#H|alias]] [[b/Note]]");
     }
 }

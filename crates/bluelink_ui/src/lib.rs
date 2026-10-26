@@ -5,10 +5,17 @@ mod editor_menu;
 mod local_graph;
 mod preview;
 mod quick_switcher;
+mod sync_panels;
 mod tabs;
 mod theme;
 mod tree;
 mod vault_registry;
+
+pub mod sync_ui;
+pub use sync_ui::{
+    SyncStatus, SyncUiCommand, SyncUiEvent, SyncUiHandle, TrustedDevice, PAIRING_ATTEMPTS,
+    PAIRING_TTL_MS,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +35,8 @@ enum Dialog {
     NewFolder { name: String },
     NewVault { name: String },
     CreateLink { rel_path: String, new_tab: bool },
+    /// Dirty buffer vs newer on-disk content — Reload discards, Keep keeps local.
+    ExternalEdit { path: String, disk_sha: String },
 }
 
 /// One undoable vault change (delete for now).
@@ -119,12 +128,20 @@ pub struct App {
     selected_sha: Option<String>,
     /// Ignore notify reloads until this instant (our own saves).
     suppress_reload_until: Option<Instant>,
+    /// Disk SHA the user already chose Keep for — skip re-prompt until it changes.
+    acked_external_sha: Option<String>,
     registry: VaultRegistry,
     undo_stack: Vec<UndoItem>,
     quick_switcher: Option<QuickSwitcher>,
     /// Recently opened note paths (most recent first), capped for quick switcher.
     recent: Vec<String>,
     local_graph: local_graph::LocalGraphUi,
+    /// Desktop sync bridge (Devices / Sync panels — Agent D). `None` without BLE runtime.
+    sync_ui: Option<SyncUiHandle>,
+    /// Notes / Devices / Sync screen (ТЗ table).
+    screen: sync_panels::Screen,
+    /// Mirrored sync runtime state (drained from `sync_ui` each frame).
+    sync_panel: sync_panels::SyncPanelState,
 }
 
 impl App {
@@ -133,6 +150,7 @@ impl App {
         vault_path: Option<PathBuf>,
         reload_flag: Arc<AtomicBool>,
         pick_folder: Option<FolderPicker>,
+        sync_ui: Option<SyncUiHandle>,
     ) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
@@ -160,11 +178,15 @@ impl App {
             pick_folder,
             selected_sha: None,
             suppress_reload_until: None,
+            acked_external_sha: None,
             registry,
             undo_stack: Vec::new(),
             quick_switcher: None,
             recent: Vec::new(),
             local_graph: local_graph::LocalGraphUi::default(),
+            sync_ui,
+            screen: sync_panels::Screen::Notes,
+            sync_panel: sync_panels::SyncPanelState::default(),
         };
 
         // --vault wins; otherwise reopen last known vault.
@@ -179,6 +201,21 @@ impl App {
 
     pub fn reload_flag(&self) -> Arc<AtomicBool> {
         self.reload_flag.clone()
+    }
+
+    pub fn sync_ui(&self) -> Option<&SyncUiHandle> {
+        self.sync_ui.as_ref()
+    }
+
+    /// Drain runtime → UI events (must stay off BLE/tokio; channel only).
+    fn drain_sync_events(&mut self) {
+        let Some(handle) = self.sync_ui.as_ref() else {
+            return;
+        };
+        let events = handle.drain_events();
+        for event in events {
+            self.sync_panel.apply_event(event);
+        }
     }
 
     pub fn vault_root(&self) -> Option<&Path> {
@@ -345,6 +382,7 @@ impl App {
             Ok(meta) => {
                 self.dirty = false;
                 self.selected_sha = Some(meta.sha256.clone());
+                self.acked_external_sha = None;
                 self.status.clear();
                 if let Some(n) = self.notes.iter_mut().find(|n| n.rel_path == rel) {
                     *n = meta;
@@ -522,6 +560,7 @@ impl App {
                 self.active_line = None;
                 self.doc_edit = false;
                 self.selected = Some(rel_path.to_string());
+                self.acked_external_sha = None;
                 self.selected_sha = self
                     .notes
                     .iter()
@@ -538,6 +577,7 @@ impl App {
                 self.active_line = None;
                 self.doc_edit = false;
                 self.selected = Some(rel_path.to_string());
+                self.acked_external_sha = None;
                 self.selected_sha = None;
                 self.status = "note is not UTF-8 (read-only)".into();
                 true
@@ -1381,11 +1421,8 @@ impl App {
         {
             return;
         }
-        // Always refresh the tree; only reload buffer when not dirty.
+        // Always refresh the tree; buffer reload depends on dirty state.
         self.refresh_notes();
-        if self.dirty {
-            return;
-        }
         let Some(rel) = self.selected.clone() else {
             return;
         };
@@ -1394,17 +1431,55 @@ impl App {
             .iter()
             .find(|n| n.rel_path == rel)
             .map(|n| n.sha256.clone());
+
+        if self.dirty {
+            match new_sha {
+                None => {
+                    self.status = "note removed on disk (unsaved edits kept)".into();
+                }
+                Some(disk_sha)
+                    if should_prompt_external_conflict(
+                        self.selected_sha.as_deref(),
+                        Some(disk_sha.as_str()),
+                        self.acked_external_sha.as_deref(),
+                    ) =>
+                {
+                    // Don't clobber an unrelated dialog; surface a status hint instead.
+                    let can_prompt = matches!(
+                        &self.dialog,
+                        None | Some(Dialog::ExternalEdit { .. })
+                    );
+                    if can_prompt {
+                        self.dialog = Some(Dialog::ExternalEdit {
+                            path: rel,
+                            disk_sha,
+                        });
+                    } else {
+                        self.status = "note changed on disk (unsaved edits kept)".into();
+                    }
+                }
+                Some(_) => {}
+            }
+            return;
+        }
+
         if new_sha.is_none() {
             // File vanished externally.
             self.selected = None;
             self.buffer.clear();
             self.selected_sha = None;
+            self.acked_external_sha = None;
             self.status = "note removed on disk".into();
             return;
         }
         if new_sha == self.selected_sha {
             return;
         }
+        self.reload_selected_buffer(rel, new_sha);
+    }
+
+    /// Discard buffer and load `rel` from disk (clean external reload or Reload choice).
+    fn reload_selected_buffer(&mut self, rel: String, new_sha: Option<String>) {
         let Some(vault) = &self.vault else {
             return;
         };
@@ -1412,7 +1487,10 @@ impl App {
             Ok(text) => {
                 self.buffer = text;
                 self.readonly = false;
+                self.dirty = false;
+                self.last_edit = None;
                 self.selected_sha = new_sha;
+                self.acked_external_sha = None;
                 self.active_line = None;
                 self.doc_edit = false;
                 self.status = format!("reloaded from disk {}", hhmm_now());
@@ -1420,7 +1498,10 @@ impl App {
             Err(VaultError::NotUtf8) => {
                 self.buffer.clear();
                 self.readonly = true;
+                self.dirty = false;
+                self.last_edit = None;
                 self.selected_sha = new_sha;
+                self.acked_external_sha = None;
                 self.active_line = None;
                 self.doc_edit = false;
                 self.status = "note is not UTF-8 (read-only)".into();
@@ -1538,6 +1619,8 @@ impl App {
 
         let mut confirm_vault: Option<String> = None;
         let mut confirm_folder: Option<String> = None;
+        let mut confirm_reload: Option<(String, String)> = None;
+        let mut confirm_keep: Option<String> = None;
 
         match &mut self.dialog {
             Some(Dialog::NewNote { name }) => {
@@ -1613,6 +1696,28 @@ impl App {
                         });
                     });
             }
+            Some(Dialog::ExternalEdit { path, disk_sha }) => {
+                let path = path.clone();
+                let disk_sha = disk_sha.clone();
+                egui::Window::new("Note changed on disk")
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.label(format!(
+                            "`{path}` was edited outside BlueLink. Reload discards your unsaved edits; Keep keeps them."
+                        ));
+                        ui.horizontal(|ui| {
+                            if ui.button("Reload").clicked() {
+                                confirm_reload = Some((path.clone(), disk_sha.clone()));
+                                close = true;
+                            }
+                            if ui.button("Keep").clicked() {
+                                confirm_keep = Some(disk_sha.clone());
+                                close = true;
+                            }
+                        });
+                    });
+            }
             None => {}
         }
 
@@ -1643,11 +1748,22 @@ impl App {
             let rel = name.trim().trim_matches('/').to_string();
             self.create_folder(&rel);
         }
+        if let Some((path, disk_sha)) = confirm_reload {
+            // Only reload if this note is still selected (user may have switched tabs).
+            if self.selected.as_deref() == Some(path.as_str()) {
+                self.reload_selected_buffer(path, Some(disk_sha));
+            }
+        }
+        if let Some(disk_sha) = confirm_keep {
+            self.acked_external_sha = Some(disk_sha);
+            self.status = format!("kept local edits {}", hhmm_now());
+        }
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_sync_events();
         self.apply_external_reload();
 
         if self.vault.is_none() {
@@ -1710,24 +1826,25 @@ impl eframe::App for App {
         if next_tab {
             self.cycle_next_tab();
         }
-        if quick_switch {
+        let on_notes = self.screen == sync_panels::Screen::Notes;
+        if quick_switch && on_notes {
             self.open_quick_switcher();
         }
-        if toggle_graph {
+        if toggle_graph && on_notes {
             self.toggle_local_graph();
         }
-        if delete_note && !self.is_graph_active() {
+        if delete_note && on_notes && !self.is_graph_active() {
             if let Some(path) = self.selected.clone() {
                 self.delete_path(&path);
             }
         }
-        if undo {
+        if undo && on_notes {
             self.undo();
         }
-        if nav_back {
+        if nav_back && on_notes {
             self.go_back();
         }
-        if nav_fwd {
+        if nav_fwd && on_notes {
             self.go_forward();
         }
 
@@ -1813,67 +1930,86 @@ impl eframe::App for App {
                         }
                     });
 
-                ui.label(
-                    egui::RichText::new("NOTES")
-                        .size(12.0)
-                        .family(theme::display_family())
-                        .color(theme::WEAK),
-                );
                 ui.add_space(8.0);
-                self.sync_live_title();
-                let can_undo = !self.undo_stack.is_empty();
-                let tree_sel = if self.is_graph_active() {
-                    self.graph_center().map(str::to_string)
+                sync_panels::show_screen_nav(ui, &mut self.screen);
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                if self.screen == sync_panels::Screen::Notes {
+                    ui.label(
+                        egui::RichText::new("NOTES")
+                            .size(12.0)
+                            .family(theme::display_family())
+                            .color(theme::WEAK),
+                    );
+                    ui.add_space(8.0);
+                    self.sync_live_title();
+                    let can_undo = !self.undo_stack.is_empty();
+                    let tree_sel = if self.is_graph_active() {
+                        self.graph_center().map(str::to_string)
+                    } else {
+                        self.selected.clone()
+                    };
+                    let action = tree::show_tree(
+                        ui,
+                        &self.notes,
+                        &self.folders,
+                        tree_sel.as_deref(),
+                        &mut self.renaming,
+                        can_undo,
+                    );
+                    if let Some(path) = action.select {
+                        self.select_note(&path);
+                    }
+                    if let Some(path) = action.open_in_new_tab {
+                        self.open_note_in_new_tab(&path);
+                    }
+                    if action.new_note {
+                        self.dialog = Some(Dialog::NewNote {
+                            name: "untitled".into(),
+                        });
+                    }
+                    if action.new_folder {
+                        self.dialog = Some(Dialog::NewFolder {
+                            name: "inbox".into(),
+                        });
+                    }
+                    if let Some(path) = action.start_rename {
+                        let is_folder = self.folders.iter().any(|f| f == &path);
+                        self.renaming = Some(tree::InlineRename {
+                            draft: tree::rename_draft(&path, is_folder),
+                            from: path,
+                            request_focus: true,
+                        });
+                    }
+                    if action.cancel_rename {
+                        self.renaming = None;
+                    }
+                    if let Some((from, to)) = action.commit_rename {
+                        self.renaming = None;
+                        self.rename_path(&from, &to);
+                    }
+                    if let Some(path) = action.delete {
+                        self.delete_path(&path);
+                    }
+                    if action.undo {
+                        self.undo();
+                    }
+                    if let Some((from, to)) = action.move_note {
+                        self.move_note(&from, &to);
+                    }
                 } else {
-                    self.selected.clone()
-                };
-                let action = tree::show_tree(
-                    ui,
-                    &self.notes,
-                    &self.folders,
-                    tree_sel.as_deref(),
-                    &mut self.renaming,
-                    can_undo,
-                );
-                if let Some(path) = action.select {
-                    self.select_note(&path);
-                }
-                if let Some(path) = action.open_in_new_tab {
-                    self.open_note_in_new_tab(&path);
-                }
-                if action.new_note {
-                    self.dialog = Some(Dialog::NewNote {
-                        name: "untitled".into(),
-                    });
-                }
-                if action.new_folder {
-                    self.dialog = Some(Dialog::NewFolder {
-                        name: "inbox".into(),
-                    });
-                }
-                if let Some(path) = action.start_rename {
-                    let is_folder = self.folders.iter().any(|f| f == &path);
-                    self.renaming = Some(tree::InlineRename {
-                        draft: tree::rename_draft(&path, is_folder),
-                        from: path,
-                        request_focus: true,
-                    });
-                }
-                if action.cancel_rename {
-                    self.renaming = None;
-                }
-                if let Some((from, to)) = action.commit_rename {
-                    self.renaming = None;
-                    self.rename_path(&from, &to);
-                }
-                if let Some(path) = action.delete {
-                    self.delete_path(&path);
-                }
-                if action.undo {
-                    self.undo();
-                }
-                if let Some((from, to)) = action.move_note {
-                    self.move_note(&from, &to);
+                    let hint = match self.screen {
+                        sync_panels::Screen::Devices => "Trusted devices and pairing",
+                        sync_panels::Screen::Sync => "Status and sync log",
+                        sync_panels::Screen::Notes => "",
+                    };
+                    ui.label(
+                        egui::RichText::new(hint)
+                            .size(13.0)
+                            .color(theme::WEAK),
+                    );
                 }
                 });
             });
@@ -1895,11 +2031,16 @@ impl eframe::App for App {
             }
         }
 
+        let notes_screen = self.screen == sync_panels::Screen::Notes;
         let mut open_backlink: Option<String> = None;
-        let backlink_target = if self.is_graph_active() {
-            self.graph_center().map(str::to_string)
+        let backlink_target = if notes_screen {
+            if self.is_graph_active() {
+                self.graph_center().map(str::to_string)
+            } else {
+                self.selected.clone()
+            }
         } else {
-            self.selected.clone()
+            None
         };
         let backlinks: Vec<(String, Option<String>)> =
             match (backlink_target.as_deref(), self.vault.as_ref()) {
@@ -1923,7 +2064,7 @@ impl eframe::App for App {
         egui::SidePanel::right("backlinks")
             .default_width(240.0)
             .min_width(180.0)
-            .show_animated(ctx, !backlinks.is_empty(), |ui| {
+            .show_animated(ctx, notes_screen && !backlinks.is_empty(), |ui| {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new("Backlinks")
@@ -1976,6 +2117,28 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            match self.screen {
+                sync_panels::Screen::Devices => {
+                    ui.add_space(8.0);
+                    let handle = self.sync_ui.as_ref();
+                    sync_panels::show_devices(
+                        ui,
+                        ctx,
+                        &mut self.sync_panel,
+                        handle,
+                        hhmm_from_unix_ms,
+                    );
+                    return;
+                }
+                sync_panels::Screen::Sync => {
+                    ui.add_space(8.0);
+                    let handle = self.sync_ui.as_ref();
+                    sync_panels::show_sync(ui, &mut self.sync_panel, handle, hhmm_from_unix_ms);
+                    return;
+                }
+                sync_panels::Screen::Notes => {}
+            }
+
             let mut tab_select: Option<usize> = None;
             let mut tab_close: Option<usize> = None;
 
@@ -2084,7 +2247,9 @@ impl eframe::App for App {
             }
         });
 
-        self.show_quick_switcher(ctx);
+        if notes_screen {
+            self.show_quick_switcher(ctx);
+        }
     }
 }
 
@@ -2216,4 +2381,68 @@ fn hhmm_from_unix_ms(ms: u64) -> String {
 fn hhmm_now() -> String {
     use chrono::Local;
     Local::now().format("%H:%M").to_string()
+}
+
+/// Dirty buffer vs on-disk SHA: prompt when disk differs from last load/save and Keep ack.
+fn should_prompt_external_conflict(
+    selected_sha: Option<&str>,
+    disk_sha: Option<&str>,
+    acked_external_sha: Option<&str>,
+) -> bool {
+    let Some(disk) = disk_sha else {
+        return false;
+    };
+    if Some(disk) == selected_sha {
+        return false;
+    }
+    if Some(disk) == acked_external_sha {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod external_conflict_tests {
+    use super::should_prompt_external_conflict;
+
+    #[test]
+    fn no_prompt_when_disk_matches_baseline() {
+        assert!(!should_prompt_external_conflict(
+            Some("aaa"),
+            Some("aaa"),
+            None
+        ));
+    }
+
+    #[test]
+    fn prompt_when_disk_differs() {
+        assert!(should_prompt_external_conflict(
+            Some("aaa"),
+            Some("bbb"),
+            None
+        ));
+    }
+
+    #[test]
+    fn no_prompt_after_keep_ack() {
+        assert!(!should_prompt_external_conflict(
+            Some("aaa"),
+            Some("bbb"),
+            Some("bbb")
+        ));
+    }
+
+    #[test]
+    fn prompt_again_when_disk_changes_after_keep() {
+        assert!(should_prompt_external_conflict(
+            Some("aaa"),
+            Some("ccc"),
+            Some("bbb")
+        ));
+    }
+
+    #[test]
+    fn no_prompt_when_file_vanished() {
+        assert!(!should_prompt_external_conflict(Some("aaa"), None, None));
+    }
 }

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -8,7 +9,9 @@ use sha2::{Digest, Sha256};
 use crate::error::VaultError;
 use crate::meta::{self, DeviceMeta};
 use crate::path::{self, MAX_NOTE_BYTES};
-use crate::wiki::WikiIndex;
+use crate::wiki::{
+    notes_after_renames, rewrite_wikilinks_in_content, WikiIndex,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteMeta {
@@ -191,8 +194,12 @@ impl Vault {
             )));
         }
 
+        let renames = HashMap::from([(from.to_string(), to.to_string())]);
+        let pending = self.collect_wikilink_rewrites(&renames)?;
+
         fs::rename(&abs_from, &abs_to).map_err(VaultError::from_io)?;
         self.index.rename_note(from, to);
+        self.apply_wikilink_rewrites(&renames, pending)?;
         note_meta_for(&abs_to, to)
     }
 
@@ -220,15 +227,75 @@ impl Vault {
         if let Some(parent) = abs_to.parent() {
             fs::create_dir_all(parent).map_err(VaultError::from_io)?;
         }
-        fs::rename(&abs_from, &abs_to).map_err(VaultError::from_io)?;
 
         let prefix = format!("{from}/");
         let notes = self.list()?;
-        for note in notes {
+        let mut renames = HashMap::new();
+        for note in &notes {
             if let Some(rest) = note.rel_path.strip_prefix(&prefix) {
-                self.index
-                    .rename_note(&note.rel_path, &format!("{to}/{rest}"));
+                renames.insert(note.rel_path.clone(), format!("{to}/{rest}"));
             }
+        }
+        let pending = self.collect_wikilink_rewrites(&renames)?;
+
+        fs::rename(&abs_from, &abs_to).map_err(VaultError::from_io)?;
+        for (old, new) in &renames {
+            self.index.rename_note(old, new);
+        }
+        self.apply_wikilink_rewrites(&renames, pending)?;
+        Ok(())
+    }
+
+    /// Notes that link to any `renames` key, with bodies rewritten for the post-rename set.
+    /// Paths are still pre-rename; call after index/fs rename with [`Self::apply_wikilink_rewrites`].
+    fn collect_wikilink_rewrites(
+        &self,
+        renames: &HashMap<String, String>,
+    ) -> Result<Vec<(String, String)>, VaultError> {
+        if renames.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut sources = HashSet::new();
+        for old in renames.keys() {
+            for src in self.index.backlinks(old) {
+                sources.insert(src);
+            }
+        }
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let note_paths = self.index.note_paths();
+        let notes_after = notes_after_renames(&note_paths, renames);
+
+        let mut pending = Vec::new();
+        for src in sources {
+            let content = match self.read(&src) {
+                Ok(c) => c,
+                Err(VaultError::NotUtf8) => continue,
+                Err(e) => return Err(e),
+            };
+            let rewritten =
+                rewrite_wikilinks_in_content(&content, &src, &self.index, renames, &notes_after);
+            if rewritten != content {
+                pending.push((src, rewritten));
+            }
+        }
+        Ok(pending)
+    }
+
+    fn apply_wikilink_rewrites(
+        &mut self,
+        renames: &HashMap<String, String>,
+        pending: Vec<(String, String)>,
+    ) -> Result<(), VaultError> {
+        for (old_src, content) in pending {
+            let dest = renames
+                .get(&old_src)
+                .map(String::as_str)
+                .unwrap_or(&old_src);
+            self.write_inner(dest, &content, true)?;
         }
         Ok(())
     }

@@ -642,6 +642,7 @@ name = "bluelink_ui"
 version = "0.1.0"
 dependencies = [
  "bluelink_core",
+ "bluelink_sync",
  "chrono",
  "eframe",
  "egui",
@@ -1123,12 +1124,15 @@ dependencies = [
 name = "desktop"
 version = "0.1.0"
 dependencies = [
+ "bluelink_ble",
  "bluelink_core",
+ "bluelink_sync",
  "bluelink_ui",
  "eframe",
  "egui",
  "notify",
  "rfd",
+ "tokio",
 ]
 
 [[package]]

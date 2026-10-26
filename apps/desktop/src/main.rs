@@ -1,14 +1,21 @@
+mod sync_runtime;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use bluelink_ui::App;
+use bluelink_ui::{sync_ui, App};
 use eframe::egui;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use sync_runtime::SyncRuntime;
 
 fn main() -> eframe::Result<()> {
     let vault_arg = parse_vault_arg(std::env::args().skip(1));
     let reload_flag = Arc::new(AtomicBool::new(false));
+
+    let (sync_handle, sync_io) = sync_ui::channel();
+    let sync_runtime = SyncRuntime::start(sync_io);
+    let sync_wake = sync_handle.wake_flag();
 
     let reload_for_ui = reload_flag.clone();
     let vault_for_ui = vault_arg.clone();
@@ -28,15 +35,28 @@ fn main() -> eframe::Result<()> {
                     .set_title("Open BlueLink vault")
                     .pick_folder()
             });
-            let app = App::new(cc, vault_for_ui.clone(), reload_for_ui, Some(pick));
+            let app = App::new(
+                cc,
+                vault_for_ui.clone(),
+                reload_for_ui,
+                Some(pick),
+                Some(sync_handle),
+            );
             let mut desktop = DesktopApp {
                 inner: app,
                 watcher: None,
                 reload_flag,
+                sync_wake,
+                sync_runtime,
                 watching: None,
             };
             if let Some(path) = vault_for_ui {
                 desktop.attach_watcher(&path);
+                desktop.sync_runtime.set_vault(Some(path));
+            } else if let Some(root) = desktop.inner.vault_root() {
+                let root = root.to_path_buf();
+                desktop.attach_watcher(&root);
+                desktop.sync_runtime.set_vault(Some(root));
             }
             Ok(Box::new(desktop) as Box<dyn eframe::App>)
         }),
@@ -47,6 +67,8 @@ struct DesktopApp {
     inner: App,
     watcher: Option<RecommendedWatcher>,
     reload_flag: Arc<AtomicBool>,
+    sync_wake: Arc<AtomicBool>,
+    sync_runtime: SyncRuntime,
     watching: Option<PathBuf>,
 }
 
@@ -63,11 +85,13 @@ impl eframe::App for DesktopApp {
                 .unwrap_or(true);
             if needs {
                 self.attach_watcher(&root);
+                self.sync_runtime.set_vault(Some(root));
             }
         }
 
-        if self.reload_flag.load(Ordering::Relaxed) {
-            // Coalesce notify bursts — don't spin the event loop at max rate.
+        let sync_woke = self.sync_wake.swap(false, Ordering::SeqCst);
+        if self.reload_flag.load(Ordering::Relaxed) || sync_woke {
+            // Coalesce notify / sync-event bursts — don't spin the event loop at max rate.
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         self.inner.update(ctx, frame);

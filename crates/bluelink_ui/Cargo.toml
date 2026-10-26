@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 bluelink_core = { workspace = true }
+bluelink_sync = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 egui-phosphor = { workspace = true }

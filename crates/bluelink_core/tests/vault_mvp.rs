@@ -170,3 +170,70 @@ fn rename_and_delete_folder() {
     assert!(vault.read("archive/a.md").is_err());
     assert!(!dir.path().join("archive").exists());
 }
+
+#[test]
+fn rename_rewrites_wikilinks_unique_basename() {
+    let dir = tempdir().unwrap();
+    let mut vault = Vault::open(dir.path()).unwrap();
+    vault.write("Old.md", "target").unwrap();
+    vault
+        .write("index.md", "see [[Old#H|алиас]] and ![[Old]]\n")
+        .unwrap();
+
+    vault.rename("Old.md", "New.md").unwrap();
+    assert_eq!(
+        vault.read("index.md").unwrap(),
+        "see [[New#H|алиас]] and ![[New]]\n"
+    );
+    assert_eq!(
+        vault.index().backlinks("New.md"),
+        vec!["index.md".to_string()]
+    );
+}
+
+#[test]
+fn rename_rewrites_wikilinks_basename_clash_uses_path() {
+    let dir = tempdir().unwrap();
+    let mut vault = Vault::open(dir.path()).unwrap();
+    vault.write("a/Note.md", "a").unwrap();
+    vault.write("b/Note.md", "b").unwrap();
+    vault
+        .write("index.md", "[[a/Note]] keeps [[b/Note]]\n")
+        .unwrap();
+
+    // Rename into another clash: both stay as Note basename → path form.
+    vault.rename("a/Note.md", "c/Note.md").unwrap();
+    assert_eq!(
+        vault.read("index.md").unwrap(),
+        "[[c/Note]] keeps [[b/Note]]\n"
+    );
+}
+
+#[test]
+fn rename_rewrites_relative_wikilink() {
+    let dir = tempdir().unwrap();
+    let mut vault = Vault::open(dir.path()).unwrap();
+    vault.write("proj/b.md", "b").unwrap();
+    vault
+        .write("proj/sub/src.md", "go [[../b]]\n")
+        .unwrap();
+
+    vault.rename("proj/b.md", "proj/renamed.md").unwrap();
+    assert_eq!(vault.read("proj/sub/src.md").unwrap(), "go [[renamed]]\n");
+}
+
+#[test]
+fn rename_folder_rewrites_wikilinks_batch() {
+    let dir = tempdir().unwrap();
+    let mut vault = Vault::open(dir.path()).unwrap();
+    vault.write("inbox/a.md", "a").unwrap();
+    vault.write("inbox/b.md", "see [[a]]\n").unwrap();
+    vault.write("root.md", "see [[inbox/a|x]] and [[inbox/b#h]]\n").unwrap();
+
+    vault.rename_folder("inbox", "archive").unwrap();
+    assert_eq!(vault.read("archive/b.md").unwrap(), "see [[a]]\n");
+    assert_eq!(
+        vault.read("root.md").unwrap(),
+        "see [[a|x]] and [[b#h]]\n"
+    );
+}

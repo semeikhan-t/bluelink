@@ -8,10 +8,17 @@ license.workspace = true
 name = "bluelink"
 path = "src/main.rs"
 
+[features]
+default = ["bluez"]
+bluez = ["bluelink_ble/bluez"]
+
 [dependencies]
 bluelink_core = { workspace = true }
 bluelink_ui = { workspace = true }
+bluelink_sync = { workspace = true }
+bluelink_ble = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 rfd = { workspace = true }
 notify = { workspace = true }
+tokio = { workspace = true }

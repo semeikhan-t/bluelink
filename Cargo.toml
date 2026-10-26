@@ -17,6 +17,7 @@ license = "MIT"
 bluelink_core = { path = "crates/bluelink_core" }
 bluelink_ui = { path = "crates/bluelink_ui" }
 bluelink_sync = { path = "crates/bluelink_sync" }
+bluelink_ble = { path = "crates/bluelink_ble" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
