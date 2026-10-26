@@ -107,6 +107,9 @@ impl SyncUiHandle {
     }
 }
 
+/// Cap so a tight sync-runtime error loop cannot grow unbounded and starve the UI.
+const EVENT_QUEUE_CAP: usize = 64;
+
 /// Runtime half — owned by `apps/desktop` SyncRuntime only.
 pub struct SyncRuntimeIo {
     pub cmd_rx: Receiver<SyncUiCommand>,
@@ -116,10 +119,11 @@ pub struct SyncRuntimeIo {
 
 impl SyncRuntimeIo {
     pub fn emit(&self, event: SyncUiEvent) {
-        self.events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(event);
+        let mut q = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        if q.len() >= EVENT_QUEUE_CAP {
+            q.pop_front();
+        }
+        q.push_back(event);
         self.wake.store(true, Ordering::SeqCst);
     }
 }

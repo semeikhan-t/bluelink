@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bluer::adv::Advertisement;
@@ -23,6 +24,9 @@ use crate::fragment::{encode, FragmentDecoder, FragmentError};
 use crate::info::{InfoValue, PROTOCOL_VERSION};
 use crate::uuids;
 
+/// Bound D-Bus/BlueZ setup so a stuck bluetoothd cannot hang the sync runtime forever.
+const START_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn map_frag(err: FragmentError) -> TransportError {
     match err {
         FragmentError::TooLarge => TransportError::TooLarge,
@@ -40,10 +44,19 @@ pub struct BluezPeripheral {
     outbound: mpsc::Sender<Vec<u8>>,
     pairing_open: Arc<AtomicBool>,
     mtu: Arc<AtomicUsize>,
-    _worker: JoinHandle<()>,
+    /// Cleared when the GATT link worker exits (transport becomes Closed).
+    link_alive: Arc<AtomicBool>,
+    worker: JoinHandle<()>,
     /// Keep advertising and GATT application alive.
     _adv: bluer::adv::AdvertisementHandle,
     _app: bluer::gatt::local::ApplicationHandle,
+}
+
+impl Drop for BluezPeripheral {
+    fn drop(&mut self) {
+        self.link_alive.store(false, Ordering::SeqCst);
+        self.worker.abort();
+    }
 }
 
 pub struct BluezPeripheralConfig {
@@ -62,6 +75,13 @@ impl Default for BluezPeripheralConfig {
 
 impl BluezPeripheral {
     pub async fn start(config: BluezPeripheralConfig) -> Result<Self, TransportError> {
+        match tokio::time::timeout(START_TIMEOUT, Self::start_inner(config)).await {
+            Ok(r) => r,
+            Err(_) => Err(TransportError::Timeout),
+        }
+    }
+
+    async fn start_inner(config: BluezPeripheralConfig) -> Result<Self, TransportError> {
         let session = bluer::Session::new()
             .await
             .map_err(|e| TransportError::Io(e.to_string()))?;
@@ -150,6 +170,7 @@ impl BluezPeripheral {
         let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(16);
         let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(16);
         let mtu = Arc::new(AtomicUsize::new(23));
+        let link_alive = Arc::new(AtomicBool::new(true));
 
         let worker = tokio::spawn(link_worker(
             rx_control,
@@ -157,6 +178,7 @@ impl BluezPeripheral {
             inbound_tx,
             outbound_rx,
             mtu.clone(),
+            link_alive.clone(),
         ));
 
         Ok(Self {
@@ -164,7 +186,8 @@ impl BluezPeripheral {
             outbound: outbound_tx,
             pairing_open,
             mtu,
-            _worker: worker,
+            link_alive,
+            worker,
             _adv: adv_handle,
             _app: app_handle,
         })
@@ -182,6 +205,11 @@ impl BluezPeripheral {
         self.mtu.load(Ordering::Relaxed).min(u16::MAX as usize) as u16
     }
 
+    /// False after the GATT I/O worker has exited — further `recv` returns Closed.
+    pub fn link_alive(&self) -> bool {
+        self.link_alive.load(Ordering::Relaxed)
+    }
+
     pub fn adapter_hint() -> &'static str {
         "BlueZ GATT peripheral (feature bluez)"
     }
@@ -193,6 +221,7 @@ async fn link_worker(
     inbound_tx: mpsc::Sender<Vec<u8>>,
     mut outbound_rx: mpsc::Receiver<Vec<u8>>,
     mtu: Arc<AtomicUsize>,
+    link_alive: Arc<AtomicBool>,
 ) {
     pin_mut!(rx_control);
     pin_mut!(tx_control);
@@ -275,6 +304,7 @@ async fn link_worker(
             }
         }
     }
+    link_alive.store(false, Ordering::SeqCst);
 }
 
 async fn flush_pending(

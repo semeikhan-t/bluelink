@@ -528,7 +528,12 @@ async fn start_ble(io: &SyncRuntimeIo) -> Result<BluezPeripheral, String> {
         pairing_open: false,
     })
     .await
-    .map_err(|e| format!("BLE adapter unavailable: {e}"))
+    .map_err(|e| match e {
+        bluelink_sync::TransportError::Timeout => {
+            "BLE adapter start timed out (15s) — is bluetoothd stuck?".into()
+        }
+        other => format!("BLE adapter unavailable: {other}"),
+    })
 }
 
 #[cfg(feature = "bluez")]
@@ -688,9 +693,17 @@ async fn run_responder_ble(
 }
 
 #[cfg(feature = "bluez")]
+fn ble_transport_dead(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("closed") || m.contains("timeout")
+}
+
+#[cfg(feature = "bluez")]
 async fn ble_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
     let cancel = Arc::new(AtomicBool::new(false));
     let mut session: Option<BleSession> = None;
+    // Prevent Closed/error tight-loops from flooding the UI wake flag (KDE ANR).
+    let mut restart_backoff = Duration::from_millis(250);
 
     io.emit(SyncUiEvent::Status(SyncStatus::Idle));
 
@@ -705,6 +718,7 @@ async fn ble_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                         }
                         Control::SetVault(path) => {
                             session = apply_vault_ble(&io, path, &cancel).await;
+                            restart_backoff = Duration::from_millis(250);
                         }
                     }
                 }
@@ -730,6 +744,7 @@ async fn ble_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                         Control::Shutdown => return,
                         Control::SetVault(path) => {
                             session = apply_vault_ble(&io, path, &cancel).await;
+                            restart_backoff = Duration::from_millis(250);
                         }
                     }
                 }
@@ -745,7 +760,6 @@ async fn ble_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                         SyncUiCommand::Revoke(id) => revoke_device(&io, &sess.root, &id),
                         SyncUiCommand::Cancel => {
                             cancel.store(true, Ordering::SeqCst);
-                            cancel.store(false, Ordering::SeqCst);
                         }
                         SyncUiCommand::Join(_) | SyncUiCommand::Sync => {
                             io.emit(SyncUiEvent::Error(
@@ -755,6 +769,18 @@ async fn ble_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                     }
                 }
             }
+            continue;
+        }
+
+        // GATT worker gone → recv returns Closed instantly. Restart with backoff
+        // instead of spinning emit(Error) on the UI channel.
+        if sess.peripheral.as_ref().is_some_and(|p| !p.link_alive()) {
+            let root = sess.root.clone();
+            emit_log(&io, "BLE link worker exited — restarting peripheral");
+            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+            tokio::time::sleep(restart_backoff).await;
+            restart_backoff = (restart_backoff * 2).min(Duration::from_secs(5));
+            session = apply_vault_ble(&io, Some(root), &cancel).await;
             continue;
         }
 
@@ -771,6 +797,7 @@ async fn ble_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                     Control::SetVault(path) => {
                         cancel.store(true, Ordering::SeqCst);
                         session = apply_vault_ble(&io, path, &cancel).await;
+                        restart_backoff = Duration::from_millis(250);
                     }
                 }
             }
@@ -786,7 +813,6 @@ async fn ble_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                     }
                     SyncUiCommand::Cancel => {
                         cancel.store(true, Ordering::SeqCst);
-                        cancel.store(false, Ordering::SeqCst);
                     }
                     SyncUiCommand::Join(_) | SyncUiCommand::Sync => {
                         io.emit(SyncUiEvent::Error(
@@ -800,16 +826,28 @@ async fn ble_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                     Ok(()) => {
                         emit_log(&io, "sync completed");
                         io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                        restart_backoff = Duration::from_millis(250);
+                        // Brief yield so a reconnecting peer cannot spin the select.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                     Err(msg) => {
                         let cancelled = msg.to_lowercase().contains("cancel");
                         if cancelled {
                             emit_log(&io, "sync cancelled");
+                            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                        } else if ble_transport_dead(&msg) {
+                            emit_log(&io, format!("BLE transport: {msg} — restarting"));
+                            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                            tokio::time::sleep(restart_backoff).await;
+                            restart_backoff = (restart_backoff * 2).min(Duration::from_secs(5));
+                            session = apply_vault_ble(&io, Some(root), &cancel).await;
                         } else {
                             io.emit(SyncUiEvent::Error(msg.clone()));
                             emit_log(&io, format!("sync error: {msg}"));
+                            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                            // Back off so crypto/protocol noise cannot flood UI events.
+                            tokio::time::sleep(Duration::from_millis(200)).await;
                         }
-                        io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
                     }
                 }
                 cancel.store(false, Ordering::SeqCst);

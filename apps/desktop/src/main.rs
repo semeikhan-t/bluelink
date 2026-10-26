@@ -60,23 +60,18 @@ fn main() -> eframe::Result<()> {
                 Some(pick),
                 Some(sync_handle),
             );
-            let mut desktop = DesktopApp {
+            // Defer watcher + BlueZ start until the first frame so the window can
+            // map and paint before D-Bus/bluetoothd work contends with accesskit.
+            let pending_vault = app.vault_root().map(|r| r.to_path_buf()).or(vault_for_ui);
+            Ok(Box::new(DesktopApp {
                 inner: app,
                 watcher: None,
                 reload_flag,
                 sync_wake,
                 sync_runtime,
                 watching: None,
-            };
-            if let Some(path) = vault_for_ui {
-                desktop.attach_watcher(&path);
-                desktop.sync_runtime.set_vault(Some(path));
-            } else if let Some(root) = desktop.inner.vault_root() {
-                let root = root.to_path_buf();
-                desktop.attach_watcher(&root);
-                desktop.sync_runtime.set_vault(Some(root));
-            }
-            Ok(Box::new(desktop) as Box<dyn eframe::App>)
+                pending_vault,
+            }) as Box<dyn eframe::App>)
         }),
     )
 }
@@ -88,11 +83,18 @@ struct DesktopApp {
     sync_wake: Arc<AtomicBool>,
     sync_runtime: SyncRuntime,
     watching: Option<PathBuf>,
+    /// Set once after the first painted frame (or when the user opens a vault).
+    pending_vault: Option<PathBuf>,
 }
 
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let t0 = std::time::Instant::now();
+
+        if let Some(path) = self.pending_vault.take() {
+            self.attach_watcher(&path);
+            self.sync_runtime.set_vault(Some(path));
+        }
 
         if let Some(root) = self.inner.vault_root() {
             let root = root.to_path_buf();
@@ -105,10 +107,15 @@ impl eframe::App for DesktopApp {
                 self.attach_watcher(&root);
                 self.sync_runtime.set_vault(Some(root));
             }
+        } else if self.watching.is_some() {
+            self.watcher = None;
+            self.watching = None;
+            self.sync_runtime.set_vault(None);
         }
 
         let sync_woke = self.sync_wake.swap(false, Ordering::SeqCst);
         if self.reload_flag.load(Ordering::Relaxed) || sync_woke {
+            // Coalesce notify / sync-event bursts — don't spin the event loop at max rate.
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         self.inner.update(ctx, frame);
