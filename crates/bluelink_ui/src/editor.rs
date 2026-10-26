@@ -9,8 +9,11 @@ use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{FontFamily, FontId, Id, Key, Order, TextEdit, Ui};
 
 use crate::editor_menu::{self, EditorAction};
+use crate::footnote;
+use crate::math_block::{self, MathRole};
 use crate::media;
 use crate::preview;
+use crate::table::{self, Place};
 use crate::theme;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -228,6 +231,181 @@ fn row_at_local_y(prefix: &[f32], heights: &[f32], local_y: f32) -> Option<usize
 
 /// Show live editor. `active_line` is the raw-editing line index (0-based).
 /// `doc_edit` — full-buffer multiline mode (Ctrl+A).
+struct PaintedRow {
+    height: f32,
+    skip_gap: bool,
+}
+
+fn take_line_focus(ui: &Ui, line: usize) -> bool {
+    ui.ctx().data_mut(|d| {
+        let key = egui::Id::new(("live_focus", line));
+        let on = d.get_temp::<bool>(key).unwrap_or(false);
+        if on {
+            d.insert_temp(key, false);
+        }
+        on
+    })
+}
+
+/// Footnote field, visual table, or a resting math block.
+/// `None` means this row is still a normal Markdown line.
+fn paint_structured_row(
+    ui: &mut Ui,
+    i: usize,
+    start: usize,
+    end: usize,
+    line: &str,
+    lines: &[String],
+    math_spans: &[math_block::MathSpan],
+    table_places: &[Place],
+    ranges: &[(usize, usize)],
+    active_line: Option<usize>,
+    readonly: bool,
+    splice: &mut Option<(usize, usize, String)>,
+    table_edit: &mut Option<(usize, usize, String)>,
+    request_active: &mut Option<usize>,
+) -> Option<PaintedRow> {
+    if let Some((n, mut body)) = footnote::parse_def(line) {
+        let want = take_line_focus(ui, i);
+        let top = ui.cursor().top();
+        let edited = footnote::show_field(ui, n, &mut body, want && !readonly, !readonly);
+        if edited && !readonly {
+            *splice = Some((start, end, footnote::format_def(n, &body)));
+        }
+        let height = (ui.cursor().top() - top).max(28.0);
+        return Some(PaintedRow {
+            height,
+            skip_gap: false,
+        });
+    }
+
+    match table_places.get(i).copied().unwrap_or(Place::None) {
+        Place::Tail => {
+            return Some(PaintedRow {
+                height: 0.0,
+                skip_gap: true,
+            });
+        }
+        Place::Head { end: block_end } => {
+            let Some(parsed) = lines.get(i..block_end).and_then(table::parse_slice) else {
+                return Some(PaintedRow {
+                    height: 0.0,
+                    skip_gap: true,
+                });
+            };
+            let want = take_line_focus(ui, i);
+            let top = ui.cursor().top();
+            if let Some(edit) = table::show(ui, i, &parsed, want && !readonly, !readonly) {
+                if !readonly {
+                    let mut next = parsed;
+                    if table::apply_edit(&mut next, edit) {
+                        if let (Some(&(b0, _)), Some(&(_, b1))) =
+                            (ranges.get(i), ranges.get(block_end - 1))
+                        {
+                            *table_edit = Some((b0, b1, table::to_markdown(&next)));
+                        }
+                    }
+                }
+            }
+            let height = (ui.cursor().top() - top).max(28.0);
+            return Some(PaintedRow {
+                height,
+                skip_gap: false,
+            });
+        }
+        Place::None => {}
+    }
+
+    let Some(span) = math_spans.get(i).copied() else {
+        return None;
+    };
+    if span.role == MathRole::Outside {
+        return None;
+    }
+    if active_line.is_some_and(|a| span.contains(a)) {
+        return None;
+    }
+    if span.role != MathRole::Open {
+        return Some(PaintedRow {
+            height: 0.0,
+            skip_gap: true,
+        });
+    }
+    let top = ui.cursor().top();
+    let (_, clicked) = math_block::show_preview(ui, &math_block::formula(lines, span), true);
+    if clicked && !readonly {
+        let body = math_block::body_line(span);
+        let col = lines.get(body).map(|s| s.chars().count()).unwrap_or(0);
+        *request_active = Some(body);
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(egui::Id::new(("live_focus", body)), true);
+            d.insert_temp(egui::Id::new(("live_cursor", body)), col);
+        });
+    }
+    let height = (ui.cursor().top() - top).max(28.0);
+    Some(PaintedRow {
+        height,
+        skip_gap: false,
+    })
+}
+
+fn apply_table_choice(
+    buffer: &mut String,
+    ranges: &[(usize, usize)],
+    choice: table::MenuChoice,
+) -> bool {
+    let lines: Vec<String> = ranges
+        .iter()
+        .map(|&(s, e)| buffer.get(s..e).unwrap_or("").to_string())
+        .collect();
+    let Some(Place::Head { end }) = table::places(&lines).get(choice.start).copied() else {
+        return false;
+    };
+    let Some(mut parsed) = lines.get(choice.start..end).and_then(table::parse_slice) else {
+        return false;
+    };
+    let keep = table::mutate(&mut parsed, choice.row, choice.col, choice.action);
+    let text = if keep {
+        table::to_markdown(&parsed)
+    } else {
+        String::new()
+    };
+    let Some(&(b0, _)) = ranges.get(choice.start) else {
+        return false;
+    };
+    let Some(&(_, b1)) = ranges.get(end - 1) else {
+        return false;
+    };
+    buffer.replace_range(b0..b1, &text);
+    true
+}
+
+/// Insert `block` on its own lines. `caret_in_block` is a char offset into `block`.
+fn insert_isolated_block(
+    text: &mut String,
+    primary: usize,
+    secondary: usize,
+    block: &str,
+    caret_in_block: usize,
+) -> usize {
+    let lo = primary.min(secondary);
+    let hi = primary.max(secondary);
+    let byte_lo = editor_menu::char_to_byte(text, lo);
+    let byte_hi = editor_menu::char_to_byte(text, hi);
+    let lead = byte_lo > 0 && !text[..byte_lo].ends_with('\n');
+    let tail = byte_hi < text.len() && !text[byte_hi..].starts_with('\n');
+    let mut snippet = String::new();
+    if lead {
+        snippet.push('\n');
+    }
+    snippet.push_str(block);
+    if tail {
+        snippet.push('\n');
+    }
+    text.replace_range(byte_lo..byte_hi, &snippet);
+    lo + usize::from(lead) + caret_in_block
+}
+
 pub fn show_live(
     ui: &mut Ui,
     vault: &Vault,
@@ -247,6 +425,7 @@ pub fn show_live(
     if readonly {
         *doc_edit = false;
     }
+    table::set_cell_focused(ui.ctx(), false);
 
     // Drops / clipboard images before TextEdit so paste does not also insert text.
     if !readonly {
@@ -285,6 +464,8 @@ pub fn show_live(
 
     let mut request_active: Option<usize> = None;
     let mut splice: Option<(usize, usize, String)> = None;
+    let mut table_edit: Option<(usize, usize, String)> = None;
+    let mut active_in_math = false;
     // Split active line at cursor: (start, end, left, right).
     let mut split_at_cursor: Option<(usize, usize, String, String)> = None;
     let mut merge_with_prev: Option<usize> = None;
@@ -370,6 +551,18 @@ pub fn show_live(
 
                 ui.add_space(prefix[first]);
 
+                let lines: Vec<String> = ranges
+                    .iter()
+                    .map(|&(s, e)| buffer.get(s..e).unwrap_or("").to_string())
+                    .collect();
+                let math_spans = math_block::spans(&lines, &fence_roles);
+                let table_places = table::places(&lines);
+                if let Some(i) = *active_line {
+                    active_in_math = math_spans
+                        .get(i)
+                        .is_some_and(|span| span.role != MathRole::Outside);
+                }
+
                 for i in first..last {
                     let (start, end) = ranges[i];
                     let fence_role = fence_roles[i];
@@ -378,8 +571,34 @@ pub fn show_live(
 
                     let line = buffer.get(start..end).unwrap_or("");
 
+                    if let Some(painted) = paint_structured_row(
+                        ui,
+                        i,
+                        start,
+                        end,
+                        line,
+                        &lines,
+                        &math_spans,
+                        &table_places,
+                        &ranges,
+                        *active_line,
+                        readonly,
+                        &mut splice,
+                        &mut table_edit,
+                        &mut request_active,
+                    ) {
+                        layout.lines[i].height = painted.height;
+                        if !painted.skip_gap {
+                            let gap = gap_after_row(i, n, fence_role);
+                            if gap > 0.0 {
+                                ui.add_space(gap);
+                            }
+                        }
+                        continue;
+                    }
+
                     let row_id = egui::Id::new(("live_line", i));
-                    let measured_h;
+                    let mut measured_h;
 
                     if is_active {
                         let mut draft = line.to_string();
@@ -669,6 +888,14 @@ pub fn show_live(
                         }
                     }
 
+                    let span = math_spans[i];
+                    let editing_math = active_line.is_some_and(|a| span.contains(a));
+                    if editing_math && span.role == MathRole::Close {
+                        let (extra, _) =
+                            math_block::show_preview(ui, &math_block::formula(&lines, span), false);
+                        measured_h += extra;
+                    }
+
                     layout.lines[i].height = measured_h;
                     let gap = gap_after_row(i, n, fence_role);
                     if gap > 0.0 {
@@ -758,6 +985,8 @@ pub fn show_live(
 
         // One floating menu for the whole editor (not per-line egui context_menu).
         if !readonly {
+            let menu_was_open = editor_menu::load_menu(ui.ctx()).is_some();
+            let table_was_open = table::menu_open(ui.ctx());
             if let Some((menu, action)) = editor_menu::show_popup(ui.ctx()) {
                 match action {
                     EditorAction::SelectAll => {
@@ -802,6 +1031,55 @@ pub fn show_live(
                         }
                         pending_clipboard = PendingClipboard::from_action(&action);
                     }
+                    EditorAction::InsertSnippet(snip)
+                        if snip == math_block::SNIPPET || snip == table::SNIPPET =>
+                    {
+                        let (primary, secondary) = match menu.line {
+                            Some(i) => (
+                                line_char_offset(buffer, &ranges, i, menu.primary),
+                                line_char_offset(buffer, &ranges, i, menu.secondary),
+                            ),
+                            None => (menu.primary, menu.secondary),
+                        };
+                        let caret_in = if snip == math_block::SNIPPET {
+                            "$$\n".chars().count()
+                        } else {
+                            0
+                        };
+                        let caret =
+                            insert_isolated_block(buffer, primary, secondary, snip, caret_in);
+                        let (line, col) = caret_line_col(buffer, caret);
+                        request_active = Some(line);
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(egui::Id::new(("live_focus", line)), true);
+                            d.insert_temp(egui::Id::new(("live_cursor", line)), col);
+                        });
+                        result.changed = true;
+                    }
+                    // Definition belongs at the end of the note, not on this line.
+                    EditorAction::Footnote => {
+                        let (primary, secondary) = match menu.line {
+                            Some(i) => (
+                                line_char_offset(buffer, &ranges, i, menu.primary),
+                                line_char_offset(buffer, &ranges, i, menu.secondary),
+                            ),
+                            None => (menu.primary, menu.secondary),
+                        };
+                        if let Some(caret) = editor_menu::apply_text_action(
+                            buffer,
+                            primary,
+                            secondary,
+                            &EditorAction::Footnote,
+                        ) {
+                            let (line, col) = caret_line_col(buffer, caret);
+                            request_active = Some(line);
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(egui::Id::new(("live_focus", line)), true);
+                                d.insert_temp(egui::Id::new(("live_cursor", line)), col);
+                            });
+                            result.changed = true;
+                        }
+                    }
                     ref text_action => {
                         if let Some(i) = menu.line {
                             if let Some(&(s, e)) = ranges.get(i) {
@@ -830,10 +1108,23 @@ pub fn show_live(
                     }
                 }
             }
+
+            if let Some(choice) = table::show_menu(ui.ctx()) {
+                if table_edit.is_none() && !result.changed && apply_table_choice(buffer, &ranges, choice)
+                {
+                    result.changed = true;
+                }
+            }
+            let esc = ui.input(|i| i.key_pressed(Key::Escape));
+            if esc && !menu_was_open && !table_was_open && active_in_math {
+                *active_line = None;
+            }
         }
 
     // Shift+↑/↓ → full-doc edit with selection extended by one line.
-    if !readonly && !request_select_all {
+    // A focused table cell owns the arrows.
+    let in_table_cell = table::cell_focused(ui.ctx());
+    if !readonly && !request_select_all && !in_table_cell {
         let (shift_up, shift_down) = ui.input(|i| {
             let shift_only =
                 i.modifiers.shift && !i.modifiers.command && !i.modifiers.alt;
@@ -875,7 +1166,7 @@ pub fn show_live(
     }
 
     // ↑/↓ move the active raw line (commit edits via splice above first).
-    if !readonly && request_active.is_none() && !request_select_all {
+    if !readonly && request_active.is_none() && !request_select_all && !in_table_cell {
         let (up, down) = ui.input(|i| {
             let no_chord = !i.modifiers.command && !i.modifiers.alt && !i.modifiers.shift;
             (
@@ -917,6 +1208,9 @@ pub fn show_live(
         *active_line = Some(i + 1);
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new(("live_focus", i + 1)), true));
+        result.changed = true;
+    } else if let Some((start, end, new_text)) = table_edit {
+        buffer.replace_range(start..end, &new_text);
         result.changed = true;
     } else if let Some((start, end, new_text)) = splice {
         buffer.replace_range(start..end, &new_text);
@@ -1353,6 +1647,26 @@ fn unindent_line(s: &mut String, primary: usize, secondary: usize) -> (usize, us
     )
 }
 
+/// Line and column for an absolute char caret. A caret past the last line
+/// clamps to the end of that line.
+fn caret_line_col(buffer: &str, caret: usize) -> (usize, usize) {
+    let ranges = line_ranges(buffer);
+    if ranges.is_empty() {
+        return (0, caret);
+    }
+    let mut chars = 0usize;
+    for (j, &(start, end)) in ranges.iter().enumerate() {
+        let line_chars = buffer.get(start..end).map(|t| t.chars().count()).unwrap_or(0);
+        let line_end = chars + line_chars;
+        let last = j + 1 == ranges.len();
+        if caret <= line_end || last {
+            return (j, caret.saturating_sub(chars).min(line_chars));
+        }
+        chars = line_end + 1;
+    }
+    (ranges.len() - 1, 0)
+}
+
 /// Absolute char offset of `col` on `line_i` (newlines between lines count as 1).
 fn line_char_offset(buffer: &str, ranges: &[(usize, usize)], line_i: usize, col: usize) -> usize {
     let mut chars = 0usize;
@@ -1387,11 +1701,13 @@ fn line_ranges(s: &str) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        estimate_row_height, gap_after_row, line_char_offset, line_ranges, note_scroll_boost,
+        caret_line_col, estimate_row_height, gap_after_row, insert_isolated_block, line_char_offset,
+        line_ranges, note_scroll_boost,
         open_wiki_query, row_at_local_y, row_prefix_heights, unindent_line, visible_row_range,
         wiki_candidates,
         NOTE_TRACKPAD_BOOST, NOTE_WHEEL_BOOST, ROW_GAP, TOP_PAD,
     };
+    use crate::math_block;
     use crate::preview::FenceRole;
 
     #[test]
@@ -1464,6 +1780,14 @@ mod tests {
         assert_eq!(line_ranges("a\nb"), vec![(0, 1), (2, 3)]);
         assert_eq!(line_ranges("a\n"), vec![(0, 1), (2, 2)]);
         assert_eq!(line_ranges("abc"), vec![(0, 3)]);
+    }
+
+    #[test]
+    fn math_block_caret_lands_on_the_blank_line() {
+        let mut s = "hello".to_string();
+        let caret = insert_isolated_block(&mut s, 5, 5, math_block::SNIPPET, "$$\n".chars().count());
+        assert_eq!(s, "hello\n$$\n\n$$");
+        assert_eq!(caret_line_col(&s, caret), (2, 0));
     }
 
     #[test]

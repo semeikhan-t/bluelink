@@ -18,6 +18,8 @@ pub enum EditorAction {
     InsertSnippet(&'static str),
     /// Host opens a file picker and inserts `![[attachments/…]]`.
     AttachFile,
+    /// `[^N]` at the caret and `[^N]: ` at the end of the note.
+    Footnote,
     Cut,
     Copy,
     Paste,
@@ -59,6 +61,7 @@ pub fn open_at(
     primary: usize,
     secondary: usize,
 ) {
+    crate::table::close(ctx);
     store_menu(
         ctx,
         Some(CtxMenu {
@@ -194,14 +197,26 @@ pub fn show_popup(ctx: &egui::Context) -> Option<(CtxMenu, EditorAction)> {
                             }
                         }
                         SubMenu::Insert => {
-                            if row(ui, regular::PAPERCLIP, "Attach file…", false) {
-                                action = Some(EditorAction::AttachFile);
+                            if row(ui, regular::ARTICLE, "Footnote", false) {
+                                action = Some(EditorAction::Footnote);
+                            }
+                            if row(ui, regular::TABLE, "Table", false) {
+                                action = Some(EditorAction::InsertSnippet(crate::table::SNIPPET));
+                            }
+                            if row(ui, regular::QUOTES, "Callout", false) {
+                                action = Some(EditorAction::InsertSnippet("> [!note]\n> "));
+                            }
+                            if row(ui, regular::MINUS, "Horizontal rule", false) {
+                                action = Some(EditorAction::InsertSnippet("---"));
                             }
                             if row(ui, regular::CODE_BLOCK, "Code block", false) {
                                 action = Some(EditorAction::InsertSnippet("```\n\n```"));
                             }
-                            if row(ui, regular::MINUS, "Divider", false) {
-                                action = Some(EditorAction::InsertSnippet("---"));
+                            if row(ui, regular::MATH_OPERATIONS, "Math block", false) {
+                                action = Some(EditorAction::InsertSnippet(crate::math_block::SNIPPET));
+                            }
+                            if row(ui, regular::PAPERCLIP, "Attach file…", false) {
+                                action = Some(EditorAction::AttachFile);
                             }
                         }
                     }
@@ -349,6 +364,54 @@ pub fn set_prefix_at_char(text: &mut String, char_idx: usize, prefix: &str) -> u
     start_chars + prefix.chars().count()
 }
 
+/// Next `[^N]` is one past the highest marker or definition already in `text`.
+fn next_footnote_number(text: &str) -> u32 {
+    let bytes = text.as_bytes();
+    let mut max_n = 0u32;
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'^' {
+            let start = i + 2;
+            let mut j = start;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            let closed = j > start && j < bytes.len() && bytes[j] == b']';
+            if closed {
+                if let Ok(n) = text[start..j].parse::<u32>() {
+                    max_n = max_n.max(n);
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    max_n.saturating_add(1)
+}
+
+/// Insert `[^N]` in place of the selection and a blank definition at the end.
+/// Caret sits after `[^N]: ` so the note text can be typed immediately.
+fn insert_footnote(text: &mut String, primary: usize, secondary: usize) -> usize {
+    let n = next_footnote_number(text);
+    let marker = format!("[^{n}]");
+    let lo = primary.min(secondary);
+    let hi = primary.max(secondary);
+    let byte_lo = char_to_byte(text, lo);
+    let byte_hi = char_to_byte(text, hi);
+    text.replace_range(byte_lo..byte_hi, &marker);
+
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    // A blank line separates the body from the definition.
+    if !text.ends_with("\n\n") {
+        text.push('\n');
+    }
+    text.push_str(&format!("[^{n}]: "));
+    text.chars().count()
+}
+
 pub fn insert_at(text: &mut String, primary: usize, secondary: usize, snippet: &str) -> usize {
     let lo = primary.min(secondary);
     let hi = primary.max(secondary);
@@ -396,6 +459,7 @@ pub fn apply_text_action(
         EditorAction::InsertSnippet(snippet) => {
             Some(insert_at(text, primary, secondary, snippet))
         }
+        EditorAction::Footnote => Some(insert_footnote(text, primary, secondary)),
         EditorAction::Cut
         | EditorAction::Copy
         | EditorAction::Paste
@@ -454,5 +518,17 @@ mod tests {
         let caret = apply_text_action(&mut s, 0, 0, &EditorAction::ExternalLink).unwrap();
         assert_eq!(s, "[](https://)");
         assert_eq!(&s[..caret], "[](https://");
+    }
+
+    #[test]
+    fn footnotes_number_in_order() {
+        let mut s = String::new();
+        let caret = apply_text_action(&mut s, 0, 0, &EditorAction::Footnote).unwrap();
+        assert_eq!(s, "[^1]\n\n[^1]: ");
+        assert_eq!(caret, s.chars().count());
+
+        let caret = apply_text_action(&mut s, 0, 0, &EditorAction::Footnote).unwrap();
+        assert_eq!(s, "[^2][^1]\n\n[^1]: \n\n[^2]: ");
+        assert_eq!(caret, s.chars().count());
     }
 }

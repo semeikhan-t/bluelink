@@ -299,8 +299,21 @@ fn render_block_compact(
             }
         }
         PreviewBlock::ThematicBreak => {
-            ui.separator();
-            LineClick::None
+            // ui.separator() uses STROKE on the near-black canvas and disappears.
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), 16.0),
+                Sense::click(),
+            );
+            ui.painter().hline(
+                rect.x_range(),
+                rect.center().y,
+                egui::Stroke::new(2.0_f32, theme::WEAK),
+            );
+            if resp.clicked() {
+                LineClick::Edit
+            } else {
+                LineClick::None
+            }
         }
     }
 }

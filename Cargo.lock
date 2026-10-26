@@ -656,6 +656,7 @@ dependencies = [
  "egui-phosphor",
  "egui_extras",
  "image",
+ "latex-rust",
  "serde",
  "serde_json",
  "tempfile",
@@ -2388,6 +2389,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bd85a5776cd9500c2e2059c8c76c3b01528566b7fcbaf8098b55a33fc298849b"
 dependencies = [
  "arrayvec",
+]
+
+[[package]]
+name = "latex-rust"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8094b939c8af51f9c7d08256ffa607b743e24d466d9a0ccc602dc748c911e54"
+dependencies = [
+ "tiny-skia",
+ "ttf-parser",
 ]
 
 [[package]]

@@ -2,11 +2,14 @@
 
 mod editor;
 mod editor_menu;
+mod footnote;
 mod local_graph;
+mod math_block;
 mod media;
 mod preview;
 mod quick_switcher;
 mod sync_panels;
+mod table;
 mod tabs;
 mod theme;
 mod tree;
