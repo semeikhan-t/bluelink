@@ -264,13 +264,25 @@ fn paint_structured_row(
     splice: &mut Option<(usize, usize, String)>,
     table_edit: &mut Option<(usize, usize, String)>,
     request_active: &mut Option<usize>,
+    leave_edit: &mut bool,
+    erase_footnote: &mut Option<(u32, usize, usize)>,
 ) -> Option<PaintedRow> {
     if let Some((n, mut body)) = footnote::parse_def(line) {
+        // The field is only for typing. After Enter the line is a normal preview.
+        let editing = !readonly && active_line == Some(i);
+        if !editing {
+            return None;
+        }
         let want = take_line_focus(ui, i);
         let top = ui.cursor().top();
-        let edited = footnote::show_field(ui, n, &mut body, want && !readonly, !readonly);
-        if edited && !readonly {
+        let field = footnote::show_field(ui, n, &mut body, want, true);
+        if field.erase {
+            *erase_footnote = Some((n, start, end));
+        } else if field.changed {
             *splice = Some((start, end, footnote::format_def(n, &body)));
+        }
+        if field.commit {
+            *leave_edit = true;
         }
         let height = (ui.cursor().top() - top).max(28.0);
         return Some(PaintedRow {
@@ -472,6 +484,7 @@ pub fn show_live(
     // After inserting a completed `[[link]]`, show it as preview (clickable).
     let mut leave_edit_after_wiki = false;
     let mut request_select_all = false;
+    let mut erase_footnote: Option<(u32, usize, usize)> = None;
     let mut pending_clipboard = PendingClipboard::None;
     // Active line + char selection (primary, secondary) for Shift+↑/↓.
     let mut active_sel: Option<(usize, usize, usize)> = None;
@@ -586,6 +599,8 @@ pub fn show_live(
                         &mut splice,
                         &mut table_edit,
                         &mut request_active,
+                        &mut leave_edit_after_wiki,
+                        &mut erase_footnote,
                     ) {
                         layout.lines[i].height = painted.height;
                         if !painted.skip_gap {
@@ -946,38 +961,21 @@ pub fn show_live(
                     egui::vec2(ui.available_width(), fill_h),
                     egui::Sense::click(),
                 );
-                if resp.secondary_clicked() {
-                    let last = ranges.len().saturating_sub(1);
-                    let end_chars = ranges
-                        .get(last)
-                        .and_then(|&(s, e)| buffer.get(s..e))
-                        .map(|t| t.chars().count())
-                        .unwrap_or(0);
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        editor_menu::open_at(
-                            ui.ctx(),
-                            pos,
-                            Some(last),
-                            end_chars,
-                            end_chars,
-                        );
+                if resp.clicked() || resp.secondary_clicked() {
+                    // Empty area under the note edits the line after the last one.
+                    let (i, created) = line_below_last(buffer);
+                    if created {
+                        result.changed = true;
                     }
-                    request_active = Some(last);
+                    if resp.secondary_clicked() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            editor_menu::open_at(ui.ctx(), pos, Some(i), 0, 0);
+                        }
+                    }
+                    request_active = Some(i);
                     ui.ctx().data_mut(|d| {
-                        d.insert_temp(egui::Id::new(("live_focus", last)), true);
-                        d.insert_temp(egui::Id::new(("live_cursor", last)), end_chars);
-                    });
-                } else if resp.clicked() {
-                    let last = ranges.len().saturating_sub(1);
-                    request_active = Some(last);
-                    let end_chars = ranges
-                        .get(last)
-                        .and_then(|&(s, e)| buffer.get(s..e))
-                        .map(|t| t.chars().count())
-                        .unwrap_or(0);
-                    ui.ctx().data_mut(|d| {
-                        d.insert_temp(egui::Id::new(("live_focus", last)), true);
-                        d.insert_temp(egui::Id::new(("live_cursor", last)), end_chars);
+                        d.insert_temp(egui::Id::new(("live_focus", i)), true);
+                        d.insert_temp(egui::Id::new(("live_cursor", i)), 0);
                     });
                 }
             }
@@ -1202,7 +1200,16 @@ pub fn show_live(
         *active_line = None;
     }
 
-    if let Some((start, end, left, right)) = split_at_cursor {
+    if let Some((n, start, end)) = erase_footnote {
+        let caret = footnote::erase(buffer, n, start, end);
+        let (line, col) = caret_line_col(buffer, caret);
+        *active_line = Some(line);
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(egui::Id::new(("live_focus", line)), true);
+            d.insert_temp(egui::Id::new(("live_cursor", line)), col);
+        });
+        result.changed = true;
+    } else if let Some((start, end, left, right)) = split_at_cursor {
         let i = active_line.unwrap_or(0);
         buffer.replace_range(start..end, &format!("{left}\n{right}"));
         *active_line = Some(i + 1);
@@ -1680,6 +1687,23 @@ fn line_char_offset(buffer: &str, ranges: &[(usize, usize)], line_i: usize, col:
     chars
 }
 
+/// Index of the empty line under the last one. Appends it when the note
+/// does not already end with an empty line. `true` means `buffer` grew.
+fn line_below_last(buffer: &mut String) -> (usize, bool) {
+    if buffer.is_empty() {
+        return (0, false);
+    }
+    let ranges = line_ranges(buffer);
+    let last = ranges.len() - 1;
+    let (start, end) = ranges[last];
+    let empty = buffer.get(start..end).unwrap_or("").is_empty();
+    if empty {
+        return (last, false);
+    }
+    buffer.push('\n');
+    (last + 1, true)
+}
+
 /// Byte ranges of each line without the trailing `\n`.
 fn line_ranges(s: &str) -> Vec<(usize, usize)> {
     if s.is_empty() {
@@ -1701,8 +1725,8 @@ fn line_ranges(s: &str) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_line_col, estimate_row_height, gap_after_row, insert_isolated_block, line_char_offset,
-        line_ranges, note_scroll_boost,
+        caret_line_col, estimate_row_height, gap_after_row, insert_isolated_block, line_below_last,
+        line_char_offset, line_ranges, note_scroll_boost,
         open_wiki_query, row_at_local_y, row_prefix_heights, unindent_line, visible_row_range,
         wiki_candidates,
         NOTE_TRACKPAD_BOOST, NOTE_WHEEL_BOOST, ROW_GAP, TOP_PAD,
@@ -1773,6 +1797,19 @@ mod tests {
         let h = estimate_row_height("![[pic|425]]", FenceRole::Outside);
         assert!(h <= 160.0, "estimate {h} should undershoot measured embeds");
         assert!(h >= 48.0);
+    }
+
+    #[test]
+    fn click_below_document_edits_the_line_under_the_last() {
+        let mut note = "hello".to_string();
+        assert_eq!(line_below_last(&mut note), (1, true));
+        assert_eq!(note, "hello\n");
+        assert_eq!(line_below_last(&mut note), (1, false));
+        assert_eq!(note, "hello\n");
+
+        let mut note = "hello\nworld".to_string();
+        assert_eq!(line_below_last(&mut note), (2, true));
+        assert_eq!(note, "hello\nworld\n");
     }
 
     #[test]
