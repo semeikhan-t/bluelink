@@ -93,7 +93,7 @@ pub fn show_panel(
 
     let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
     let rect = resp.rect;
-    painter.rect_filled(rect, 0.0, theme::PANEL);
+    painter.rect_filled(rect, theme::round(), theme::PANEL);
     let origin = rect.center();
 
     let index: HashMap<&str, usize> = graph

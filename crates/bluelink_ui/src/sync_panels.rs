@@ -129,21 +129,52 @@ pub fn status_label(status: &SyncStatus) -> String {
 }
 
 pub fn show_screen_nav(ui: &mut egui::Ui, screen: &mut Screen) {
-    ui.horizontal(|ui| {
-        nav_btn(ui, screen, Screen::Notes, regular::NOTEBOOK, "Notes");
-        nav_btn(ui, screen, Screen::Devices, regular::DEVICES, "Devices");
-        nav_btn(ui, screen, Screen::Sync, regular::ARROWS_CLOCKWISE, "Sync");
-    });
+    let full = ui.available_width();
+    let gap = 4.0_f32;
+    let cell = ((full - gap * 2.0) / 3.0).max(64.0);
+
+    egui::Frame::NONE
+        .fill(theme::FAINT)
+        .corner_radius(theme::round())
+        .inner_margin(egui::Margin::same(3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                nav_btn(ui, screen, Screen::Notes, regular::NOTEBOOK, "Notes", cell);
+                nav_btn(ui, screen, Screen::Devices, regular::DEVICES, "Devices", cell);
+                nav_btn(
+                    ui,
+                    screen,
+                    Screen::Sync,
+                    regular::ARROWS_CLOCKWISE,
+                    "Sync",
+                    cell,
+                );
+            });
+        });
 }
 
-fn nav_btn(ui: &mut egui::Ui, screen: &mut Screen, target: Screen, icon: &str, label: &str) {
+fn nav_btn(
+    ui: &mut egui::Ui,
+    screen: &mut Screen,
+    target: Screen,
+    icon: &str,
+    label: &str,
+    width: f32,
+) {
     let selected = *screen == target;
-    let text = egui::RichText::new(format!("{icon}  {label}")).size(14.0);
-    let mut btn = egui::Button::new(text).min_size(egui::vec2(0.0, 32.0));
+    let color = if selected { theme::TEXT } else { theme::WEAK };
+    let text = egui::RichText::new(format!("{icon}  {label}"))
+        .size(13.0)
+        .color(color);
+    let mut btn = egui::Button::new(text)
+        .min_size(egui::vec2(width, 30.0))
+        .corner_radius(theme::round_sm())
+        .stroke(egui::Stroke::NONE);
     if selected {
-        btn = btn.fill(theme::FAINT);
+        btn = btn.fill(theme::PANEL);
     } else {
-        btn = btn.frame(false);
+        btn = btn.fill(egui::Color32::TRANSPARENT);
     }
     if ui.add(btn).clicked() {
         *screen = target;
@@ -420,7 +451,7 @@ pub fn show_sync(
         SyncStatus::Pairing => (regular::KEY, theme::WARN),
         SyncStatus::Connecting => (regular::PLUGS, theme::TEXT),
         SyncStatus::Transfer { .. } => (regular::ARROWS_CLOCKWISE, theme::TEXT),
-        SyncStatus::Error => (regular::WARNING_CIRCLE, theme::ACCENT),
+        SyncStatus::Error => (regular::WARNING_CIRCLE, theme::DESTRUCTIVE),
     };
     ui.horizontal(|ui| {
         ui.label(
@@ -435,7 +466,7 @@ pub fn show_sync(
             ui.label(
                 egui::RichText::new(err)
                     .size(13.0)
-                    .color(theme::ACCENT),
+                    .color(theme::DESTRUCTIVE),
             );
         }
     }

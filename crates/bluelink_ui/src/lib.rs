@@ -720,34 +720,19 @@ impl App {
     }
 
     fn show_nav_buttons(&mut self, ui: &mut egui::Ui) {
-        // Nudge down to sit with the tab baseline.
-        ui.vertical(|ui| {
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                let back = ui
-                    .add_enabled(
-                        self.can_go_back(),
-                        egui::Button::new(egui::RichText::new(regular::ARROW_LEFT).size(16.0))
-                            .min_size(egui::vec2(32.0, 32.0))
-                            .frame(false),
-                    )
-                    .on_hover_text("Back (Alt+←)");
-                let fwd = ui
-                    .add_enabled(
-                        self.can_go_forward(),
-                        egui::Button::new(egui::RichText::new(regular::ARROW_RIGHT).size(16.0))
-                            .min_size(egui::vec2(32.0, 32.0))
-                            .frame(false),
-                    )
-                    .on_hover_text("Forward (Alt+→)");
-                if back.clicked() {
-                    self.go_back();
-                }
-                if fwd.clicked() {
-                    self.go_forward();
-                }
-            });
-        });
+        let back = toolbar_icon(ui, regular::ARROW_LEFT, self.can_go_back(), "Back (Alt+←)");
+        let fwd = toolbar_icon(
+            ui,
+            regular::ARROW_RIGHT,
+            self.can_go_forward(),
+            "Forward (Alt+→)",
+        );
+        if back.clicked() {
+            self.go_back();
+        }
+        if fwd.clicked() {
+            self.go_forward();
+        }
     }
 
     fn cycle_next_tab(&mut self) {
@@ -1730,6 +1715,11 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // eframe default clear is alpha 180 — seams between panels show the desktop.
+        theme::BG.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_sync_events();
         self.apply_external_reload();
@@ -1820,6 +1810,12 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::bottom("status")
             .exact_height(36.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(12, 0)),
+            )
+            .show_separator_line(true)
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(egui::RichText::new(&self.status).color(theme::WEAK));
@@ -1843,75 +1839,118 @@ impl eframe::App for App {
         let mut pick_vault = false;
         let mut create_vault = false;
 
-        egui::SidePanel::left("tree")
+        // Id "tree_sidebar" keeps PanelState clear of the old width-grow "tree" id.
+        egui::SidePanel::left("tree_sidebar")
             .default_width(theme::SIDEBAR_WIDTH)
             .min_width(240.0)
+            .max_width(380.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin {
+                        left: 12,
+                        right: 0,
+                        top: 12,
+                        bottom: 12,
+                    }),
+            )
+            .show_separator_line(true)
             .show(ctx, |ui| {
-                ui.with_layout(
-                    egui::Layout::top_down(egui::Align::Min).with_cross_justify(true),
-                    |ui| {
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("BlueLink")
-                        .size(22.0)
-                        .family(theme::display_family())
-                        .color(theme::TEXT),
-                );
+                // Sidebar-local spacing — global item_spacing is too airy for a nav rail.
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
 
-                let vault_name = self
-                    .vault_root()
-                    .map(VaultRegistry::display_name)
-                    .unwrap_or_else(|| "Vault".into());
-                egui::ComboBox::from_id_salt("vault_switcher")
-                    .width(ui.available_width() - 8.0)
-                    .selected_text(format!("{}  {vault_name}", regular::FOLDER))
-                    .show_ui(ui, |ui| {
-                        for entry in &self.registry.entries {
-                            let name = VaultRegistry::display_name(&entry.path);
-                            let selected = self.vault_root().is_some_and(|r| {
-                                r == entry.path.as_path()
-                                    || r.canonicalize().ok() == entry.path.canonicalize().ok()
+                // Header keeps a right pad; tree scroll sits flush against the scrollbar.
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin {
+                        left: 0,
+                        right: 12,
+                        top: 0,
+                        bottom: 0,
+                    })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let mark = egui::vec2(10.0, 10.0);
+                            let (rect, _) = ui.allocate_exact_size(mark, egui::Sense::hover());
+                            ui.painter()
+                                .rect_filled(rect, theme::round_sm(), theme::ACCENT);
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("BlueLink")
+                                    .size(18.0)
+                                    .family(theme::display_family())
+                                    .strong()
+                                    .color(theme::TEXT),
+                            );
+                        });
+                        ui.add_space(10.0);
+
+                        let vault_name = self
+                            .vault_root()
+                            .map(VaultRegistry::display_name)
+                            .unwrap_or_else(|| "Vault".into());
+                        let vault_w = ui.available_width();
+                        egui::ComboBox::from_id_salt("vault_switcher")
+                            .width(vault_w)
+                            .selected_text(format!("{}  {vault_name}", regular::FOLDER))
+                            .show_ui(ui, |ui| {
+                                for entry in &self.registry.entries {
+                                    let name = VaultRegistry::display_name(&entry.path);
+                                    let selected = self.vault_root().is_some_and(|r| {
+                                        r == entry.path.as_path()
+                                            || r.canonicalize().ok()
+                                                == entry.path.canonicalize().ok()
+                                    });
+                                    if ui
+                                        .selectable_label(selected, &name)
+                                        .on_hover_text(entry.path.display().to_string())
+                                        .clicked()
+                                    {
+                                        switch_to = Some(entry.path.clone());
+                                    }
+                                }
+                                ui.separator();
+                                if ui
+                                    .button(format!("{}  Open…", regular::FOLDER_OPEN))
+                                    .clicked()
+                                {
+                                    pick_vault = true;
+                                }
+                                if ui.button(format!("{}  Create…", regular::PLUS)).clicked()
+                                {
+                                    create_vault = true;
+                                }
+                                if ui
+                                    .button(format!("{}  Forget current", regular::X))
+                                    .clicked()
+                                {
+                                    forget_active = true;
+                                }
                             });
-                            if ui
-                                .selectable_label(selected, &name)
-                                .on_hover_text(entry.path.display().to_string())
-                                .clicked()
-                            {
-                                switch_to = Some(entry.path.clone());
-                            }
-                        }
-                        ui.separator();
-                        if ui
-                            .button(format!("{}  Open…", regular::FOLDER_OPEN))
-                            .clicked()
-                        {
-                            pick_vault = true;
-                        }
-                        if ui.button(format!("{}  Create…", regular::PLUS)).clicked() {
-                            create_vault = true;
-                        }
-                        if ui
-                            .button(format!("{}  Forget current", regular::X))
-                            .clicked()
-                        {
-                            forget_active = true;
-                        }
+
+                        ui.add_space(10.0);
+                        sync_panels::show_screen_nav(ui, &mut self.screen);
                     });
 
-                ui.add_space(8.0);
-                sync_panels::show_screen_nav(ui, &mut self.screen);
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(6.0);
+                ui.add_space(12.0);
 
                 if self.screen == sync_panels::Screen::Notes {
-                    ui.label(
-                        egui::RichText::new("NOTES")
-                            .size(12.0)
-                            .family(theme::display_family())
-                            .color(theme::WEAK),
-                    );
-                    ui.add_space(8.0);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin {
+                            left: 0,
+                            right: 12,
+                            top: 0,
+                            bottom: 0,
+                        })
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("NOTES")
+                                    .size(11.0)
+                                    .family(theme::display_family())
+                                    .color(theme::WEAK),
+                            );
+                        });
+                    ui.add_space(6.0);
                     self.sync_live_title();
                     let can_undo = !self.undo_stack.is_empty();
                     let tree_sel = if self.is_graph_active() {
@@ -1965,18 +2004,24 @@ impl eframe::App for App {
                         self.move_note(&from, &to);
                     }
                 } else {
-                    let hint = match self.screen {
-                        sync_panels::Screen::Devices => "Trusted devices and pairing",
-                        sync_panels::Screen::Sync => "Status and sync log",
-                        sync_panels::Screen::Notes => "",
-                    };
-                    ui.label(
-                        egui::RichText::new(hint)
-                            .size(13.0)
-                            .color(theme::WEAK),
-                    );
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin {
+                            left: 0,
+                            right: 12,
+                            top: 0,
+                            bottom: 0,
+                        })
+                        .show(ui, |ui| {
+                            let hint = match self.screen {
+                                sync_panels::Screen::Devices => "Trusted devices and pairing",
+                                sync_panels::Screen::Sync => "Status and sync log",
+                                sync_panels::Screen::Notes => "",
+                            };
+                            ui.label(
+                                egui::RichText::new(hint).size(13.0).color(theme::WEAK),
+                            );
+                        });
                 }
-                });
             });
 
         if let Some(path) = switch_to {
@@ -2081,7 +2126,13 @@ impl eframe::App for App {
             self.select_note(&path);
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
+            )
+            .show(ctx, |ui| {
             if self.screen != sync_panels::Screen::Sync {
                 self.sync_panel.reset_ensure_ble();
             }
@@ -2111,54 +2162,59 @@ impl eframe::App for App {
             let mut tab_close: Option<usize> = None;
 
             ui.horizontal(|ui| {
-                ui.add_space(2.0);
-                self.show_nav_buttons(ui);
-                ui.add_space(4.0);
-                if ui
-                    .add(
-                        egui::Button::new(egui::RichText::new(regular::MAGNIFYING_GLASS).size(16.0))
-                            .min_size(egui::vec2(32.0, 32.0))
-                            .frame(false),
-                    )
-                    .on_hover_text("Find a note (Ctrl+P)")
-                    .clicked()
-                {
-                    self.open_quick_switcher();
-                }
-                ui.add_space(4.0);
-                {
-                    let has_graph = self.open_tabs.iter().any(|t| t.is_graph());
-                    let graph_enabled =
-                        self.vault.is_some() && (self.selected.is_some() || has_graph);
-                    let graph_btn = ui.add_enabled(
-                        graph_enabled,
-                        egui::Button::new(egui::RichText::new(regular::SHARE_NETWORK).size(16.0))
-                            .min_size(egui::vec2(32.0, 32.0))
-                            .frame(false),
-                    );
-                    let graph_btn = if graph_enabled {
-                        graph_btn.on_hover_text("Local graph (Ctrl+G)")
-                    } else {
-                        graph_btn.on_disabled_hover_text("Open a note to show its local graph")
-                    };
-                    if graph_btn.clicked() {
-                        self.toggle_local_graph();
-                    }
-                }
-                ui.add_space(4.0);
-                if self.open_tabs.is_empty() {
-                    ui.label(egui::RichText::new("Note").size(15.0).color(theme::WEAK));
-                } else {
-                    let views = self.tab_views();
-                    let tab_action =
-                        tabs::show(ui, &views, self.active_tab, self.dirty && !self.is_graph_active());
-                    tab_select = tab_action.select;
-                    tab_close = tab_action.close;
-                }
-                if self.readonly && !self.is_graph_active() {
-                    ui.add_space(8.0);
-                    ui.colored_label(theme::WARN, "read-only");
-                }
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.set_min_height(tabs::BAR_HEIGHT);
+                ui.with_layout(
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        self.show_nav_buttons(ui);
+                        if toolbar_icon(
+                            ui,
+                            regular::MAGNIFYING_GLASS,
+                            true,
+                            "Find a note (Ctrl+P)",
+                        )
+                        .clicked()
+                        {
+                            self.open_quick_switcher();
+                        }
+                        {
+                            let has_graph = self.open_tabs.iter().any(|t| t.is_graph());
+                            let graph_enabled =
+                                self.vault.is_some() && (self.selected.is_some() || has_graph);
+                            let tip = if graph_enabled {
+                                "Local graph (Ctrl+G)"
+                            } else {
+                                "Open a note to show its local graph"
+                            };
+                            if toolbar_icon(ui, regular::SHARE_NETWORK, graph_enabled, tip)
+                                .clicked()
+                            {
+                                self.toggle_local_graph();
+                            }
+                        }
+                        ui.add_space(6.0);
+                        if self.open_tabs.is_empty() {
+                            ui.label(
+                                egui::RichText::new("Note").size(15.0).color(theme::WEAK),
+                            );
+                        } else {
+                            let views = self.tab_views();
+                            let tab_action = tabs::show(
+                                ui,
+                                &views,
+                                self.active_tab,
+                                self.dirty && !self.is_graph_active(),
+                            );
+                            tab_select = tab_action.select;
+                            tab_close = tab_action.close;
+                        }
+                        if self.readonly && !self.is_graph_active() {
+                            ui.add_space(8.0);
+                            ui.colored_label(theme::WARN, "read-only");
+                        }
+                    },
+                );
             });
             ui.add_space(4.0);
             if self.open_tabs.is_empty() {
@@ -2312,6 +2368,27 @@ impl App {
             .find(|n| n.rel_path == *rel)
             .map(|n| n.modified)?;
         Some(hhmm_from_unix_ms(ms))
+    }
+}
+
+/// Ghost icon button for the note chrome toolbar — equal hit target, muted ink.
+fn toolbar_icon(
+    ui: &mut egui::Ui,
+    icon: &str,
+    enabled: bool,
+    tip: &str,
+) -> egui::Response {
+    let color = if enabled { theme::WEAK } else { theme::STROKE };
+    let btn = egui::Button::new(egui::RichText::new(icon).size(15.0).color(color))
+        .min_size(egui::vec2(32.0, 32.0))
+        .corner_radius(theme::round_sm())
+        .fill(egui::Color32::TRANSPARENT)
+        .stroke(egui::Stroke::NONE);
+    let response = ui.add_enabled(enabled, btn);
+    if enabled {
+        response.on_hover_text(tip)
+    } else {
+        response.on_disabled_hover_text(tip)
     }
 }
 

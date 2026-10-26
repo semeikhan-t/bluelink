@@ -108,6 +108,11 @@ struct DesktopApp {
 }
 
 impl eframe::App for DesktopApp {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        // Must live on DesktopApp — eframe calls the outer App, not `inner`.
+        self.inner.clear_color(visuals)
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let t0 = std::time::Instant::now();
 

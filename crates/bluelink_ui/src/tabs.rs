@@ -20,12 +20,15 @@ pub struct TabView {
     pub kind: TabKind,
 }
 
-const TAB_H: f32 = 42.0;
+const TAB_H: f32 = 34.0;
+const BAR_PAD_Y: f32 = 6.0;
+/// Full tab strip height — use to vertically center toolbar icons.
+pub const BAR_HEIGHT: f32 = TAB_H + BAR_PAD_Y * 2.0;
 const TITLE_MAX: usize = 28;
-const TITLE_SIZE: f32 = 16.0;
-const ICON_SIZE: f32 = 16.0;
+const TITLE_SIZE: f32 = 14.0;
+const ICON_SIZE: f32 = 14.0;
 
-/// Browser-style tab strip for open notes and the local graph.
+/// Floating chip tab strip — shadcn-like pills over a quiet bar.
 pub fn show(ui: &mut Ui, tabs: &[TabView], active: Option<usize>, dirty: bool) -> TabAction {
     let mut action = TabAction::default();
     if tabs.is_empty() {
@@ -33,22 +36,20 @@ pub fn show(ui: &mut Ui, tabs: &[TabView], active: Option<usize>, dirty: bool) -
     }
 
     let bar_w = ui.available_width();
-    let (_, bar_rect) = ui.allocate_space(egui::vec2(bar_w, TAB_H + 4.0));
-    let rule_y = bar_rect.bottom() - 1.0;
+    let (_, bar_rect) = ui.allocate_space(egui::vec2(bar_w, BAR_HEIGHT));
 
-    // Faint strip so the active tab can lift into the paper content.
     ui.painter()
-        .rect_filled(bar_rect, theme::round(), theme::FAINT);
+        .rect_filled(bar_rect, theme::round(), theme::PANEL);
     ui.painter().hline(
         bar_rect.x_range(),
-        rule_y,
+        bar_rect.bottom() - 0.5,
         Stroke::new(1.0_f32, theme::STROKE),
     );
 
     let mut child = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(bar_rect.shrink2(egui::vec2(4.0, 0.0)))
-            .layout(egui::Layout::left_to_right(egui::Align::BOTTOM)),
+            .max_rect(bar_rect.shrink2(egui::vec2(8.0, BAR_PAD_Y)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
 
     egui::ScrollArea::horizontal()
@@ -56,26 +57,15 @@ pub fn show(ui: &mut Ui, tabs: &[TabView], active: Option<usize>, dirty: bool) -
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .auto_shrink([false, true])
         .show(&mut child, |ui| {
-            ui.set_min_height(TAB_H + 2.0);
-            ui.spacing_mut().item_spacing.x = 4.0;
-            ui.add_space(4.0);
+            ui.set_min_height(TAB_H);
+            ui.spacing_mut().item_spacing.x = 6.0;
 
             for (index, tab) in tabs.iter().enumerate() {
                 let is_active = active == Some(index);
                 let title = truncate_title(&tab.title);
                 let show_dirty = dirty && is_active && tab.kind == TabKind::Note;
-                tab_chip(
-                    ui,
-                    index,
-                    tab.kind,
-                    &title,
-                    is_active,
-                    show_dirty,
-                    rule_y,
-                    &mut action,
-                );
+                tab_chip(ui, index, tab.kind, &title, is_active, show_dirty, &mut action);
             }
-            ui.add_space(4.0);
         });
 
     action
@@ -88,69 +78,71 @@ fn tab_chip(
     title: &str,
     active: bool,
     dirty: bool,
-    rule_y: f32,
     action: &mut TabAction,
 ) {
     let close_id = ui.id().with(("note_tab_close", index));
 
-    let pad_x = 14.0_f32;
-    let icon_w = 18.0_f32;
-    let close_w = 20.0_f32;
-    let gaps = 8.0_f32 + if dirty { 12.0 } else { 0.0 } + 8.0;
+    let pad_x = 12.0_f32;
+    let icon_w = 16.0_f32;
+    let close_w = 18.0_f32;
+    let gap_icon = 8.0_f32;
+    let gap_close = 6.0_f32;
+    let dirty_w = if dirty { 10.0 } else { 0.0 };
     let text_w = ui.fonts(|f| {
         f.layout_no_wrap(title.to_owned(), FontId::proportional(TITLE_SIZE), theme::TEXT)
             .size()
             .x
     });
-    let width = pad_x + icon_w + gaps + text_w + close_w + pad_x;
-    let size = Vec2::new(width.max(96.0), TAB_H);
+    let width = pad_x + icon_w + gap_icon + dirty_w + text_w + gap_close + close_w + pad_x;
+    let size = Vec2::new(width.max(88.0), TAB_H);
 
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let hovered = response.hovered();
 
-    if active {
-        // Square bottom corners; open into the document (no bottom stroke, no ears).
-        let body = egui::Rect::from_min_max(
-            egui::pos2(rect.left(), rect.top()),
-            egui::pos2(rect.right(), rule_y + 1.0),
-        );
-        let rounding = egui::CornerRadius {
-            nw: theme::ROUND,
-            ne: theme::ROUND,
-            sw: 0,
-            se: 0,
-        };
-        let edge = Stroke::new(1.0_f32, theme::STROKE);
-        ui.painter()
-            .rect(body, rounding, theme::BG, edge, egui::StrokeKind::Inside);
-        // Cover only the bottom stroke — stay inside the side strokes so we
-        // don't paint BG wings over the strip (that looked like convex ears).
-        let seal = egui::Rect::from_min_max(
-            egui::pos2(body.left() + 1.0, rule_y - 1.0),
-            egui::pos2(body.right() - 1.0, body.bottom() + 1.0),
-        );
-        ui.painter()
-            .rect_filled(seal, egui::CornerRadius::ZERO, theme::BG);
+    let fill = if active {
+        theme::FAINT
     } else if hovered {
-        // Invert: ink fill on paper strip (immediate, no motion).
-        ui.painter().rect_filled(
-            rect.shrink2(egui::vec2(0.0, 3.0)),
-            theme::round_sm(),
-            theme::TEXT,
+        Color32::from_rgb(0x1c, 0x1c, 0x1f)
+    } else {
+        Color32::TRANSPARENT
+    };
+    let stroke = if active {
+        Stroke::new(1.0_f32, theme::STROKE)
+    } else if hovered {
+        Stroke::new(1.0_f32, Color32::from_rgb(0x3f, 0x3f, 0x46))
+    } else {
+        Stroke::NONE
+    };
+
+    ui.painter().rect(
+        rect,
+        theme::round(),
+        fill,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+
+    if active {
+        // Short primary underline centered under the chip.
+        let underline_w = (rect.width() * 0.55).clamp(28.0, 72.0);
+        let mid = rect.center().x;
+        let y = rect.bottom() - 3.0;
+        ui.painter().hline(
+            (mid - underline_w * 0.5)..=(mid + underline_w * 0.5),
+            y,
+            Stroke::new(2.0_f32, theme::ACCENT),
         );
     }
 
-    let text_color = if active {
+    let text_color = if active || hovered {
         theme::TEXT
-    } else if hovered {
-        theme::BG
     } else {
         theme::WEAK
     };
     let icon_color = if active {
         theme::ACCENT
     } else if hovered {
-        theme::BG
+        theme::TEXT
     } else {
         theme::WEAK
     };
@@ -163,16 +155,16 @@ fn tab_chip(
         TabKind::Graph => regular::SHARE_NETWORK,
     };
     paint_glyph(ui, egui::pos2(x, cy), icon, ICON_SIZE, icon_color, AlignX::Left);
-    x += icon_w + 8.0;
+    x += icon_w + gap_icon;
 
     if dirty {
         ui.painter()
-            .circle_filled(egui::pos2(x + 3.5, cy), 3.5, theme::WARN);
-        x += 12.0;
+            .circle_filled(egui::pos2(x + 2.5, cy), 2.5, theme::WARN);
+        x += dirty_w;
     }
 
     paint_glyph(ui, egui::pos2(x, cy), title, TITLE_SIZE, text_color, AlignX::Left);
-    x += text_w + 8.0;
+    x += text_w + gap_close;
 
     let close_rect = egui::Rect::from_center_size(
         egui::pos2(rect.right() - pad_x - close_w * 0.5, cy),
@@ -185,26 +177,22 @@ fn tab_chip(
         let ch = close.hovered();
         if ch {
             ui.painter().rect_filled(
-                close_rect.expand(2.0),
+                close_rect.expand(1.0),
                 theme::round_sm(),
                 Color32::from_rgba_unmultiplied(
-                    theme::ACCENT.r(),
-                    theme::ACCENT.g(),
-                    theme::ACCENT.b(),
-                    55,
+                    theme::DESTRUCTIVE.r(),
+                    theme::DESTRUCTIVE.g(),
+                    theme::DESTRUCTIVE.b(),
+                    48,
                 ),
             );
         }
         let xc = if ch {
-            theme::ACCENT
-        } else if active {
-            theme::WEAK
-        } else if hovered {
-            theme::BG
+            theme::DESTRUCTIVE
         } else {
             theme::WEAK
         };
-        paint_glyph(ui, close_rect.center(), regular::X, 13.0, xc, AlignX::Center);
+        paint_glyph(ui, close_rect.center(), regular::X, 12.0, xc, AlignX::Center);
         close.clone().on_hover_text("Close");
         if close.clicked() {
             action.close = Some(index);

@@ -1,4 +1,4 @@
-//! Dark newsprint: ink sheet, light serif type, hairline rules, restrained red marks.
+//! ProMotor / shadcn dark: cool near-black canvas, blue primary, medium radius, sans UI type.
 
 use std::sync::Arc;
 
@@ -7,32 +7,32 @@ use egui::{
     TextStyle, Visuals,
 };
 
-/// Dark paper / light ink / restrained red — flat newspaper sheet at night.
-pub const BG: Color32 = Color32::from_rgb(0x19, 0x19, 0x16);
-pub const PANEL: Color32 = Color32::from_rgb(0x1f, 0x1e, 0x1a);
-pub const FAINT: Color32 = Color32::from_rgb(0x2a, 0x29, 0x24);
-pub const STROKE: Color32 = Color32::from_rgb(0x6b, 0x67, 0x60);
-pub const TEXT: Color32 = Color32::from_rgb(0xf3, 0xef, 0xe5);
-pub const WEAK: Color32 = Color32::from_rgb(0xa8, 0xa4, 0x9a);
-pub const ACCENT: Color32 = Color32::from_rgb(0xc4, 0x3a, 0x32);
-pub const ACCENT_DIM: Color32 = Color32::from_rgb(0xa3, 0x23, 0x1d);
-pub const WARN: Color32 = Color32::from_rgb(0xd4, 0xa0, 0x48);
-pub const CODE_BG: Color32 = Color32::from_rgb(0x12, 0x11, 0x0e);
+/// Cool zinc canvas / blue primary — shadcn-like dark tool chrome.
+pub const BG: Color32 = Color32::from_rgb(0x09, 0x09, 0x0b);
+pub const PANEL: Color32 = Color32::from_rgb(0x0c, 0x0c, 0x0e);
+pub const FAINT: Color32 = Color32::from_rgb(0x18, 0x18, 0x1b);
+pub const STROKE: Color32 = Color32::from_rgb(0x27, 0x27, 0x2a);
+pub const TEXT: Color32 = Color32::from_rgb(0xfa, 0xfa, 0xfa);
+pub const WEAK: Color32 = Color32::from_rgb(0xa1, 0xa1, 0xaa);
+pub const ACCENT: Color32 = Color32::from_rgb(0x3b, 0x82, 0xf6);
+pub const ACCENT_DIM: Color32 = Color32::from_rgb(0x25, 0x63, 0xeb);
+pub const DESTRUCTIVE: Color32 = Color32::from_rgb(0xef, 0x44, 0x44);
+pub const WARN: Color32 = Color32::from_rgb(0xf5, 0x9e, 0x0b);
+pub const CODE_BG: Color32 = Color32::from_rgb(0x05, 0x05, 0x05);
 
-pub const BODY_SIZE: f32 = 20.0;
-pub const EDITOR_SIZE: f32 = 19.0;
-pub const HEADING_SIZE: f32 = 28.0;
+pub const BODY_SIZE: f32 = 16.0;
+pub const EDITOR_SIZE: f32 = 16.0;
+pub const HEADING_SIZE: f32 = 24.0;
 pub const SIDEBAR_WIDTH: f32 = 300.0;
 /// Readable note column — centered in the central panel.
 pub const CONTENT_MAX_WIDTH: f32 = 720.0;
 
-/// Square chrome — newspaper sheet, not soft cards.
-pub const ROUND_SM: u8 = 0;
-pub const ROUND: u8 = 0;
-pub const ROUND_LG: u8 = 0;
+pub const ROUND_SM: u8 = 4;
+pub const ROUND: u8 = 6;
+pub const ROUND_LG: u8 = 8;
 
-pub const FAMILY_DISPLAY: &str = "Newsprint Display";
-pub const FAMILY_READING: &str = "Newsprint Reading";
+pub const FAMILY_DISPLAY: &str = "UI Display";
+pub const FAMILY_READING: &str = "UI Reading";
 
 const PHOSPHOR: &str = "phosphor";
 
@@ -54,7 +54,7 @@ pub fn reading_family() -> FontFamily {
     FontFamily::Name(FAMILY_READING.into())
 }
 
-/// Serif faces: Display = heavy headlines; Reading = body.
+/// Sans faces: Display = titles/buttons; Reading = body.
 const FACE_BLACK: &str = "bl_black";
 const FACE_BOLD: &str = "bl_bold";
 const FACE_MEDIUM: &str = "bl_medium";
@@ -64,54 +64,57 @@ pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
 
-    // Prefer Source Serif 4 / EB Garamond when present; else Noto / Liberation serif.
+    // Prefer Inter when present; else Noto Sans / Liberation / DejaVu.
     load_face(
         &mut fonts,
         FACE_BLACK,
         &[
-            "/usr/share/fonts/adobe-source-serif/SourceSerif4-Black.otf",
-            "/usr/share/fonts/OTF/SourceSerif4-Black.otf",
-            "/usr/share/fonts/noto/NotoSerif-Black.ttf",
-            "/usr/share/fonts/liberation/LiberationSerif-Bold.ttf",
-            "/usr/share/fonts/TTF/DejaVuSerif-Bold.ttf",
+            "/usr/share/fonts/inter/Inter-Black.ttf",
+            "/usr/share/fonts/TTF/Inter-Black.ttf",
+            "/usr/share/fonts/opentype/inter/Inter-Black.otf",
+            "/usr/share/fonts/noto/NotoSans-Black.ttf",
+            "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
         ],
     );
     load_face(
         &mut fonts,
         FACE_BOLD,
         &[
-            "/usr/share/fonts/adobe-source-serif/SourceSerif4-Bold.otf",
-            "/usr/share/fonts/OTF/SourceSerif4-Bold.otf",
-            "/usr/share/fonts/noto/NotoSerif-Bold.ttf",
-            "/usr/share/fonts/liberation/LiberationSerif-Bold.ttf",
-            "/usr/share/fonts/TTF/DejaVuSerif-Bold.ttf",
+            "/usr/share/fonts/inter/Inter-Bold.ttf",
+            "/usr/share/fonts/TTF/Inter-Bold.ttf",
+            "/usr/share/fonts/opentype/inter/Inter-Bold.otf",
+            "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
         ],
     );
     load_face(
         &mut fonts,
         FACE_MEDIUM,
         &[
-            "/usr/share/fonts/adobe-source-serif/SourceSerif4-Semibold.otf",
-            "/usr/share/fonts/OTF/SourceSerif4-Semibold.otf",
-            "/usr/share/fonts/noto/NotoSerif-Medium.ttf",
-            "/usr/share/fonts/noto/NotoSerif-Regular.ttf",
-            "/usr/share/fonts/liberation/LiberationSerif-Regular.ttf",
+            "/usr/share/fonts/inter/Inter-SemiBold.ttf",
+            "/usr/share/fonts/inter/Inter-Medium.ttf",
+            "/usr/share/fonts/TTF/Inter-SemiBold.ttf",
+            "/usr/share/fonts/TTF/Inter-Medium.ttf",
+            "/usr/share/fonts/noto/NotoSans-Medium.ttf",
+            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
         ],
     );
     load_face(
         &mut fonts,
         FACE_REGULAR,
         &[
-            "/usr/share/fonts/TTF/EBGaramond-Regular.ttf",
-            "/usr/share/fonts/ebgaramond/EBGaramond-Regular.ttf",
-            "/usr/share/fonts/OTF/EBGaramond-Regular.otf",
-            "/usr/share/fonts/noto/NotoSerif-Regular.ttf",
-            "/usr/share/fonts/liberation/LiberationSerif-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSerif.ttf",
+            "/usr/share/fonts/inter/Inter-Regular.ttf",
+            "/usr/share/fonts/TTF/Inter-Regular.ttf",
+            "/usr/share/fonts/opentype/inter/Inter-Regular.otf",
+            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
         ],
     );
 
-    // Body stack: serif for text, phosphor at index 1 for icons (same as egui_phosphor).
     if let Some(stack) = fonts.families.get_mut(&FontFamily::Proportional) {
         stack.retain(|k| k != PHOSPHOR);
         if fonts.font_data.contains_key(FACE_REGULAR) {
@@ -131,7 +134,6 @@ pub fn install_fonts(ctx: &egui::Context) {
         &[FACE_REGULAR, FACE_MEDIUM, FACE_BOLD],
     );
 
-    // Heading weight ladder still keyed as H1–H3 (Display stack).
     register_named(
         &mut fonts,
         "H1",
@@ -153,10 +155,10 @@ pub fn install_fonts(ctx: &egui::Context) {
 
 pub fn heading_size(level: u8) -> f32 {
     match level {
-        1 => 28.0,
-        2 => 24.0,
-        3 => 20.0,
-        _ => 18.0,
+        1 => 24.0,
+        2 => 20.0,
+        3 => 18.0,
+        _ => 16.0,
     }
 }
 
@@ -213,16 +215,16 @@ pub fn apply(ctx: &egui::Context) {
     scale_text(&mut style);
     style.spacing.item_spacing = egui::vec2(12.0, 10.0);
     style.spacing.window_margin = egui::Margin::same(14);
-    style.spacing.button_padding = egui::vec2(14.0, 8.0);
-    style.spacing.interact_size = egui::vec2(48.0, 32.0);
+    style.spacing.button_padding = egui::vec2(12.0, 8.0);
+    style.spacing.interact_size = egui::vec2(44.0, 32.0);
     style.spacing.indent = 22.0;
     style.spacing.scroll = egui::style::ScrollStyle {
         bar_width: 10.0,
         ..egui::style::ScrollStyle::solid()
     };
-    style.visuals = newsprint_visuals();
+    style.visuals = promotor_visuals();
     ctx.set_style(style);
-    ctx.set_visuals(newsprint_visuals());
+    ctx.set_visuals(promotor_visuals());
 }
 
 fn scale_text(style: &mut Style) {
@@ -230,41 +232,43 @@ fn scale_text(style: &mut Style) {
     let reading = reading_family();
     let display = display_family();
     style.text_styles = [
-        (TextStyle::Small, FontId::new(13.0, reading.clone())),
+        (TextStyle::Small, FontId::new(12.0, reading.clone())),
         (TextStyle::Body, FontId::new(BODY_SIZE, reading.clone())),
-        (TextStyle::Button, FontId::new(15.0, display.clone())),
+        (TextStyle::Button, FontId::new(14.0, display.clone())),
         (TextStyle::Heading, FontId::new(HEADING_SIZE, display)),
         (TextStyle::Monospace, FontId::new(EDITOR_SIZE, Monospace)),
     ]
     .into();
 }
 
-fn newsprint_visuals() -> Visuals {
+fn promotor_visuals() -> Visuals {
     let mut v = Visuals::dark();
     v.dark_mode = true;
-    // No override — widget fg_stroke drives text so hover invert works.
     v.override_text_color = None;
 
-    // Idle: dark sheet + light ink + thin rule. Hover/active: invert immediately.
+    // Idle: dark fill + light text + subtle border. Hover: muted fill (not invert).
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, BG);
-    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, BG);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.widgets.open.fg_stroke = Stroke::new(1.0_f32, TEXT);
 
     v.widgets.noninteractive.bg_fill = PANEL;
-    v.widgets.inactive.bg_fill = BG;
-    v.widgets.hovered.bg_fill = TEXT;
-    v.widgets.active.bg_fill = TEXT;
+    v.widgets.inactive.bg_fill = FAINT;
+    v.widgets.hovered.bg_fill = Color32::from_rgb(0x27, 0x27, 0x2a);
+    v.widgets.active.bg_fill = ACCENT_DIM;
     v.widgets.open.bg_fill = FAINT;
 
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, STROKE);
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, TEXT);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, TEXT);
-    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, TEXT);
-    v.widgets.open.bg_stroke = Stroke::new(1.0_f32, TEXT);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, STROKE);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(0x3f, 0x3f, 0x46));
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    v.widgets.open.bg_stroke = Stroke::new(1.0_f32, STROKE);
 
-    v.selection.bg_fill = Color32::from_rgba_unmultiplied(0xc4, 0x3a, 0x32, 56);
+    // Active (pressed) primary: white text on blue.
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT);
+
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied(0x3b, 0x82, 0xf6, 56);
     v.selection.stroke = Stroke::new(2.0_f32, ACCENT);
 
     v.panel_fill = BG;
@@ -274,8 +278,7 @@ fn newsprint_visuals() -> Visuals {
     v.code_bg_color = CODE_BG;
     v.hyperlink_color = ACCENT;
     v.warn_fg_color = WARN;
-    let _ = WEAK;
-    let _ = ACCENT_DIM;
+    v.error_fg_color = DESTRUCTIVE;
 
     v.window_stroke = Stroke::new(1.0_f32, STROKE);
     v.window_corner_radius = round_lg();

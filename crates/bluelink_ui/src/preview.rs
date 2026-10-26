@@ -361,7 +361,7 @@ fn render_one_span(
             let rich = if heading {
                 theme::heading_rich(t, level)
             } else {
-                // Pin ink: Sense::click labels use hovered.fg_stroke (invert = dark on dark).
+                // Pin ink: Sense::click labels use hovered.fg_stroke — keep explicit TEXT.
                 RichText::new(t).size(size).color(theme::TEXT)
             };
             let resp = ui.add(egui::Label::new(rich).sense(Sense::click()));
@@ -731,7 +731,7 @@ fn paint_resize_handle(
     }
 
     ui.painter()
-        .rect_filled(handle_rect, 2.0, theme::ACCENT);
+        .rect_filled(handle_rect, theme::round_sm(), theme::ACCENT);
     let sense = ui.interact(handle_rect, drag_id.with("h"), Sense::drag());
     sense.clone().on_hover_cursor(CursorIcon::ResizeEast);
 
