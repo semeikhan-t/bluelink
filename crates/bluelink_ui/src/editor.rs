@@ -193,6 +193,39 @@ fn visible_row_range(
     (first, last)
 }
 
+/// Row under a click in the editor margins. `local_y` is relative to the column top.
+/// The top pad belongs to the first row; a click in a gap goes to the nearer row.
+fn row_at_local_y(prefix: &[f32], heights: &[f32], local_y: f32) -> Option<usize> {
+    let n = heights.len();
+    if n == 0 || prefix.len() != n + 1 || local_y < 0.0 || local_y > prefix[n] {
+        return None;
+    }
+    if local_y <= prefix[0] {
+        return Some(0);
+    }
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if prefix[mid] <= local_y {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let row_bottom = prefix[lo] + heights[lo].max(1.0);
+    if local_y <= row_bottom || lo + 1 == n {
+        return Some(lo);
+    }
+    let next_top = prefix[lo + 1];
+    let closer_to_next = local_y - row_bottom > next_top - local_y;
+    if closer_to_next {
+        Some(lo + 1)
+    } else {
+        Some(lo)
+    }
+}
+
 /// Show live editor. `active_line` is the raw-editing line index (0-based).
 /// `doc_edit` — full-buffer multiline mode (Ctrl+A).
 pub fn show_live(
@@ -279,7 +312,6 @@ pub fn show_live(
             // Viewport height at content start — used to fill empty space below lines
             // so clicks there hit a widget (ScrollArea empty chrome is not clickable).
             let viewport_h = viewport.height();
-            let content_top = ui.cursor().top();
 
             // Keep parsed previews and measured heights across frames. Scrolling should not
             // re-run pulldown-cmark for every visible line on every repaint.
@@ -293,12 +325,40 @@ pub fn show_live(
             }
             let mut layout = layout.expect("live layout cache initialized");
 
+            let heights: Vec<f32> = layout.lines.iter().map(|l| l.height.max(1.0)).collect();
+            let prefix = row_prefix_heights(&heights, &fence_roles);
+            let content_top = ui.cursor().top();
+            let pane = ui.available_rect_before_wrap();
+            // Registered before the lines so text, links, and embeds stay on top.
+            // Empty space at the same height (side margins and the tail of a short line)
+            // still hits this widget and opens that row.
+            let margin = if readonly {
+                None
+            } else {
+                let total = *prefix.last().unwrap_or(&TOP_PAD);
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(pane.left(), content_top),
+                    egui::pos2(pane.right(), content_top + total),
+                );
+                Some(
+                    ui.interact(
+                        rect,
+                        Id::new(("live_margin", source_path.unwrap_or(""))),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::Text),
+                )
+            };
+
+            let mut column_top = content_top;
+            let mut column_left = pane.left();
             centered_column(ui, |ui| {
+                // Prefix heights are measured from this cursor, not the outer pane.
+                column_top = ui.cursor().top();
+                column_left = ui.cursor().left();
                 // Gaps are baked into prefix strides — avoid egui item_spacing double-count.
                 ui.spacing_mut().item_spacing.y = 0.0;
 
-                let heights: Vec<f32> = layout.lines.iter().map(|l| l.height.max(1.0)).collect();
-                let prefix = row_prefix_heights(&heights, &fence_roles);
                 let n = ranges.len();
                 let force = if readonly {
                     None
@@ -621,6 +681,33 @@ pub fn show_live(
                     ui.add_space(after);
                 }
             });
+
+            if let Some(resp) = margin {
+                let primary = resp.clicked();
+                let secondary = resp.secondary_clicked();
+                if primary || secondary {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let local_y = pos.y - column_top;
+                        if let Some(i) = row_at_local_y(&prefix, &heights, local_y) {
+                            let n = ranges
+                                .get(i)
+                                .and_then(|&(s, e)| buffer.get(s..e))
+                                .map(|t| t.chars().count())
+                                .unwrap_or(0);
+                            // Left of the text column → start of the line. Anywhere else
+                            // the click is past the glyphs, so the caret goes to the end.
+                            let caret = if pos.x < column_left { 0 } else { n };
+                            if secondary {
+                                editor_menu::open_at(ui.ctx(), pos, Some(i), caret, caret);
+                            }
+                            request_active = Some(i);
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(egui::Id::new(("live_cursor", i)), caret);
+                            });
+                        }
+                    }
+                }
+            }
 
             ui.ctx().data_mut(|d| d.insert_temp(layout_id, layout));
 
@@ -1301,7 +1388,8 @@ fn line_ranges(s: &str) -> Vec<(usize, usize)> {
 mod tests {
     use super::{
         estimate_row_height, gap_after_row, line_char_offset, line_ranges, note_scroll_boost,
-        open_wiki_query, row_prefix_heights, unindent_line, visible_row_range, wiki_candidates,
+        open_wiki_query, row_at_local_y, row_prefix_heights, unindent_line, visible_row_range,
+        wiki_candidates,
         NOTE_TRACKPAD_BOOST, NOTE_WHEEL_BOOST, ROW_GAP, TOP_PAD,
     };
     use crate::preview::FenceRole;
@@ -1338,6 +1426,19 @@ mod tests {
         assert_eq!(gap_after_row(4, 5, FenceRole::Outside), 0.0);
         assert_eq!(gap_after_row(0, 5, FenceRole::Outside), ROW_GAP);
         assert_eq!(gap_after_row(1, 5, FenceRole::Open), 0.0);
+    }
+
+    #[test]
+    fn click_y_selects_the_row_at_that_height() {
+        let roles = [FenceRole::Outside, FenceRole::Outside];
+        let heights = [22.0, 22.0];
+        let prefix = row_prefix_heights(&heights, &roles);
+        assert_eq!(row_at_local_y(&prefix, &heights, 0.0), Some(0));
+        assert_eq!(row_at_local_y(&prefix, &heights, TOP_PAD + 10.0), Some(0));
+        let gap_start = prefix[1] - ROW_GAP;
+        assert_eq!(row_at_local_y(&prefix, &heights, gap_start + 1.0), Some(0));
+        assert_eq!(row_at_local_y(&prefix, &heights, prefix[2] - 1.0), Some(1));
+        assert_eq!(row_at_local_y(&prefix, &heights, prefix[2] + 4.0), None);
     }
 
     #[test]
