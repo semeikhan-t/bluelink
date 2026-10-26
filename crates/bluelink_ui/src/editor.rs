@@ -98,28 +98,26 @@ const ROW_GAP: f32 = 10.0;
 /// Extra band so fast flings don't flash empty rows.
 const OVERSCAN: f32 = 600.0;
 
-/// On Wayland, winit often reports the mouse wheel as `PixelDelta` (Point units).
-/// `Options::line_scroll_speed` only scales `Line` units — Point notches stay ~15–40px
-/// and feel sluggish vs browsers (~120px). Discrete-sized Point deltas get this boost.
-const POINT_WHEEL_BOOST: f32 = 4.0;
-/// Gentler multiplier for small continuous Point deltas (trackpad).
-const POINT_TRACKPAD_BOOST: f32 = 1.5;
+/// Note-editor only. Wayland wheels often arrive as Point; `line_scroll_speed` only scales Line.
+const NOTE_WHEEL_BOOST: f32 = 4.0;
+const NOTE_TRACKPAD_BOOST: f32 = 1.5;
 
-fn point_scroll_boost(raw_len: f32) -> f32 {
+fn note_scroll_boost(raw_len: f32) -> f32 {
     if raw_len >= 8.0 {
-        POINT_WHEEL_BOOST
+        NOTE_WHEEL_BOOST
     } else {
-        POINT_TRACKPAD_BOOST
+        NOTE_TRACKPAD_BOOST
     }
 }
 
-/// Make note scrolling feel like a browser: unsmear wheel notches and boost Wayland Point deltas.
-/// Only when the pointer is over this ui (side-panel scroll already consumed input otherwise).
+/// Faster note scroll on Wayland Point wheels. Idle frames must not call `input_mut` —
+/// rewriting input every hover frame contended with AccessKit/atspi and tripped Plasma ANR.
 fn boost_note_scroll(ui: &Ui) {
     if !ui.rect_contains_pointer(ui.max_rect()) {
         return;
     }
-    ui.ctx().input_mut(|i| {
+    // Read first (no write). Bail before input_mut when there is nothing to boost.
+    let (raw, point_only) = ui.ctx().input(|i| {
         let mut saw_point = false;
         let mut saw_line = false;
         for ev in &i.events {
@@ -130,18 +128,14 @@ fn boost_note_scroll(ui: &Ui) {
                 }
             }
         }
-        let raw = i.raw_scroll_delta;
-        if raw == egui::Vec2::ZERO {
-            // Drop egui's multi-frame smear leftovers — one notch = one jump.
-            i.smooth_scroll_delta = egui::Vec2::ZERO;
-            return;
-        }
-        if saw_point && !saw_line {
-            i.smooth_scroll_delta = raw * point_scroll_boost(raw.length());
-        } else {
-            // Line/Page already scaled by line_scroll_speed — apply fully this frame.
-            i.smooth_scroll_delta = raw;
-        }
+        (i.raw_scroll_delta, saw_point && !saw_line)
+    });
+    if raw == egui::Vec2::ZERO || !point_only {
+        return;
+    }
+    let boost = note_scroll_boost(raw.length());
+    ui.ctx().input_mut(|i| {
+        i.smooth_scroll_delta = raw * boost;
     });
 }
 
@@ -1306,17 +1300,17 @@ fn line_ranges(s: &str) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        estimate_row_height, gap_after_row, line_char_offset, line_ranges, open_wiki_query,
-        point_scroll_boost, row_prefix_heights, unindent_line, visible_row_range, wiki_candidates,
-        POINT_TRACKPAD_BOOST, POINT_WHEEL_BOOST, ROW_GAP, TOP_PAD,
+        estimate_row_height, gap_after_row, line_char_offset, line_ranges, note_scroll_boost,
+        open_wiki_query, row_prefix_heights, unindent_line, visible_row_range, wiki_candidates,
+        NOTE_TRACKPAD_BOOST, NOTE_WHEEL_BOOST, ROW_GAP, TOP_PAD,
     };
     use crate::preview::FenceRole;
 
     #[test]
-    fn point_wheel_boost_scales_discrete_notches() {
-        assert_eq!(point_scroll_boost(15.0), POINT_WHEEL_BOOST);
-        assert_eq!(point_scroll_boost(2.0), POINT_TRACKPAD_BOOST);
-        assert!(POINT_WHEEL_BOOST > POINT_TRACKPAD_BOOST);
+    fn note_scroll_boost_scales_discrete_notches() {
+        assert_eq!(note_scroll_boost(15.0), NOTE_WHEEL_BOOST);
+        assert_eq!(note_scroll_boost(2.0), NOTE_TRACKPAD_BOOST);
+        assert!(NOTE_WHEEL_BOOST > NOTE_TRACKPAD_BOOST);
     }
 
     #[test]

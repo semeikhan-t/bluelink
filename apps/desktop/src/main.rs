@@ -75,8 +75,8 @@ fn main() -> eframe::Result<()> {
                 Some(pick_file),
                 Some(sync_handle),
             );
-            // Defer watcher + BlueZ start until the first frame so the window can
-            // map and paint before D-Bus/bluetoothd work contends with accesskit.
+            // Defer watcher + BlueZ until AccessKit has painted a few frames.
+            // Starting BlueZ on frame 0 blocked the UI ~13s on D-Bus (Plasma ANR).
             let pending_vault = app.vault_root().map(|r| r.to_path_buf()).or(vault_for_ui);
             Ok(Box::new(DesktopApp {
                 inner: app,
@@ -86,10 +86,15 @@ fn main() -> eframe::Result<()> {
                 sync_runtime,
                 watching: None,
                 pending_vault,
+                startup_frames: 0,
             }) as Box<dyn eframe::App>)
         }),
     )
 }
+
+/// Frames to paint before watcher/BlueZ. AccessKit (atspi) and bluer share D-Bus;
+/// overlapping them on the first pass freezes the UI long enough for Plasma ANR.
+const POST_MAP_FRAMES: u8 = 4;
 
 struct DesktopApp {
     inner: App,
@@ -98,17 +103,43 @@ struct DesktopApp {
     sync_wake: Arc<AtomicBool>,
     sync_runtime: SyncRuntime,
     watching: Option<PathBuf>,
-    /// Set once after the first painted frame (or when the user opens a vault).
+    /// CLI / initial vault — attached after [`POST_MAP_FRAMES`].
     pending_vault: Option<PathBuf>,
+    startup_frames: u8,
 }
 
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let t0 = std::time::Instant::now();
 
+        let sync_woke = self.sync_wake.swap(false, Ordering::SeqCst);
+        if self.reload_flag.load(Ordering::Relaxed) || sync_woke {
+            // Coalesce notify / sync-event bursts — don't spin the event loop at max rate.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        // Paint before any D-Bus/BlueZ work so AccessKit can finish its first trees.
+        self.inner.update(ctx, frame);
+
+        if self.startup_frames < POST_MAP_FRAMES {
+            self.startup_frames += 1;
+            ctx.request_repaint();
+        } else {
+            self.reconcile_vault_runtime();
+        }
+
+        let ms = t0.elapsed().as_millis();
+        if ms > 100 {
+            eprintln!("bluelink: slow frame {ms}ms");
+        }
+    }
+}
+
+impl DesktopApp {
+    fn reconcile_vault_runtime(&mut self) {
         if let Some(path) = self.pending_vault.take() {
             self.attach_watcher(&path);
             self.sync_runtime.set_vault(Some(path));
+            return;
         }
 
         if let Some(root) = self.inner.vault_root() {
@@ -127,22 +158,8 @@ impl eframe::App for DesktopApp {
             self.watching = None;
             self.sync_runtime.set_vault(None);
         }
-
-        let sync_woke = self.sync_wake.swap(false, Ordering::SeqCst);
-        if self.reload_flag.load(Ordering::Relaxed) || sync_woke {
-            // Coalesce notify / sync-event bursts — don't spin the event loop at max rate.
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
-        }
-        self.inner.update(ctx, frame);
-
-        let ms = t0.elapsed().as_millis();
-        if ms > 100 {
-            eprintln!("bluelink: slow frame {ms}ms");
-        }
     }
-}
 
-impl DesktopApp {
     fn attach_watcher(&mut self, path: &Path) {
         match start_watcher(path, self.reload_flag.clone()) {
             Ok(w) => {
