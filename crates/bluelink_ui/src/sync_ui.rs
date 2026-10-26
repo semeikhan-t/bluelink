@@ -49,13 +49,20 @@ pub enum SyncUiEvent {
     Error(String),
 }
 
-/// UI → runtime. Desktop does **not** expose a Sync button (phone initiates).
+/// UI → runtime.
+///
+/// Host (BLE or `--sync-tcp`): ShowCode / Revoke / Cancel.
+/// Initiator (`--initiator --connect`): Join / Sync / Revoke / Cancel.
 #[derive(Debug, Clone)]
 pub enum SyncUiCommand {
     /// Show a new 6-digit pairing code (TTL [`PAIRING_TTL_MS`], [`PAIRING_ATTEMPTS`] tries).
     ShowCode,
+    /// Initiator: dial peer and complete SPAKE2 join with this 6-digit code.
+    Join(String),
+    /// Initiator: dial peer and run sync as Initiator (after trust exists).
+    Sync,
     Revoke(String),
-    /// Cancel in-flight pairing or responder sync.
+    /// Cancel in-flight pairing or sync.
     Cancel,
 }
 
@@ -65,9 +72,15 @@ pub struct SyncUiHandle {
     cmd_tx: Sender<SyncUiCommand>,
     events: Arc<Mutex<VecDeque<SyncUiEvent>>>,
     wake: Arc<AtomicBool>,
+    /// True when this process is the TCP/phone-side Initiator (shows Join + Sync).
+    initiator: bool,
 }
 
 impl SyncUiHandle {
+    pub fn is_initiator(&self) -> bool {
+        self.initiator
+    }
+
     pub fn send(&self, cmd: SyncUiCommand) {
         let _ = self.cmd_tx.send(cmd);
     }
@@ -113,6 +126,11 @@ impl SyncRuntimeIo {
 
 /// Split UI handle + runtime I/O. Call once from desktop `main`.
 pub fn channel() -> (SyncUiHandle, SyncRuntimeIo) {
+    channel_with_role(false)
+}
+
+/// Like [`channel`], with Initiator UI enabled when `initiator` is true.
+pub fn channel_with_role(initiator: bool) -> (SyncUiHandle, SyncRuntimeIo) {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let events = Arc::new(Mutex::new(VecDeque::new()));
     let wake = Arc::new(AtomicBool::new(false));
@@ -121,6 +139,7 @@ pub fn channel() -> (SyncUiHandle, SyncRuntimeIo) {
             cmd_tx,
             events: events.clone(),
             wake: wake.clone(),
+            initiator,
         },
         SyncRuntimeIo {
             cmd_rx,

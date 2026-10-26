@@ -1,8 +1,11 @@
-//! Tokio + BlueZ SyncRuntime: pairing host + sync Responder.
+//! Tokio SyncRuntime: BlueZ peripheral host, or TCP Host/Initiator for local demo.
 //!
-//! Desktop never initiates sync (phone does). UI drives ShowCode / Revoke / Cancel.
+//! - Default / BLE: ShowCode + Responder sync (phone / Initiator dials).
+//! - `--sync-tcp ADDR`: TCP listen; same host UX without BlueZ.
+//! - `--initiator --connect ADDR`: Join + Sync buttons; dials the host.
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -10,26 +13,40 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "bluez")]
 use bluelink_ble::{BluezPeripheral, BluezPeripheralConfig};
 use bluelink_core::Vault;
 use bluelink_sync::{
-    host_accept, host_session, run_sync, Role, SyncOptions, TrustStore, PAIRING_TTL_MS,
+    host_accept, host_session, join, run_sync, Role, SyncOptions, TcpTransport, TrustStore,
+    PAIRING_TTL_MS,
 };
 use bluelink_ui::sync_ui::{SyncRuntimeIo, SyncStatus, SyncUiCommand, SyncUiEvent};
+use tokio::net::TcpListener;
+
+/// How the desktop sync worker talks to a peer.
+#[derive(Debug, Clone)]
+pub enum TransportMode {
+    /// BlueZ GATT peripheral (default when feature `bluez` is on).
+    Ble,
+    /// Listen for TCP Initiator (demo without Android/BLE).
+    TcpHost(SocketAddr),
+    /// Dial TCP host; UI shows Join + Sync.
+    TcpInitiator(SocketAddr),
+}
 
 enum Control {
     SetVault(Option<PathBuf>),
     Shutdown,
 }
 
-/// Background BLE + sync worker. Lifetime owned by [`super::DesktopApp`].
+/// Background sync worker. Lifetime owned by [`super::DesktopApp`].
 pub struct SyncRuntime {
     ctrl_tx: mpsc::Sender<Control>,
     _thread: JoinHandle<()>,
 }
 
 impl SyncRuntime {
-    pub fn start(io: SyncRuntimeIo) -> Self {
+    pub fn start(io: SyncRuntimeIo, mode: TransportMode) -> Self {
         let (ctrl_tx, ctrl_rx) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("bluelink-sync".into())
@@ -46,7 +63,7 @@ impl SyncRuntime {
                         return;
                     }
                 };
-                rt.block_on(runtime_loop(io, ctrl_rx));
+                rt.block_on(runtime_loop(io, ctrl_rx, mode));
             })
             .expect("spawn sync runtime thread");
         Self {
@@ -107,62 +124,6 @@ async fn poll_ctrl(rx: &Receiver<Control>) -> Control {
     }
 }
 
-async fn start_ble(io: &SyncRuntimeIo) -> Result<BluezPeripheral, String> {
-    emit_log(io, "starting BlueZ peripheral…");
-    BluezPeripheral::start(BluezPeripheralConfig {
-        local_name: "BlueLink".into(),
-        pairing_open: false,
-    })
-    .await
-    .map_err(|e| format!("BLE adapter unavailable: {e}"))
-}
-
-struct Session {
-    root: PathBuf,
-    peripheral: Option<BluezPeripheral>,
-    ble_failed: bool,
-}
-
-async fn apply_vault(
-    io: &SyncRuntimeIo,
-    path: Option<PathBuf>,
-    cancel: &AtomicBool,
-) -> Option<Session> {
-    cancel.store(true, Ordering::SeqCst);
-    cancel.store(false, Ordering::SeqCst);
-
-    let Some(root) = path else {
-        io.emit(SyncUiEvent::Status(SyncStatus::Idle));
-        io.emit(SyncUiEvent::Trusted(Vec::new()));
-        return None;
-    };
-
-    emit_log(io, format!("vault {}", root.display()));
-    emit_trusted(io, &root);
-
-    match start_ble(io).await {
-        Ok(p) => {
-            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
-            emit_log(io, "BLE advertising (waiting for phone)");
-            Some(Session {
-                root,
-                peripheral: Some(p),
-                ble_failed: false,
-            })
-        }
-        Err(msg) => {
-            io.emit(SyncUiEvent::Error(msg.clone()));
-            io.emit(SyncUiEvent::Status(SyncStatus::Error));
-            emit_log(io, msg);
-            Some(Session {
-                root,
-                peripheral: None,
-                ble_failed: true,
-            })
-        }
-    }
-}
-
 fn revoke_device(io: &SyncRuntimeIo, root: &Path, device_id: &str) {
     match TrustStore::load(root) {
         Ok(mut store) => match store.revoke(device_id) {
@@ -179,23 +140,447 @@ fn revoke_device(io: &SyncRuntimeIo, root: &Path, device_id: &str) {
     }
 }
 
-fn handle_cmd_no_ble(io: &SyncRuntimeIo, root: &Path, cmd: SyncUiCommand, cancel: &AtomicBool) {
-    match cmd {
-        SyncUiCommand::ShowCode => {
-            io.emit(SyncUiEvent::Error(
-                "BLE adapter unavailable — cannot show pairing code".into(),
-            ));
-            io.emit(SyncUiEvent::Status(SyncStatus::Error));
+async fn wait_cancel_or_expiry(cancel: &AtomicBool, expires: u64) {
+    while !cancel.load(Ordering::Relaxed) && now_ms() <= expires {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn runtime_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>, mode: TransportMode) {
+    match mode {
+        TransportMode::Ble => {
+            #[cfg(feature = "bluez")]
+            {
+                ble_host_loop(io, ctrl_rx).await;
+            }
+            #[cfg(not(feature = "bluez"))]
+            {
+                io.emit(SyncUiEvent::Error(
+                    "desktop built without bluez — use --sync-tcp or --initiator --connect".into(),
+                ));
+                io.emit(SyncUiEvent::Status(SyncStatus::Error));
+                idle_until_shutdown(io, ctrl_rx).await;
+            }
         }
-        SyncUiCommand::Revoke(id) => revoke_device(io, root, &id),
-        SyncUiCommand::Cancel => {
-            cancel.store(true, Ordering::SeqCst);
-            cancel.store(false, Ordering::SeqCst);
+        TransportMode::TcpHost(addr) => tcp_host_loop(io, ctrl_rx, addr).await,
+        TransportMode::TcpInitiator(addr) => tcp_initiator_loop(io, ctrl_rx, addr).await,
+    }
+}
+
+async fn idle_until_shutdown(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
+    loop {
+        match poll_ctrl(&ctrl_rx).await {
+            Control::Shutdown => {
+                emit_log(&io, "sync runtime stopped");
+                return;
+            }
+            Control::SetVault(_) => {}
         }
     }
 }
 
-async fn run_pairing(
+// --- TCP Host ----------------------------------------------------------------
+
+struct PendingPair {
+    code: String,
+    expires_at: u64,
+    attempts_left: u8,
+}
+
+async fn tcp_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>, bind: SocketAddr) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut root: Option<PathBuf> = None;
+    let mut pending: Option<PendingPair> = None;
+
+    let listener = match TcpListener::bind(bind).await {
+        Ok(l) => {
+            emit_log(&io, format!("TCP host listening on {bind}"));
+            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+            l
+        }
+        Err(e) => {
+            let msg = format!("TCP bind {bind}: {e}");
+            io.emit(SyncUiEvent::Error(msg.clone()));
+            io.emit(SyncUiEvent::Status(SyncStatus::Error));
+            emit_log(&io, msg);
+            idle_until_shutdown(io, ctrl_rx).await;
+            return;
+        }
+    };
+
+    io.emit(SyncUiEvent::Status(SyncStatus::Idle));
+
+    loop {
+        tokio::select! {
+            ctrl = poll_ctrl(&ctrl_rx) => {
+                match ctrl {
+                    Control::Shutdown => {
+                        emit_log(&io, "sync runtime stopped");
+                        return;
+                    }
+                    Control::SetVault(path) => {
+                        cancel.store(true, Ordering::SeqCst);
+                        cancel.store(false, Ordering::SeqCst);
+                        pending = None;
+                        root = path;
+                        if let Some(r) = &root {
+                            emit_log(&io, format!("vault {}", r.display()));
+                            emit_trusted(&io, r);
+                            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                        } else {
+                            io.emit(SyncUiEvent::Trusted(Vec::new()));
+                            io.emit(SyncUiEvent::Status(SyncStatus::Idle));
+                        }
+                    }
+                }
+            }
+            cmd = poll_cmd(&io.cmd_rx) => {
+                let Some(cmd) = cmd else { return };
+                let Some(r) = root.as_ref() else {
+                    io.emit(SyncUiEvent::Error("open a vault first".into()));
+                    continue;
+                };
+                match cmd {
+                    SyncUiCommand::ShowCode => {
+                        match host_session() {
+                            Ok(s) => {
+                                pending = Some(PendingPair {
+                                    code: s.code.clone(),
+                                    expires_at: s.expires_at,
+                                    attempts_left: s.attempts_left,
+                                });
+                                io.emit(SyncUiEvent::Status(SyncStatus::Pairing));
+                                io.emit(SyncUiEvent::Pairing {
+                                    code: s.code.clone(),
+                                    expires_at_ms: s.expires_at,
+                                    attempts_left: s.attempts_left,
+                                });
+                                emit_log(
+                                    &io,
+                                    format!(
+                                        "pairing code {} — Initiator should Join ({}s)",
+                                        s.code,
+                                        PAIRING_TTL_MS / 1000
+                                    ),
+                                );
+                            }
+                            Err(e) => io.emit(SyncUiEvent::Error(format!("pairing code: {e}"))),
+                        }
+                    }
+                    SyncUiCommand::Revoke(id) => revoke_device(&io, r, &id),
+                    SyncUiCommand::Cancel => {
+                        cancel.store(true, Ordering::SeqCst);
+                        cancel.store(false, Ordering::SeqCst);
+                        pending = None;
+                        io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                        emit_log(&io, "cancelled");
+                    }
+                    SyncUiCommand::Join(_) | SyncUiCommand::Sync => {
+                        io.emit(SyncUiEvent::Error(
+                            "this process is the Host — run Initiator with --initiator --connect"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            accept = listener.accept() => {
+                let Ok((stream, peer)) = accept else {
+                    continue;
+                };
+                let Some(r) = root.clone() else {
+                    emit_log(&io, format!("ignored connect from {peer} (no vault)"));
+                    continue;
+                };
+                let _ = stream.set_nodelay(true);
+                let mut transport = TcpTransport::new(stream);
+                emit_log(&io, format!("TCP peer {peer}"));
+
+                if let Some(mut p) = pending.take() {
+                    if now_ms() > p.expires_at {
+                        emit_log(&io, "pairing expired before accept");
+                        io.emit(SyncUiEvent::Error("pairing code expired".into()));
+                        io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                        continue;
+                    }
+                    let vault = match Vault::open(&r) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            io.emit(SyncUiEvent::Error(format!("open vault: {e}")));
+                            continue;
+                        }
+                    };
+                    io.emit(SyncUiEvent::Status(SyncStatus::Connecting));
+                    let ttl = p.expires_at.saturating_sub(now_ms()).max(1);
+                    let outcome = tokio::select! {
+                        result = host_accept(
+                            &mut transport,
+                            &vault,
+                            &p.code,
+                            p.expires_at,
+                            &mut p.attempts_left,
+                        ) => Some(result),
+                        _ = tokio::time::sleep(Duration::from_millis(ttl)) => None,
+                        _ = wait_cancel_or_expiry(&cancel, p.expires_at) => None,
+                    };
+                    match outcome {
+                        Some(Ok(device)) => {
+                            emit_log(
+                                &io,
+                                format!("paired {} ({})", device.name, device.device_id),
+                            );
+                            emit_trusted(&io, &r);
+                            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                        }
+                        Some(Err(e)) => {
+                            io.emit(SyncUiEvent::Pairing {
+                                code: p.code.clone(),
+                                expires_at_ms: p.expires_at,
+                                attempts_left: p.attempts_left,
+                            });
+                            pending = Some(p);
+                            io.emit(SyncUiEvent::Error(format!("pairing failed: {e}")));
+                            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                        }
+                        None => {
+                            emit_log(&io, "pairing cancelled or expired");
+                            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                        }
+                    }
+                    cancel.store(false, Ordering::SeqCst);
+                } else {
+                    io.emit(SyncUiEvent::Status(SyncStatus::Connecting));
+                    cancel.store(false, Ordering::SeqCst);
+                    let mut vault = match Vault::open(&r) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            io.emit(SyncUiEvent::Error(format!("open vault: {e}")));
+                            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                            continue;
+                        }
+                    };
+                    let unsaved = HashSet::new();
+                    let opts = SyncOptions {
+                        role: Role::Responder,
+                        unsaved: &unsaved,
+                        cancel: Some(cancel.as_ref()),
+                    };
+                    match run_sync(&mut transport, &mut vault, opts).await {
+                        Ok(()) => {
+                            emit_log(&io, "sync completed");
+                            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if msg.to_lowercase().contains("cancel") {
+                                emit_log(&io, "sync cancelled");
+                            } else {
+                                io.emit(SyncUiEvent::Error(msg.clone()));
+                                emit_log(&io, format!("sync error: {msg}"));
+                            }
+                            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                        }
+                    }
+                    cancel.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+}
+
+// --- TCP Initiator -----------------------------------------------------------
+
+async fn tcp_initiator_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>, connect: SocketAddr) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut root: Option<PathBuf> = None;
+
+    emit_log(&io, format!("TCP initiator → {connect}"));
+    io.emit(SyncUiEvent::Status(SyncStatus::Idle));
+
+    loop {
+        tokio::select! {
+            ctrl = poll_ctrl(&ctrl_rx) => {
+                match ctrl {
+                    Control::Shutdown => {
+                        emit_log(&io, "sync runtime stopped");
+                        return;
+                    }
+                    Control::SetVault(path) => {
+                        cancel.store(true, Ordering::SeqCst);
+                        cancel.store(false, Ordering::SeqCst);
+                        root = path;
+                        if let Some(r) = &root {
+                            emit_log(&io, format!("vault {}", r.display()));
+                            emit_trusted(&io, r);
+                            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                        } else {
+                            io.emit(SyncUiEvent::Trusted(Vec::new()));
+                            io.emit(SyncUiEvent::Status(SyncStatus::Idle));
+                        }
+                    }
+                }
+            }
+            cmd = poll_cmd(&io.cmd_rx) => {
+                let Some(cmd) = cmd else { return };
+                let Some(r) = root.clone() else {
+                    io.emit(SyncUiEvent::Error("open a vault first".into()));
+                    continue;
+                };
+                match cmd {
+                    SyncUiCommand::Join(code) => {
+                        cancel.store(false, Ordering::SeqCst);
+                        io.emit(SyncUiEvent::Status(SyncStatus::Pairing));
+                        emit_log(&io, format!("joining with code {code}…"));
+                        let mut transport = match TcpTransport::connect(connect).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                io.emit(SyncUiEvent::Error(format!("connect {connect}: {e}")));
+                                io.emit(SyncUiEvent::Status(SyncStatus::Error));
+                                continue;
+                            }
+                        };
+                        let vault = match Vault::open(&r) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                io.emit(SyncUiEvent::Error(format!("open vault: {e}")));
+                                continue;
+                            }
+                        };
+                        match join(&mut transport, &vault, &code).await {
+                            Ok(peer) => {
+                                emit_log(
+                                    &io,
+                                    format!("paired with {} ({})", peer.name, peer.device_id),
+                                );
+                                emit_trusted(&io, &r);
+                                io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                            }
+                            Err(e) => {
+                                io.emit(SyncUiEvent::Error(format!("join failed: {e}")));
+                                emit_log(&io, format!("join failed: {e}"));
+                                io.emit(SyncUiEvent::Status(SyncStatus::Error));
+                            }
+                        }
+                    }
+                    SyncUiCommand::Sync => {
+                        cancel.store(false, Ordering::SeqCst);
+                        io.emit(SyncUiEvent::Status(SyncStatus::Connecting));
+                        emit_log(&io, "sync (Initiator)…");
+                        let mut transport = match TcpTransport::connect(connect).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                io.emit(SyncUiEvent::Error(format!("connect {connect}: {e}")));
+                                io.emit(SyncUiEvent::Status(SyncStatus::Error));
+                                continue;
+                            }
+                        };
+                        let mut vault = match Vault::open(&r) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                io.emit(SyncUiEvent::Error(format!("open vault: {e}")));
+                                continue;
+                            }
+                        };
+                        let unsaved = HashSet::new();
+                        let opts = SyncOptions {
+                            role: Role::Initiator,
+                            unsaved: &unsaved,
+                            cancel: Some(cancel.as_ref()),
+                        };
+                        match run_sync(&mut transport, &mut vault, opts).await {
+                            Ok(()) => {
+                                emit_log(&io, "sync completed");
+                                io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                            }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                io.emit(SyncUiEvent::Error(msg.clone()));
+                                emit_log(&io, format!("sync error: {msg}"));
+                                io.emit(SyncUiEvent::Status(SyncStatus::Error));
+                            }
+                        }
+                        cancel.store(false, Ordering::SeqCst);
+                    }
+                    SyncUiCommand::Revoke(id) => revoke_device(&io, &r, &id),
+                    SyncUiCommand::Cancel => {
+                        cancel.store(true, Ordering::SeqCst);
+                        cancel.store(false, Ordering::SeqCst);
+                        emit_log(&io, "cancelled");
+                        io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+                    }
+                    SyncUiCommand::ShowCode => {
+                        io.emit(SyncUiEvent::Error(
+                            "Initiator cannot Show code — use the Host window".into(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --- BLE Host (existing path) ------------------------------------------------
+
+#[cfg(feature = "bluez")]
+async fn start_ble(io: &SyncRuntimeIo) -> Result<BluezPeripheral, String> {
+    emit_log(io, "starting BlueZ peripheral…");
+    BluezPeripheral::start(BluezPeripheralConfig {
+        local_name: "BlueLink".into(),
+        pairing_open: false,
+    })
+    .await
+    .map_err(|e| format!("BLE adapter unavailable: {e}"))
+}
+
+#[cfg(feature = "bluez")]
+struct BleSession {
+    root: PathBuf,
+    peripheral: Option<BluezPeripheral>,
+    ble_failed: bool,
+}
+
+#[cfg(feature = "bluez")]
+async fn apply_vault_ble(
+    io: &SyncRuntimeIo,
+    path: Option<PathBuf>,
+    cancel: &AtomicBool,
+) -> Option<BleSession> {
+    cancel.store(true, Ordering::SeqCst);
+    cancel.store(false, Ordering::SeqCst);
+
+    let Some(root) = path else {
+        io.emit(SyncUiEvent::Status(SyncStatus::Idle));
+        io.emit(SyncUiEvent::Trusted(Vec::new()));
+        return None;
+    };
+
+    emit_log(io, format!("vault {}", root.display()));
+    emit_trusted(io, &root);
+
+    match start_ble(io).await {
+        Ok(p) => {
+            io.emit(SyncUiEvent::Status(SyncStatus::Waiting));
+            emit_log(io, "BLE advertising (waiting for peer)");
+            Some(BleSession {
+                root,
+                peripheral: Some(p),
+                ble_failed: false,
+            })
+        }
+        Err(msg) => {
+            io.emit(SyncUiEvent::Error(msg.clone()));
+            io.emit(SyncUiEvent::Status(SyncStatus::Error));
+            emit_log(io, format!("{msg} — tip: --sync-tcp 127.0.0.1:7878"));
+            Some(BleSession {
+                root,
+                peripheral: None,
+                ble_failed: true,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "bluez")]
+async fn run_pairing_ble(
     io: &SyncRuntimeIo,
     peri: &mut BluezPeripheral,
     root: &Path,
@@ -283,13 +668,8 @@ async fn run_pairing(
     cancel.store(false, Ordering::SeqCst);
 }
 
-async fn wait_cancel_or_expiry(cancel: &AtomicBool, expires: u64) {
-    while !cancel.load(Ordering::Relaxed) && now_ms() <= expires {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn run_responder(
+#[cfg(feature = "bluez")]
+async fn run_responder_ble(
     peri: &mut BluezPeripheral,
     root: &Path,
     cancel: &Arc<AtomicBool>,
@@ -307,9 +687,10 @@ async fn run_responder(
         .map_err(|e| e.to_string())
 }
 
-async fn runtime_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
+#[cfg(feature = "bluez")]
+async fn ble_host_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut session: Option<Session> = None;
+    let mut session: Option<BleSession> = None;
 
     io.emit(SyncUiEvent::Status(SyncStatus::Idle));
 
@@ -323,7 +704,7 @@ async fn runtime_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                             return;
                         }
                         Control::SetVault(path) => {
-                            session = apply_vault(&io, path, &cancel).await;
+                            session = apply_vault_ble(&io, path, &cancel).await;
                         }
                     }
                 }
@@ -348,13 +729,30 @@ async fn runtime_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                     match ctrl {
                         Control::Shutdown => return,
                         Control::SetVault(path) => {
-                            session = apply_vault(&io, path, &cancel).await;
+                            session = apply_vault_ble(&io, path, &cancel).await;
                         }
                     }
                 }
                 cmd = poll_cmd(&io.cmd_rx) => {
                     let Some(cmd) = cmd else { return };
-                    handle_cmd_no_ble(&io, &sess.root, cmd, &cancel);
+                    match cmd {
+                        SyncUiCommand::ShowCode => {
+                            io.emit(SyncUiEvent::Error(
+                                "BLE adapter unavailable — cannot show pairing code".into(),
+                            ));
+                            io.emit(SyncUiEvent::Status(SyncStatus::Error));
+                        }
+                        SyncUiCommand::Revoke(id) => revoke_device(&io, &sess.root, &id),
+                        SyncUiCommand::Cancel => {
+                            cancel.store(true, Ordering::SeqCst);
+                            cancel.store(false, Ordering::SeqCst);
+                        }
+                        SyncUiCommand::Join(_) | SyncUiCommand::Sync => {
+                            io.emit(SyncUiEvent::Error(
+                                "BLE host cannot Join/Sync — use --initiator --connect".into(),
+                            ));
+                        }
+                    }
                 }
             }
             continue;
@@ -372,7 +770,7 @@ async fn runtime_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                     }
                     Control::SetVault(path) => {
                         cancel.store(true, Ordering::SeqCst);
-                        session = apply_vault(&io, path, &cancel).await;
+                        session = apply_vault_ble(&io, path, &cancel).await;
                     }
                 }
             }
@@ -380,12 +778,8 @@ async fn runtime_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                 let Some(cmd) = cmd else { return };
                 match cmd {
                     SyncUiCommand::ShowCode => {
-                        cancel.store(true, Ordering::SeqCst);
-                        // Drop in-flight responder wait by falling through after cancel;
-                        // ShowCode runs pairing on the same peripheral next iteration…
-                        // Run pairing immediately instead:
                         cancel.store(false, Ordering::SeqCst);
-                        run_pairing(&io, peri, &root, &cancel).await;
+                        run_pairing_ble(&io, peri, &root, &cancel).await;
                     }
                     SyncUiCommand::Revoke(id) => {
                         revoke_device(&io, &root, &id);
@@ -394,9 +788,14 @@ async fn runtime_loop(io: SyncRuntimeIo, ctrl_rx: Receiver<Control>) {
                         cancel.store(true, Ordering::SeqCst);
                         cancel.store(false, Ordering::SeqCst);
                     }
+                    SyncUiCommand::Join(_) | SyncUiCommand::Sync => {
+                        io.emit(SyncUiEvent::Error(
+                            "BLE host cannot Join/Sync — use --initiator --connect".into(),
+                        ));
+                    }
                 }
             }
-            result = run_responder(peri, &root, &cancel) => {
+            result = run_responder_ble(peri, &root, &cancel) => {
                 match result {
                     Ok(()) => {
                         emit_log(&io, "sync completed");

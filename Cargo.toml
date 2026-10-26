@@ -34,7 +34,7 @@ egui = "0.31"
 egui-phosphor = "0.9"
 rfd = "0.15"
 notify = "7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "signal", "net"] }
 async-trait = "0.1"
 bytes = "1"
 spake2 = "0.4"

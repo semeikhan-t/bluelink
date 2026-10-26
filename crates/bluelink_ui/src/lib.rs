@@ -31,8 +31,6 @@ use egui_phosphor::regular;
 use vault_registry::{validate_vault_name, VaultRegistry};
 
 enum Dialog {
-    NewNote { name: String },
-    NewFolder { name: String },
     NewVault { name: String },
     CreateLink { rel_path: String, new_tab: bool },
     /// Dirty buffer vs newer on-disk content — Reload discards, Keep keeps local.
@@ -865,44 +863,28 @@ impl App {
 
     /// Next free `untitled.md` / `untitled1.md` / `untitled2.md` …
     fn next_untitled_rel(&self) -> String {
-        let taken = |stem: &str| {
+        let stem = next_available_name("untitled", |stem| {
             let path = format!("{stem}.md");
             self.notes.iter().any(|n| n.rel_path == path)
                 || self
                     .open_tabs
                     .iter()
                     .any(|t| t.note_path() == Some(path.as_str()))
-        };
-        if !taken("untitled") {
-            return "untitled.md".into();
-        }
-        for i in 1..10_000 {
-            let stem = format!("untitled{i}");
-            if !taken(&stem) {
-                return format!("{stem}.md");
-            }
-        }
-        "untitled.md".into()
+        });
+        format!("{stem}.md")
     }
 
-    /// Ctrl+T: create untitled note and open it in a new tab (no name dialog).
-    fn create_untitled_tab(&mut self) {
+    fn next_inbox_rel(&self) -> String {
+        next_available_name("inbox", |candidate| {
+            self.folders.iter().any(|folder| folder == candidate)
+        })
+    }
+
+    /// Create an untitled note immediately. Ctrl+T opens it in a new tab.
+    fn create_untitled_note(&mut self, new_tab: bool) {
         let path = self.next_untitled_rel();
         let title = path.trim_end_matches(".md");
-        if self.dirty {
-            self.save_current();
-        }
-        let Some(vault) = self.vault.as_mut() else {
-            return;
-        };
-        match vault.write(&path, &format!("# {title}\n")) {
-            Ok(_) => {
-                self.refresh_notes();
-                self.open_note_in_new_tab(&path);
-                self.status = format!("created {path}");
-            }
-            Err(e) => self.status = format!("create failed: {e}"),
-        }
+        self.create_note(&path, &format!("# {title}\n"), new_tab);
     }
 
     fn open_quick_switcher(&mut self) {
@@ -1615,50 +1597,11 @@ impl App {
     fn show_dialogs(&mut self, ctx: &egui::Context) {
         let mut close = false;
         let mut confirm_create: Option<(String, bool)> = None;
-        let mut confirm_new: Option<String> = None;
-
         let mut confirm_vault: Option<String> = None;
-        let mut confirm_folder: Option<String> = None;
         let mut confirm_reload: Option<(String, String)> = None;
         let mut confirm_keep: Option<String> = None;
 
         match &mut self.dialog {
-            Some(Dialog::NewNote { name }) => {
-                egui::Window::new("New note")
-                    .collapsible(false)
-                    .resizable(false)
-                    .show(ctx, |ui| {
-                        ui.label("Name (e.g. inbox/idea) — .md is added automatically:");
-                        ui.text_edit_singleline(name);
-                        ui.horizontal(|ui| {
-                            if ui.button("Create").clicked() {
-                                confirm_new = Some(name.clone());
-                                close = true;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                close = true;
-                            }
-                        });
-                    });
-            }
-            Some(Dialog::NewFolder { name }) => {
-                egui::Window::new("New folder")
-                    .collapsible(false)
-                    .resizable(false)
-                    .show(ctx, |ui| {
-                        ui.label("Name (e.g. inbox or projects/work):");
-                        ui.text_edit_singleline(name);
-                        ui.horizontal(|ui| {
-                            if ui.button("Create").clicked() {
-                                confirm_folder = Some(name.clone());
-                                close = true;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                close = true;
-                            }
-                        });
-                    });
-            }
             Some(Dialog::NewVault { name }) => {
                 egui::Window::new("New vault")
                     .collapsible(false)
@@ -1732,21 +1675,8 @@ impl App {
                 .unwrap_or("Note");
             self.create_note(&path, &format!("# {title}\n"), new_tab);
         }
-        if let Some(name) = confirm_new {
-            let path = normalize_note_path(&name);
-            let title = path
-                .trim_end_matches(".md")
-                .rsplit('/')
-                .next()
-                .unwrap_or("Note");
-            self.create_note(&path, &format!("# {title}\n"), false);
-        }
         if let Some(name) = confirm_vault {
             self.create_named_vault(&name);
-        }
-        if let Some(name) = confirm_folder {
-            let rel = name.trim().trim_matches('/').to_string();
-            self.create_folder(&rel);
         }
         if let Some((path, disk_sha)) = confirm_reload {
             // Only reload if this note is still selected (user may have switched tabs).
@@ -1816,7 +1746,7 @@ impl eframe::App for App {
             self.save_current();
         }
         if new_note && self.vault.is_some() && self.dialog.is_none() {
-            self.create_untitled_tab();
+            self.create_untitled_note(true);
         }
         if close_tab {
             if let Some(i) = self.active_tab {
@@ -1966,14 +1896,11 @@ impl eframe::App for App {
                         self.open_note_in_new_tab(&path);
                     }
                     if action.new_note {
-                        self.dialog = Some(Dialog::NewNote {
-                            name: "untitled".into(),
-                        });
+                        self.create_untitled_note(false);
                     }
                     if action.new_folder {
-                        self.dialog = Some(Dialog::NewFolder {
-                            name: "inbox".into(),
-                        });
+                        let path = self.next_inbox_rel();
+                        self.create_folder(&path);
                     }
                     if let Some(path) = action.start_rename {
                         let is_folder = self.folders.iter().any(|f| f == &path);
@@ -2348,6 +2275,20 @@ fn normalize_note_path(input: &str) -> String {
     }
 }
 
+fn next_available_name(base: &str, mut is_taken: impl FnMut(&str) -> bool) -> String {
+    for index in 0_u64.. {
+        let candidate = if index == 0 {
+            base.to_string()
+        } else {
+            format!("{base}{index}")
+        };
+        if !is_taken(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("u64 name suffixes are exhausted")
+}
+
 /// First line in `source` whose wikilink resolves to `target` (cheap backlink snippet).
 fn backlink_snippet(
     content: &str,
@@ -2399,6 +2340,30 @@ fn should_prompt_external_conflict(
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod automatic_name_tests {
+    use super::next_available_name;
+
+    #[test]
+    fn starts_with_base_and_uses_the_next_available_number() {
+        assert_eq!(next_available_name("untitled", |_| false), "untitled");
+        assert_eq!(
+            next_available_name("inbox", |candidate| candidate == "inbox" || candidate == "inbox1"),
+            "inbox2"
+        );
+        assert_eq!(
+            next_available_name("folder", |candidate| {
+                candidate == "folder"
+                    || candidate
+                        .strip_prefix("folder")
+                        .and_then(|suffix| suffix.parse::<u32>().ok())
+                        .is_some_and(|index| index < 10_000)
+            }),
+            "folder10000"
+        );
+    }
 }
 
 #[cfg(test)]

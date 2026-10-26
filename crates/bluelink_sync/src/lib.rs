@@ -16,7 +16,7 @@ pub use pairing::{generate_code, host_accept, host_session, join, HostSessionInf
 pub use plan::{build_plan, Action};
 pub use session::{run_sync, Role, SyncOptions};
 pub use sync_state::SyncState;
-pub use transport::{Loopback, Transport, MAX_FRAME_BYTES};
+pub use transport::{Loopback, TcpTransport, Transport, MAX_FRAME_BYTES};
 pub use trust::{TrustStore, TrustedDevice};
 
 pub use bluelink_core;

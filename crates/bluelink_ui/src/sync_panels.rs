@@ -1,6 +1,7 @@
-//! Devices + Sync screens (desktop Responder UI).
+//! Devices + Sync screens.
 //!
-//! Phone initiates sync — no Sync button here. Android Initiator hooks later.
+//! Host (BLE / `--sync-tcp`): Show code; peer initiates sync.
+//! Initiator (`--initiator --connect`): Join with code + Sync button (TCP demo / Android later).
 
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -41,6 +42,8 @@ pub struct SyncPanelState {
     pairing: Option<PairingUi>,
     log: VecDeque<LogEntry>,
     last_error: Option<String>,
+    /// Initiator: draft 6-digit code for Join.
+    pub join_code: String,
 }
 
 impl SyncPanelState {
@@ -149,6 +152,8 @@ pub fn show_devices(
 ) {
     state.tick_pairing();
 
+    let initiator = handle.map(|h| h.is_initiator()).unwrap_or(false);
+
     ui.label(
         egui::RichText::new("Devices")
             .size(22.0)
@@ -156,44 +161,84 @@ pub fn show_devices(
             .color(theme::TEXT),
     );
     ui.label(
-        egui::RichText::new("Pair a phone with a 6-digit code. Desktop waits; the phone joins.")
-            .size(13.0)
-            .color(theme::WEAK),
+        egui::RichText::new(if initiator {
+            "Enter the Host pairing code, then Join. Sync from the Sync screen."
+        } else {
+            "Show a 6-digit code; the other device Joins (phone or --initiator)."
+        })
+        .size(13.0)
+        .color(theme::WEAK),
     );
     ui.add_space(12.0);
 
     let runtime_ok = handle.is_some();
-    ui.horizontal(|ui| {
-        let show = ui.add_enabled(
-            runtime_ok,
-            egui::Button::new(format!("{}  Show code", regular::KEY)).min_size(egui::vec2(0.0, 36.0)),
-        );
-        if show.clicked() {
-            if let Some(h) = handle {
-                h.send(SyncUiCommand::ShowCode);
+    if initiator {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Code")
+                    .size(13.0)
+                    .color(theme::WEAK),
+            );
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut state.join_code)
+                    .desired_width(100.0)
+                    .char_limit(6)
+                    .hint_text("000000"),
+            );
+            if edit.changed() {
+                state.join_code.retain(|c| c.is_ascii_digit());
             }
-        }
-        if state.pairing.is_some() {
-            let cancel = ui.add_enabled(
+            let join = ui.add_enabled(
+                runtime_ok && state.join_code.len() == 6,
+                egui::Button::new(format!("{}  Join", regular::KEY)).min_size(egui::vec2(0.0, 36.0)),
+            );
+            if join.clicked() {
+                if let Some(h) = handle {
+                    h.send(SyncUiCommand::Join(state.join_code.clone()));
+                }
+            }
+            if !runtime_ok {
+                ui.label(
+                    egui::RichText::new("Sync runtime unavailable")
+                        .size(13.0)
+                        .color(theme::WARN),
+                );
+            }
+        });
+    } else {
+        ui.horizontal(|ui| {
+            let show = ui.add_enabled(
                 runtime_ok,
-                egui::Button::new(format!("{}  Cancel", regular::X_CIRCLE))
+                egui::Button::new(format!("{}  Show code", regular::KEY))
                     .min_size(egui::vec2(0.0, 36.0)),
             );
-            if cancel.clicked() {
+            if show.clicked() {
                 if let Some(h) = handle {
-                    h.send(SyncUiCommand::Cancel);
+                    h.send(SyncUiCommand::ShowCode);
                 }
-                state.pairing = None;
             }
-        }
-        if !runtime_ok {
-            ui.label(
-                egui::RichText::new("Sync runtime unavailable")
-                    .size(13.0)
-                    .color(theme::WARN),
-            );
-        }
-    });
+            if state.pairing.is_some() {
+                let cancel = ui.add_enabled(
+                    runtime_ok,
+                    egui::Button::new(format!("{}  Cancel", regular::X_CIRCLE))
+                        .min_size(egui::vec2(0.0, 36.0)),
+                );
+                if cancel.clicked() {
+                    if let Some(h) = handle {
+                        h.send(SyncUiCommand::Cancel);
+                    }
+                    state.pairing = None;
+                }
+            }
+            if !runtime_ok {
+                ui.label(
+                    egui::RichText::new("Sync runtime unavailable")
+                        .size(13.0)
+                        .color(theme::WARN),
+                );
+            }
+        });
+    }
 
     if let Some(p) = &state.pairing {
         let now = now_ms();
@@ -303,10 +348,12 @@ pub fn show_devices(
 pub fn show_sync(
     ui: &mut egui::Ui,
     state: &mut SyncPanelState,
-    _handle: Option<&SyncUiHandle>,
+    handle: Option<&SyncUiHandle>,
     format_hhmm: impl Fn(u64) -> String,
 ) {
     state.tick_pairing();
+
+    let initiator = handle.map(|h| h.is_initiator()).unwrap_or(false);
 
     ui.label(
         egui::RichText::new("Sync")
@@ -315,13 +362,41 @@ pub fn show_sync(
             .color(theme::TEXT),
     );
     ui.label(
-        egui::RichText::new("Desktop is the Responder — start sync from the phone.")
-            .size(13.0)
-            .color(theme::WEAK),
+        egui::RichText::new(if initiator {
+            "This window initiates sync over TCP. Pair on Devices first."
+        } else {
+            "This window waits (Responder). Start sync from Initiator / phone."
+        })
+        .size(13.0)
+        .color(theme::WEAK),
     );
-    // Android Initiator: add Sync / Cancel buttons here (SyncUiCommand not needed for
-    // desktop ShowCode path; phone would call run_sync as Initiator).
     ui.add_space(12.0);
+
+    if initiator {
+        ui.horizontal(|ui| {
+            let sync = ui.add_enabled(
+                handle.is_some(),
+                egui::Button::new(format!("{}  Synchronize", regular::ARROWS_CLOCKWISE))
+                    .min_size(egui::vec2(0.0, 36.0)),
+            );
+            if sync.clicked() {
+                if let Some(h) = handle {
+                    h.send(SyncUiCommand::Sync);
+                }
+            }
+            let cancel = ui.add_enabled(
+                handle.is_some(),
+                egui::Button::new(format!("{}  Cancel", regular::X_CIRCLE))
+                    .min_size(egui::vec2(0.0, 36.0)),
+            );
+            if cancel.clicked() {
+                if let Some(h) = handle {
+                    h.send(SyncUiCommand::Cancel);
+                }
+            }
+        });
+        ui.add_space(12.0);
+    }
 
     let (icon, color) = match state.status {
         SyncStatus::Idle => (regular::CIRCLE, theme::WEAK),

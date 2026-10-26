@@ -8,10 +8,26 @@ Stages 1–4 done: vault core, desktop UI, sync on Loopback, BlueZ GATT peripher
 
 ```bash
 cargo test --workspace
-cargo run -p desktop -- --vault ~/BlueLinkDemo
+cargo run -p desktop --features bluez -- --vault ~/BlueLinkDemo
 ```
 
 Without `--vault`, use **Open vault** in the start screen.
+
+### TCP Host ↔ Initiator demo (no Android / no BLE)
+
+Two vaults, two terminals — full pairing + sync over localhost:
+
+```bash
+# Host (shows code, waits for sync)
+cargo run -p desktop -- --vault ~/BlueLinkHost --sync-tcp 127.0.0.1:7878
+
+# Initiator (Join with code, then Synchronize)
+cargo run -p desktop -- --vault ~/BlueLinkPhone --initiator --connect 127.0.0.1:7878
+```
+
+1. Host → **Devices** → **Show code**  
+2. Initiator → **Devices** → enter code → **Join**  
+3. Edit a note on either side → Initiator → **Sync** → **Synchronize**
 
 ## BLE peripheral spike (Linux / BlueZ)
 
