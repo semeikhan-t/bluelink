@@ -172,6 +172,18 @@ pub fn show_popup(ctx: &egui::Context) -> Option<(CtxMenu, EditorAction)> {
                                     after: "`",
                                 });
                             }
+                            if row(ui, regular::TEXT_STRIKETHROUGH, "Strikethrough", false) {
+                                action = Some(EditorAction::Wrap {
+                                    before: "~~",
+                                    after: "~~",
+                                });
+                            }
+                            if row(ui, regular::HIGHLIGHTER, "Highlight", false) {
+                                action = Some(EditorAction::Wrap {
+                                    before: "==",
+                                    after: "==",
+                                });
+                            }
                         }
                         SubMenu::Paragraph => {
                             if row(ui, regular::TEXT_T, "Plain text", false) {
@@ -185,6 +197,15 @@ pub fn show_popup(ctx: &egui::Context) -> Option<(CtxMenu, EditorAction)> {
                             }
                             if row(ui, regular::TEXT_H_THREE, "Heading 3", false) {
                                 action = Some(EditorAction::SetLinePrefix("### "));
+                            }
+                            if row(ui, regular::TEXT_H_FOUR, "Heading 4", false) {
+                                action = Some(EditorAction::SetLinePrefix("#### "));
+                            }
+                            if row(ui, regular::TEXT_H_FIVE, "Heading 5", false) {
+                                action = Some(EditorAction::SetLinePrefix("##### "));
+                            }
+                            if row(ui, regular::TEXT_H_SIX, "Heading 6", false) {
+                                action = Some(EditorAction::SetLinePrefix("###### "));
                             }
                             if row(ui, regular::TEXT_AA, "Quote", false) {
                                 action = Some(EditorAction::SetLinePrefix("> "));

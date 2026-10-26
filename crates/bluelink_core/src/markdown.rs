@@ -22,6 +22,10 @@ pub enum Span {
     Text(String),
     Strong(String),
     Emphasis(String),
+    Strike(String),
+    Highlight(String),
+    /// Inline TeX from `$...$` (not `$$` blocks).
+    InlineMath { formula: String },
     Code(String),
     Link { text: String, dest: String },
     WikiLink { raw: String, alias: Option<String> },
@@ -115,6 +119,7 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
 
     let mut strong_buf: Option<String> = None;
     let mut em_buf: Option<String> = None;
+    let mut strike_buf: Option<String> = None;
     let mut pending_link_dest: Option<String> = None;
     let mut pending_image_dest: Option<String> = None;
     let mut image_alt_buf: Option<String> = None;
@@ -137,7 +142,14 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
             return;
         }
         for piece in split_wikilinks(&text) {
-            push_span(para, quote, item, heading, false, piece);
+            match piece {
+                Span::Text(t) => {
+                    for mark in split_inline_marks(&t) {
+                        push_span(para, quote, item, heading, false, mark);
+                    }
+                }
+                other => push_span(para, quote, item, heading, false, other),
+            }
         }
     };
 
@@ -347,6 +359,29 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
                     );
                 }
             }
+            Event::Start(Tag::Strikethrough) => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    heading_level.is_some(),
+                );
+                strike_buf = Some(String::new());
+            }
+            Event::End(TagEnd::Strikethrough) => {
+                if let Some(text) = strike_buf.take() {
+                    push_span(
+                        &mut para_spans,
+                        &mut quote_spans,
+                        &mut list_item_spans,
+                        &mut heading_text,
+                        heading_level.is_some(),
+                        Span::Strike(text),
+                    );
+                }
+            }
             Event::Code(code) => {
                 flush_text(
                     &mut pending_text,
@@ -426,15 +461,27 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
                     code_buf.push_str(&s);
                 } else if let Some(buf) = image_alt_buf.as_mut() {
                     buf.push_str(&s);
-                } else if let Some(buf) = strong_buf.as_mut().or(em_buf.as_mut()) {
+                } else if let Some(buf) = strike_buf
+                    .as_mut()
+                    .or(strong_buf.as_mut())
+                    .or(em_buf.as_mut())
+                {
                     buf.push_str(&s);
                 } else {
                     pending_text.push_str(&s);
                 }
             }
             Event::SoftBreak | Event::HardBreak => {
-                if heading_level.is_some() || strong_buf.is_some() || em_buf.is_some() {
-                    if let Some(buf) = strong_buf.as_mut().or(em_buf.as_mut()) {
+                if heading_level.is_some()
+                    || strong_buf.is_some()
+                    || em_buf.is_some()
+                    || strike_buf.is_some()
+                {
+                    if let Some(buf) = strike_buf
+                        .as_mut()
+                        .or(strong_buf.as_mut())
+                        .or(em_buf.as_mut())
+                    {
                         buf.push(' ');
                     } else {
                         pending_text.push(' ');
@@ -468,8 +515,15 @@ fn push_span(
     span: Span,
 ) {
     if in_heading {
-        if let Span::Text(t) | Span::Strong(t) | Span::Emphasis(t) | Span::Code(t) = &span {
-            heading.push_str(t);
+        match &span {
+            Span::Text(t)
+            | Span::Strong(t)
+            | Span::Emphasis(t)
+            | Span::Strike(t)
+            | Span::Highlight(t)
+            | Span::Code(t) => heading.push_str(t),
+            Span::InlineMath { formula } => heading.push_str(formula),
+            _ => {}
         }
         return;
     }
@@ -480,6 +534,97 @@ fn push_span(
     } else if let Some(spans) = para.as_mut() {
         spans.push(span);
     }
+}
+
+/// Split plain text into highlight / inline math / text; `%%…%%` comments are dropped.
+fn split_inline_marks(text: &str) -> Vec<Span> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut last = 0;
+    while i < bytes.len() {
+        // `%%…%%` — omit from preview
+        if i + 1 < bytes.len() && bytes[i] == b'%' && bytes[i + 1] == b'%' {
+            if let Some(end) = find_close(bytes, i + 2, b"%%") {
+                if last < i {
+                    out.push(Span::Text(text[last..i].to_string()));
+                }
+                i = end + 2;
+                last = i;
+                continue;
+            }
+        }
+        // `==…==` highlight
+        if i + 1 < bytes.len() && bytes[i] == b'=' && bytes[i + 1] == b'=' {
+            if let Some(end) = find_close(bytes, i + 2, b"==") {
+                if end > i + 2 {
+                    if last < i {
+                        out.push(Span::Text(text[last..i].to_string()));
+                    }
+                    out.push(Span::Highlight(text[i + 2..end].to_string()));
+                    i = end + 2;
+                    last = i;
+                    continue;
+                }
+            }
+        }
+        // `$…$` inline math (not `$$`)
+        if bytes[i] == b'$' && (i + 1 >= bytes.len() || bytes[i + 1] != b'$') {
+            if let Some(end) = find_dollar_close(bytes, i + 1) {
+                if end > i + 1 {
+                    if last < i {
+                        out.push(Span::Text(text[last..i].to_string()));
+                    }
+                    out.push(Span::InlineMath {
+                        formula: text[i + 1..end].to_string(),
+                    });
+                    i = end + 1;
+                    last = i;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if last < text.len() {
+        out.push(Span::Text(text[last..].to_string()));
+    }
+    if out.is_empty() {
+        out.push(Span::Text(text.to_string()));
+    }
+    out
+}
+
+fn find_close(bytes: &[u8], from: usize, delim: &[u8]) -> Option<usize> {
+    let d0 = delim[0];
+    let d1 = delim[1];
+    let mut j = from;
+    while j + 1 < bytes.len() {
+        if bytes[j] == d0 && bytes[j + 1] == d1 {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
+}
+
+fn find_dollar_close(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut j = from;
+    while j < bytes.len() {
+        if bytes[j] == b'$' {
+            // Don't treat `$$` as a closer for inline math.
+            if j + 1 < bytes.len() && bytes[j + 1] == b'$' {
+                return None;
+            }
+            return Some(j);
+        }
+        // Stop at newline — inline only.
+        if bytes[j] == b'\n' {
+            return None;
+        }
+        j += 1;
+    }
+    None
 }
 
 /// Split plain text into `Text` / `WikiLink` / `Embed` spans.
@@ -750,5 +895,66 @@ mod tests {
             &spans[..],
             [Span::WikiLink { raw, alias: None }] if raw == "attachments/x.png"
         ));
+    }
+
+    fn para_spans(doc: &PreviewDoc) -> Vec<Span> {
+        doc.blocks
+            .iter()
+            .find_map(|b| match b {
+                PreviewBlock::Paragraph { spans } => Some(spans.clone()),
+                _ => None,
+            })
+            .expect("paragraph")
+    }
+
+    #[test]
+    fn parses_strikethrough() {
+        let spans = para_spans(&parse_preview("a ~~gone~~ b"));
+        assert!(
+            spans
+                .iter()
+                .any(|s| matches!(s, Span::Strike(t) if t == "gone")),
+            "spans={spans:?}"
+        );
+    }
+
+    #[test]
+    fn parses_highlight() {
+        let spans = para_spans(&parse_preview("see ==hot== now"));
+        assert!(
+            spans.iter().any(|s| matches!(s, Span::Highlight(t) if t == "hot")),
+            "spans={spans:?}"
+        );
+    }
+
+    #[test]
+    fn comment_omitted_from_preview() {
+        let spans = para_spans(&parse_preview("keep %%secret%% visible"));
+        assert!(
+            !spans.iter().any(|s| matches!(s, Span::Text(t) if t.contains("secret"))),
+            "spans={spans:?}"
+        );
+        assert!(
+            spans.iter().any(|s| matches!(s, Span::Text(t) if t.contains("keep"))),
+            "spans={spans:?}"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| matches!(s, Span::Text(t) if t.contains("visible"))),
+            "spans={spans:?}"
+        );
+    }
+
+    #[test]
+    fn parses_inline_math() {
+        let spans = para_spans(&parse_preview("e = $mc^2$ end"));
+        assert!(
+            spans.iter().any(|s| matches!(
+                s,
+                Span::InlineMath { formula } if formula == "mc^2"
+            )),
+            "spans={spans:?}"
+        );
     }
 }

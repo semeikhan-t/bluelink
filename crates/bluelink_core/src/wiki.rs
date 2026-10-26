@@ -1,5 +1,139 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::frontmatter::aliases_from_frontmatter;
+
+/// Heading text or `^id` after `#` in a wiki link body (`Note#H|a` → `H`).
+pub fn link_fragment(raw: &str) -> Option<String> {
+    let without_alias = raw.split('|').next().unwrap_or(raw);
+    let frag = without_alias.split_once('#')?.1.trim();
+    if frag.is_empty() {
+        None
+    } else {
+        Some(frag.to_string())
+    }
+}
+
+/// 0-based line of an ATX heading whose title equals `heading` (ASCII case-insensitive).
+pub fn heading_line(text: &str, heading: &str) -> Option<usize> {
+    for (i, line) in text.lines().enumerate() {
+        let Some(title) = atx_heading_title(line) else {
+            continue;
+        };
+        if title.eq_ignore_ascii_case(heading) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// 0-based line of a block id (`^id` alone or trailing). `id` may include the `^`.
+pub fn block_line(text: &str, id: &str) -> Option<usize> {
+    let needle = if id.starts_with('^') {
+        id.to_string()
+    } else {
+        format!("^{id}")
+    };
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim_end();
+        if t == needle || t.ends_with(&format!(" {needle}")) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Rewrite `#old` → `#new` on wiki links whose target is `note_stem` (or empty `[[#old]]`).
+pub fn rewrite_heading_links(content: &str, note_stem: &str, old: &str, new: &str) -> String {
+    if old == new {
+        return content.to_string();
+    }
+    let bytes = content.as_bytes();
+    let mut out = String::with_capacity(content.len());
+    let mut i = 0;
+    let mut last = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            let start = i + 2;
+            let mut j = start;
+            while j + 1 < bytes.len() {
+                if bytes[j] == b']' && bytes[j + 1] == b']' {
+                    out.push_str(&content[last..i]);
+                    let body = &content[start..j];
+                    let trimmed = body.trim();
+                    let replacement = rewrite_heading_in_body(trimmed, note_stem, old, new);
+                    out.push_str("[[");
+                    out.push_str(replacement.as_deref().unwrap_or(body));
+                    out.push_str("]]");
+                    i = j + 2;
+                    last = i;
+                    break;
+                }
+                j += 1;
+            }
+            if j + 1 >= bytes.len() {
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&content[last..]);
+    out
+}
+
+fn atx_heading_title(line: &str) -> Option<&str> {
+    let t = line.trim();
+    if !t.starts_with('#') {
+        return None;
+    }
+    let after_hashes = t.trim_start_matches('#');
+    let level = t.len() - after_hashes.len();
+    if level < 1 || level > 6 {
+        return None;
+    }
+    let title = after_hashes.trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+fn rewrite_heading_in_body(body: &str, note_stem: &str, old: &str, new: &str) -> Option<String> {
+    let (before_alias, alias) = match body.split_once('|') {
+        Some((path_heading, alias)) => (path_heading, Some(alias)),
+        None => (body, None),
+    };
+    let hash = before_alias.find('#')?;
+    let target = before_alias[..hash].trim();
+    let heading = before_alias[hash + 1..].trim();
+    if !heading.eq_ignore_ascii_case(old) {
+        return None;
+    }
+    if !target_matches_stem(target, note_stem) {
+        return None;
+    }
+    let mut out = String::new();
+    out.push_str(target);
+    out.push('#');
+    out.push_str(new);
+    if let Some(a) = alias {
+        out.push('|');
+        out.push_str(a);
+    }
+    Some(out)
+}
+
+fn target_matches_stem(target: &str, note_stem: &str) -> bool {
+    // Empty target: `[[#heading]]` same-note form (rewritten in every scanned file; ponytail).
+    if target.is_empty() {
+        return true;
+    }
+    let t = normalize_path_separators(target);
+    let t = strip_md_suffix(&t);
+    t == note_stem || file_stem(&t) == note_stem || t.ends_with(&format!("/{note_stem}"))
+}
+
 /// Display form for a renamed note's wiki target (no `#` / `|`).
 ///
 /// Obsidian `MetadataCache.fileToLinktext` (shortest): unique basename, else
@@ -126,6 +260,8 @@ pub struct WikiIndex {
     outgoing: HashMap<String, Vec<String>>,
     /// All known note rel_paths (with .md)
     notes: HashSet<String>,
+    /// Lowercased frontmatter alias → first note path that claimed it (`ponytail:`).
+    aliases: HashMap<String, String>,
 }
 
 impl WikiIndex {
@@ -136,15 +272,25 @@ impl WikiIndex {
     pub fn clear(&mut self) {
         self.outgoing.clear();
         self.notes.clear();
+        self.aliases.clear();
     }
 
     pub fn set_note(&mut self, rel_path: &str, content: &str) {
+        self.forget_aliases_for(rel_path);
         self.notes.insert(rel_path.to_string());
         let links = extract_wikilinks(content);
         self.outgoing.insert(rel_path.to_string(), links);
+        for alias in aliases_from_frontmatter(content) {
+            let key = alias.to_ascii_lowercase();
+            // First note wins when two share an alias.
+            self.aliases
+                .entry(key)
+                .or_insert_with(|| rel_path.to_string());
+        }
     }
 
     pub fn remove_note(&mut self, rel_path: &str) {
+        self.forget_aliases_for(rel_path);
         self.notes.remove(rel_path);
         self.outgoing.remove(rel_path);
     }
@@ -155,6 +301,15 @@ impl WikiIndex {
         }
         self.notes.remove(from);
         self.notes.insert(to.to_string());
+        for path in self.aliases.values_mut() {
+            if path == from {
+                *path = to.to_string();
+            }
+        }
+    }
+
+    fn forget_aliases_for(&mut self, rel_path: &str) {
+        self.aliases.retain(|_, path| path != rel_path);
     }
 
     /// Resolve a wiki link like Obsidian `MetadataCache.getFirstLinkpathDest`.
@@ -192,7 +347,8 @@ impl WikiIndex {
             .filter(|n| file_name(n).eq_ignore_ascii_case(&lookup_key))
             .collect();
         if candidates.is_empty() {
-            return None;
+            // After file-name lookup: frontmatter aliases recorded in `set_note`.
+            return self.resolve_alias(&target);
         }
 
         // Unique basename-only link → that file.
@@ -244,7 +400,16 @@ impl WikiIndex {
         }
         near.sort_by_key(|p| (p.len(), p.as_str()));
         far.sort_by_key(|p| (p.len(), p.as_str()));
-        near.into_iter().chain(far).next().cloned()
+        near.into_iter()
+            .chain(far)
+            .next()
+            .cloned()
+            .or_else(|| self.resolve_alias(&target))
+    }
+
+    fn resolve_alias(&self, target: &str) -> Option<String> {
+        let key = target.to_ascii_lowercase();
+        self.aliases.get(&key).cloned()
     }
 
     pub fn backlinks(&self, rel_path: &str) -> Vec<String> {
@@ -811,5 +976,55 @@ mod tests {
             &notes_after,
         );
         assert_eq!(out, "[[Renamed#H|alias]] [[b/Note]]");
+    }
+
+    #[test]
+    fn link_fragment_heading_and_block() {
+        assert_eq!(link_fragment("Note#Heading|a").as_deref(), Some("Heading"));
+        assert_eq!(link_fragment("Note#^bid").as_deref(), Some("^bid"));
+        assert_eq!(link_fragment("#Only").as_deref(), Some("Only"));
+        assert_eq!(link_fragment("Note"), None);
+        assert_eq!(link_fragment("Note#"), None);
+    }
+
+    #[test]
+    fn heading_and_block_line_find() {
+        let text = "# Intro\n\npara\n\n## Target Title\n\nline ^block-a\n\n^solo\n";
+        assert_eq!(heading_line(text, "target title"), Some(4));
+        assert_eq!(heading_line(text, "missing"), None);
+        assert_eq!(block_line(text, "block-a"), Some(6));
+        assert_eq!(block_line(text, "^solo"), Some(8));
+    }
+
+    #[test]
+    fn rewrite_heading_links_stem_and_bare() {
+        let content = "see [[MyNote#Old|x]] and [[#Old]] and [[Other#Old]]";
+        let out = rewrite_heading_links(content, "MyNote", "Old", "New");
+        assert_eq!(out, "see [[MyNote#New|x]] and [[#New]] and [[Other#Old]]");
+    }
+
+    #[test]
+    fn resolve_uses_frontmatter_alias() {
+        let mut i = WikiIndex::new();
+        i.set_note(
+            "real.md",
+            "---\naliases: nickname\n---\nbody\n",
+        );
+        i.set_note("other.md", "");
+        assert_eq!(i.resolve("nickname", None).as_deref(), Some("real.md"));
+        // File name still wins over alias.
+        i.set_note(
+            "nickname.md",
+            "---\naliases: ignored-for-file\n---\n",
+        );
+        assert_eq!(i.resolve("nickname", None).as_deref(), Some("nickname.md"));
+    }
+
+    #[test]
+    fn alias_first_wins() {
+        let mut i = WikiIndex::new();
+        i.set_note("a.md", "---\naliases: shared\n---\n");
+        i.set_note("b.md", "---\naliases: shared\n---\n");
+        assert_eq!(i.resolve("shared", None).as_deref(), Some("a.md"));
     }
 }

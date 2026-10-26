@@ -4,7 +4,7 @@
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use bluelink_core::{PreviewDoc, Vault};
+use bluelink_core::{link_fragment, PreviewDoc, Vault};
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{FontFamily, FontId, Id, Key, Order, TextEdit, Ui};
 
@@ -12,6 +12,7 @@ use crate::editor_menu::{self, EditorAction};
 use crate::footnote;
 use crate::math_block::{self, MathRole};
 use crate::media;
+use crate::note_history::NoteHistory;
 use crate::preview;
 use crate::table::{self, Place};
 use crate::theme;
@@ -23,6 +24,14 @@ enum PendingClipboard {
     Cut,
     Copy,
     Paste,
+}
+
+/// Focus target for [`NoteHistory`] burst grouping.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistFocus {
+    None,
+    Line(usize),
+    Doc,
 }
 
 impl PendingClipboard {
@@ -49,6 +58,8 @@ impl PendingClipboard {
 pub struct WikiClick {
     pub raw: String,
     pub new_tab: bool,
+    /// Heading text or `^id` from `[[note#…]]`.
+    pub fragment: Option<String>,
 }
 
 pub struct LiveResult {
@@ -58,6 +69,10 @@ pub struct LiveResult {
     pub attach_file: bool,
     /// Status line hint from media ingest (errors / confirmation).
     pub status: Option<String>,
+    /// Host can clear `scroll_to_line` after we applied the offset.
+    pub scroll_consumed: bool,
+    /// Tag click (`#tag`) — host opens quick switcher with this query.
+    pub tag_query: Option<String>,
 }
 
 #[derive(Clone)]
@@ -247,7 +262,7 @@ fn take_line_focus(ui: &Ui, line: usize) -> bool {
     })
 }
 
-/// Footnote field, visual table, or a resting math block.
+/// Footnote field, visual table, callout, or a resting math block.
 /// `None` means this row is still a normal Markdown line.
 fn paint_structured_row(
     ui: &mut Ui,
@@ -258,6 +273,7 @@ fn paint_structured_row(
     lines: &[String],
     math_spans: &[math_block::MathSpan],
     table_places: &[Place],
+    callout_places: &[preview::CalloutPlace],
     ranges: &[(usize, usize)],
     active_line: Option<usize>,
     readonly: bool,
@@ -326,6 +342,40 @@ fn paint_structured_row(
             });
         }
         Place::None => {}
+    }
+
+    match callout_places
+        .get(i)
+        .copied()
+        .unwrap_or(preview::CalloutPlace::None)
+    {
+        preview::CalloutPlace::Tail { start, end: block_end } => {
+            if active_line.is_some_and(|a| (start..block_end).contains(&a)) {
+                return None;
+            }
+            return Some(PaintedRow {
+                height: 0.0,
+                skip_gap: true,
+            });
+        }
+        preview::CalloutPlace::Head { end: block_end } => {
+            if active_line.is_some_and(|a| (i..block_end).contains(&a)) {
+                // Editing inside the callout — fall through to raw lines.
+            } else {
+                let top = ui.cursor().top();
+                if let Some(clicked) = preview::paint_callout(ui, lines, i, block_end) {
+                    if !readonly {
+                        *request_active = Some(clicked);
+                    }
+                }
+                let height = (ui.cursor().top() - top).max(28.0);
+                return Some(PaintedRow {
+                    height,
+                    skip_gap: false,
+                });
+            }
+        }
+        preview::CalloutPlace::None => {}
     }
 
     let Some(span) = math_spans.get(i).copied() else {
@@ -426,12 +476,16 @@ pub fn show_live(
     active_line: &mut Option<usize>,
     doc_edit: &mut bool,
     readonly: bool,
+    scroll_to_line: Option<usize>,
+    history: &mut NoteHistory,
 ) -> LiveResult {
     let mut result = LiveResult {
         changed: false,
         wikilink: None,
         attach_file: false,
         status: None,
+        scroll_consumed: false,
+        tag_query: None,
     };
 
     if readonly {
@@ -442,8 +496,8 @@ pub fn show_live(
     // Drops / clipboard images before TextEdit so paste does not also insert text.
     if !readonly {
         if let Some(note) = source_path {
-            handle_dropped_files(ui, vault, note, buffer, *active_line, &mut result);
-            handle_clipboard_image_paste(ui, vault, note, buffer, *active_line, &mut result);
+            handle_dropped_files(ui, vault, note, buffer, *active_line, history, &mut result);
+            handle_clipboard_image_paste(ui, vault, note, buffer, *active_line, history, &mut result);
         }
     }
 
@@ -451,14 +505,46 @@ pub fn show_live(
     if !readonly
         && ui.input(|i| i.modifiers.command && i.key_pressed(Key::A))
     {
+        history.end_burst(buffer);
         *doc_edit = true;
         *active_line = None;
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new("live_select_all"), true));
     }
 
+    // Sync typing bursts with the active raw line (or full-doc session).
+    {
+        let hist_key = Id::new(("live_hist_focus", source_path.unwrap_or("")));
+        let prev: Option<HistFocus> = ui.ctx().data(|d| d.get_temp(hist_key));
+        let now = if *doc_edit {
+            HistFocus::Doc
+        } else if let Some(i) = *active_line {
+            HistFocus::Line(i)
+        } else {
+            HistFocus::None
+        };
+        if prev != Some(now) {
+            if prev.is_some_and(|p| p != HistFocus::None) {
+                history.end_burst(buffer);
+            }
+            if now != HistFocus::None {
+                history.begin_burst(buffer);
+            }
+            ui.ctx().data_mut(|d| d.insert_temp(hist_key, now));
+        }
+    }
+
     if *doc_edit {
-        return show_doc_edit(ui, vault, source_path, buffer, doc_edit, active_line, result);
+        return show_doc_edit(
+            ui,
+            vault,
+            source_path,
+            buffer,
+            doc_edit,
+            active_line,
+            history,
+            result,
+        );
     }
 
     boost_note_scroll(ui);
@@ -488,28 +574,63 @@ pub fn show_live(
     let mut pending_clipboard = PendingClipboard::None;
     // Active line + char selection (primary, secondary) for Shift+↑/↓.
     let mut active_sel: Option<(usize, usize, usize)> = None;
+    let mut structural_checkpoint = false;
 
     // Precompute fence roles so viewport culling can skip lines without breaking ``` state.
-    let fence_roles = {
+    let (fence_roles, fence_langs) = {
         let mut open = None;
+        let mut cur_lang: Option<String> = None;
         let mut roles = Vec::with_capacity(ranges.len());
+        let mut langs = Vec::with_capacity(ranges.len());
         for &(start, end) in &ranges {
             let line = buffer.get(start..end).unwrap_or("");
-            roles.push(preview::advance_fence(line, &mut open));
+            let role = preview::advance_fence(line, &mut open);
+            match role {
+                preview::FenceRole::Open => {
+                    cur_lang = preview::fence_lang(line);
+                    langs.push(cur_lang.clone());
+                }
+                preview::FenceRole::Body | preview::FenceRole::Close => {
+                    langs.push(cur_lang.clone());
+                    if matches!(role, preview::FenceRole::Close) {
+                        cur_lang = None;
+                    }
+                }
+                preview::FenceRole::Outside => {
+                    langs.push(None);
+                    cur_lang = None;
+                }
+            }
+            roles.push(role);
         }
-        roles
+        (roles, langs)
     };
 
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show_viewport(ui, |ui, viewport| {
+    // Scroll target from prefix heights (virtual rows are not in the tessellator).
+    let layout_id = Id::new(("live_layout", vault.root(), source_path.unwrap_or("")));
+    let mut scroll_area = egui::ScrollArea::vertical()
+        .id_salt(("live_note_scroll", source_path.unwrap_or("")))
+        .auto_shrink([false, false]);
+    if let Some(target) = scroll_to_line {
+        if let Some(cache) = ui.ctx().data(|d| d.get_temp::<LiveLayoutCache>(layout_id)) {
+            if cache.lines.len() == ranges.len() {
+                let heights: Vec<f32> = cache.lines.iter().map(|l| l.height.max(1.0)).collect();
+                let prefix = row_prefix_heights(&heights, &fence_roles);
+                let idx = target.min(prefix.len().saturating_sub(1));
+                let offset = prefix.get(idx).copied().unwrap_or(TOP_PAD);
+                scroll_area = scroll_area.vertical_scroll_offset(offset);
+                result.scroll_consumed = true;
+            }
+        }
+    }
+
+    scroll_area.show_viewport(ui, |ui, viewport| {
             // Viewport height at content start — used to fill empty space below lines
             // so clicks there hit a widget (ScrollArea empty chrome is not clickable).
             let viewport_h = viewport.height();
 
             // Keep parsed previews and measured heights across frames. Scrolling should not
             // re-run pulldown-cmark for every visible line on every repaint.
-            let layout_id = Id::new(("live_layout", vault.root(), source_path.unwrap_or("")));
             let mut layout = ui.ctx().data(|d| d.get_temp::<LiveLayoutCache>(layout_id));
             if layout
                 .as_ref()
@@ -557,7 +678,9 @@ pub fn show_live(
                 let force = if readonly {
                     None
                 } else {
-                    active_line.filter(|&i| i < n)
+                    active_line
+                        .filter(|&i| i < n)
+                        .or_else(|| scroll_to_line.filter(|&i| i < n))
                 };
                 let (first, last) =
                     visible_row_range(&prefix, viewport.min.y, viewport.max.y, force);
@@ -570,6 +693,7 @@ pub fn show_live(
                     .collect();
                 let math_spans = math_block::spans(&lines, &fence_roles);
                 let table_places = table::places(&lines);
+                let callout_places = preview::callout_places(&lines);
                 if let Some(i) = *active_line {
                     active_in_math = math_spans
                         .get(i)
@@ -579,6 +703,7 @@ pub fn show_live(
                 for i in first..last {
                     let (start, end) = ranges[i];
                     let fence_role = fence_roles[i];
+                    let fence_lang = fence_langs[i].as_deref();
                     let in_fence = !matches!(fence_role, preview::FenceRole::Outside);
                     let is_active = !readonly && *active_line == Some(i);
 
@@ -593,6 +718,7 @@ pub fn show_live(
                         &lines,
                         &math_spans,
                         &table_places,
+                        &callout_places,
                         &ranges,
                         *active_line,
                         readonly,
@@ -712,6 +838,39 @@ pub fn show_live(
                             });
                         }
 
+                        // Format shortcuts when the line field has focus (not S/P/Z/F/A/W/T/G).
+                        if focused && splice.is_none() {
+                            let wrap = ui.input(|inp| {
+                                if !inp.modifiers.command || inp.modifiers.shift || inp.modifiers.alt
+                                {
+                                    return None;
+                                }
+                                if inp.key_pressed(Key::B) {
+                                    Some(("**", "**"))
+                                } else if inp.key_pressed(Key::I) {
+                                    Some(("*", "*"))
+                                } else if inp.key_pressed(Key::E) {
+                                    Some(("`", "`"))
+                                } else if inp.key_pressed(Key::K) {
+                                    Some(("[[", "]]"))
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some((before, after)) = wrap {
+                                structural_checkpoint = true;
+                                let caret = editor_menu::wrap_selection(
+                                    &mut draft, primary, secondary, before, after,
+                                );
+                                primary = caret;
+                                secondary = caret;
+                                splice = Some((start, end, draft.clone()));
+                                ui.ctx().data_mut(|d| {
+                                    d.insert_temp(egui::Id::new(("live_cursor", i)), caret);
+                                });
+                            }
+                        }
+
                         active_sel = Some((i, primary, secondary));
                         if response.secondary_clicked() {
                             if let Some(pos) = response.interact_pointer_pos() {
@@ -806,7 +965,27 @@ pub fn show_live(
                         if enter_here {
                             let left = draft[..byte_idx].to_string();
                             let right = draft[byte_idx..].to_string();
-                            split_at_cursor = Some((start, end, left, right));
+                            // Empty list/checklist item: strip marker. Else continue it.
+                            if right.is_empty() {
+                                if let Some(cont) = preview::continue_list_marker(&left) {
+                                    structural_checkpoint = true;
+                                    if cont.empty_body {
+                                        splice = Some((start, end, cont.clear_to));
+                                        leave_edit_after_wiki = true;
+                                    } else {
+                                        split_at_cursor = Some((
+                                            start,
+                                            end,
+                                            left,
+                                            cont.next_prefix,
+                                        ));
+                                    }
+                                } else {
+                                    split_at_cursor = Some((start, end, left, right));
+                                }
+                            } else {
+                                split_at_cursor = Some((start, end, left, right));
+                            }
                         } else if splice.is_none() && response.changed() && draft != line {
                             // Typing the closing `]]` → switch to preview so the link is clickable.
                             let closed_wiki = open_wiki_query(&draft, byte_idx).is_none()
@@ -863,6 +1042,7 @@ pub fn show_live(
                                     source_path,
                                     line,
                                     fence_role,
+                                    fence_lang,
                                     preview,
                                 )
                             },
@@ -883,17 +1063,34 @@ pub fn show_live(
 
                         match click {
                             preview::LineClick::Wiki { raw, new_tab } => {
-                                result.wikilink = Some(WikiClick { raw, new_tab });
+                                result.wikilink = Some(WikiClick {
+                                    fragment: link_fragment(&raw),
+                                    raw,
+                                    new_tab,
+                                });
+                            }
+                            preview::LineClick::Tag { query } => {
+                                result.tag_query = Some(query);
+                            }
+                            preview::LineClick::ToggleCheck if !readonly => {
+                                if let Some(next) = preview::toggle_checklist_line(line) {
+                                    structural_checkpoint = true;
+                                    splice = Some((start, end, next));
+                                }
                             }
                             preview::LineClick::ResizeEmbed {
                                 target,
                                 width,
                                 height,
                             } if !readonly => {
+                                history.checkpoint(buffer);
                                 if media::rewrite_embed_size(
                                     buffer, Some(i), &target, width, height,
                                 ) {
                                     result.changed = true;
+                                    if *active_line == Some(i) {
+                                        history.begin_burst(buffer);
+                                    }
                                 }
                             }
                             preview::LineClick::Edit if !readonly => {
@@ -1010,6 +1207,7 @@ pub fn show_live(
                                 note,
                                 buffer,
                                 menu.line.or(*active_line),
+                                history,
                                 &mut result,
                             ) {
                                 // Image consumed; skip RequestPaste.
@@ -1032,6 +1230,7 @@ pub fn show_live(
                     EditorAction::InsertSnippet(snip)
                         if snip == math_block::SNIPPET || snip == table::SNIPPET =>
                     {
+                        history.checkpoint(buffer);
                         let (primary, secondary) = match menu.line {
                             Some(i) => (
                                 line_char_offset(buffer, &ranges, i, menu.primary),
@@ -1052,10 +1251,12 @@ pub fn show_live(
                             d.insert_temp(egui::Id::new(("live_focus", line)), true);
                             d.insert_temp(egui::Id::new(("live_cursor", line)), col);
                         });
+                        history.begin_burst(buffer);
                         result.changed = true;
                     }
                     // Definition belongs at the end of the note, not on this line.
                     EditorAction::Footnote => {
+                        history.checkpoint(buffer);
                         let (primary, secondary) = match menu.line {
                             Some(i) => (
                                 line_char_offset(buffer, &ranges, i, menu.primary),
@@ -1075,6 +1276,7 @@ pub fn show_live(
                                 d.insert_temp(egui::Id::new(("live_focus", line)), true);
                                 d.insert_temp(egui::Id::new(("live_cursor", line)), col);
                             });
+                            history.begin_burst(buffer);
                             result.changed = true;
                         }
                     }
@@ -1091,6 +1293,7 @@ pub fn show_live(
                                     secondary,
                                     text_action,
                                 ) {
+                                    structural_checkpoint = true;
                                     splice = Some((s, e, draft));
                                     request_active = Some(i);
                                     ui.ctx().data_mut(|d| {
@@ -1108,9 +1311,11 @@ pub fn show_live(
             }
 
             if let Some(choice) = table::show_menu(ui.ctx()) {
-                if table_edit.is_none() && !result.changed && apply_table_choice(buffer, &ranges, choice)
-                {
-                    result.changed = true;
+                if table_edit.is_none() && !result.changed {
+                    history.checkpoint(buffer);
+                    if apply_table_choice(buffer, &ranges, choice) {
+                        result.changed = true;
+                    }
                 }
             }
             let esc = ui.input(|i| i.key_pressed(Key::Escape));
@@ -1200,6 +1405,11 @@ pub fn show_live(
         *active_line = None;
     }
 
+    // Typing splices stay in the open burst; structural edits get their own step.
+    if structural_checkpoint || erase_footnote.is_some() || table_edit.is_some() {
+        history.checkpoint(buffer);
+    }
+
     if let Some((n, start, end)) = erase_footnote {
         let caret = footnote::erase(buffer, n, start, end);
         let (line, col) = caret_line_col(buffer, caret);
@@ -1208,6 +1418,7 @@ pub fn show_live(
             d.insert_temp(egui::Id::new(("live_focus", line)), true);
             d.insert_temp(egui::Id::new(("live_cursor", line)), col);
         });
+        history.begin_burst(buffer);
         result.changed = true;
     } else if let Some((start, end, left, right)) = split_at_cursor {
         let i = active_line.unwrap_or(0);
@@ -1215,12 +1426,20 @@ pub fn show_live(
         *active_line = Some(i + 1);
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new(("live_focus", i + 1)), true));
+        // Caret on the new line — place after continued list marker when present.
+        let col = right.chars().count();
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new(("live_cursor", i + 1)), col));
+        history.begin_burst(buffer);
         result.changed = true;
     } else if let Some((start, end, new_text)) = table_edit {
         buffer.replace_range(start..end, &new_text);
         result.changed = true;
     } else if let Some((start, end, new_text)) = splice {
         buffer.replace_range(start..end, &new_text);
+        if structural_checkpoint {
+            history.begin_burst(buffer);
+        }
         result.changed = true;
     }
 
@@ -1259,9 +1478,11 @@ fn show_doc_edit(
     buffer: &mut String,
     doc_edit: &mut bool,
     active_line: &mut Option<usize>,
+    history: &mut NoteHistory,
     mut result: LiveResult,
 ) -> LiveResult {
     if ui.input(|i| i.key_pressed(Key::Escape)) {
+        history.end_burst(buffer);
         *doc_edit = false;
         *active_line = None;
         return result;
@@ -1271,6 +1492,10 @@ fn show_doc_edit(
     let font = FontId::new(theme::EDITOR_SIZE, FontFamily::Monospace);
 
     boost_note_scroll(ui);
+
+    let mut caret_primary = 0usize;
+    let mut caret_secondary = 0usize;
+    let mut focused = false;
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -1289,6 +1514,7 @@ fn show_doc_edit(
                     .show(ui);
 
                 let response = output.response;
+                focused = response.has_focus() || response.lost_focus();
 
                 let select_all = ui.ctx().data_mut(|d| {
                     let v = d
@@ -1328,6 +1554,8 @@ fn show_doc_edit(
                         let n = buffer.chars().count();
                         (n, n)
                     });
+                caret_primary = primary;
+                caret_secondary = secondary;
 
                 if response.secondary_clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
@@ -1341,6 +1569,43 @@ fn show_doc_edit(
             });
         });
 
+    if focused {
+        let wrap = ui.input(|inp| {
+            if !inp.modifiers.command || inp.modifiers.shift || inp.modifiers.alt {
+                return None;
+            }
+            if inp.key_pressed(Key::B) {
+                Some(("**", "**"))
+            } else if inp.key_pressed(Key::I) {
+                Some(("*", "*"))
+            } else if inp.key_pressed(Key::E) {
+                Some(("`", "`"))
+            } else if inp.key_pressed(Key::K) {
+                Some(("[[", "]]"))
+            } else {
+                None
+            }
+        });
+        if let Some((before, after)) = wrap {
+            history.checkpoint(buffer);
+            let caret = editor_menu::wrap_selection(
+                buffer,
+                caret_primary,
+                caret_secondary,
+                before,
+                after,
+            );
+            let mut state =
+                egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+            state
+                .cursor
+                .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
+            state.store(ui.ctx(), id);
+            history.begin_burst(buffer);
+            result.changed = true;
+        }
+    }
+
     if let Some((menu, action)) = editor_menu::show_popup(ui.ctx()) {
         match action {
             EditorAction::SelectAll => {
@@ -1352,7 +1617,14 @@ fn show_doc_edit(
             }
             EditorAction::Paste => {
                 if let Some(note) = source_path {
-                    if !try_insert_clipboard_image(vault, note, buffer, None, &mut result) {
+                    if !try_insert_clipboard_image(
+                        vault,
+                        note,
+                        buffer,
+                        None,
+                        history,
+                        &mut result,
+                    ) {
                         editor_menu::dispatch_clipboard(ui, &EditorAction::Paste);
                     }
                 } else {
@@ -1363,6 +1635,7 @@ fn show_doc_edit(
                 editor_menu::dispatch_clipboard(ui, &action);
             }
             ref text_action => {
+                history.checkpoint(buffer);
                 if let Some(caret) = editor_menu::apply_text_action(
                     buffer,
                     menu.primary,
@@ -1375,6 +1648,7 @@ fn show_doc_edit(
                         .cursor
                         .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
                     state.store(ui.ctx(), id);
+                    history.begin_burst(buffer);
                     result.changed = true;
                 }
             }
@@ -1390,6 +1664,7 @@ fn handle_dropped_files(
     active_note: &str,
     buffer: &mut String,
     active_line: Option<usize>,
+    history: &mut NoteHistory,
     result: &mut LiveResult,
 ) {
     let dropped = ui.ctx().input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
@@ -1397,6 +1672,7 @@ fn handle_dropped_files(
         return;
     }
     let mut embedded = 0usize;
+    let mut checked = false;
     for file in dropped {
         let Some(path) = file.path.as_deref() else {
             // Web / in-memory drops: use bytes + name when present.
@@ -1414,6 +1690,10 @@ fn handle_dropped_files(
                     .unwrap_or("attachment");
                 match media::save_bytes(vault, stem, ext, bytes, active_note) {
                     Ok(rel) => {
+                        if !checked {
+                            history.checkpoint(buffer);
+                            checked = true;
+                        }
                         media::insert_embed(buffer, active_line, &rel);
                         embedded += 1;
                         result.changed = true;
@@ -1425,6 +1705,10 @@ fn handle_dropped_files(
         };
         match media::ingest_path(vault, path, active_note) {
             Ok(rel) => {
+                if !checked {
+                    history.checkpoint(buffer);
+                    checked = true;
+                }
                 media::insert_embed(buffer, active_line, &rel);
                 embedded += 1;
                 result.changed = true;
@@ -1432,12 +1716,15 @@ fn handle_dropped_files(
             Err(e) => result.status = Some(format!("drop failed: {e}")),
         }
     }
-    if embedded > 0 && result.status.is_none() {
-        result.status = Some(if embedded == 1 {
-            "attached file".into()
-        } else {
-            format!("attached {embedded} files")
-        });
+    if embedded > 0 {
+        history.begin_burst(buffer);
+        if result.status.is_none() {
+            result.status = Some(if embedded == 1 {
+                "attached file".into()
+            } else {
+                format!("attached {embedded} files")
+            });
+        }
     }
 }
 
@@ -1447,6 +1734,7 @@ fn handle_clipboard_image_paste(
     active_note: &str,
     buffer: &mut String,
     active_line: Option<usize>,
+    history: &mut NoteHistory,
     result: &mut LiveResult,
 ) {
     let wants_paste = ui.input(|i| {
@@ -1457,7 +1745,7 @@ fn handle_clipboard_image_paste(
     if !wants_paste {
         return;
     }
-    if !try_insert_clipboard_image(vault, active_note, buffer, active_line, result) {
+    if !try_insert_clipboard_image(vault, active_note, buffer, active_line, history, result) {
         return;
     }
     // Swallow text paste so TextEdit does not also insert clipboard text.
@@ -1473,6 +1761,7 @@ fn try_insert_clipboard_image(
     active_note: &str,
     buffer: &mut String,
     active_line: Option<usize>,
+    history: &mut NoteHistory,
     result: &mut LiveResult,
 ) -> bool {
     let Some(png) = media::clipboard_image_png() else {
@@ -1481,7 +1770,9 @@ fn try_insert_clipboard_image(
     let stem = media::pasted_image_stem();
     match media::save_bytes(vault, &stem, "png", &png, active_note) {
         Ok(rel) => {
+            history.checkpoint(buffer);
             media::insert_embed(buffer, active_line, &rel);
+            history.begin_burst(buffer);
             result.changed = true;
             result.status = Some(format!("pasted {rel}"));
             true

@@ -122,7 +122,7 @@ pub fn show_preview(ui: &mut egui::Ui, formula: &str, catch_empty: bool) -> (f32
         );
         resp.clicked()
     } else {
-        match cached_texture(ui.ctx(), formula) {
+        match cached_texture(ui.ctx(), formula, true) {
             Some(tex) => ui
                 .add(
                     egui::Image::from_texture(&tex)
@@ -146,12 +146,57 @@ pub fn show_preview(ui: &mut egui::Ui, formula: &str, catch_empty: bool) -> (f32
     (height, clicked)
 }
 
-fn cached_texture(ctx: &Context, formula: &str) -> Option<TextureHandle> {
-    let key = egui::Id::new(("math_png", formula));
+/// ponytail: longer formulas stay as source; raise or async-raster when inline TeX is common.
+const INLINE_MAX_CHARS: usize = 64;
+
+/// Inline `$...$` via the same PNG cache. Returns whether the glyph was clicked.
+pub fn show_inline(ui: &mut egui::Ui, formula: &str, size: f32) -> bool {
+    let formula = formula.trim();
+    if formula.is_empty() {
+        return false;
+    }
+    let too_long = formula.chars().count() > INLINE_MAX_CHARS;
+    if too_long {
+        return ui
+            .add(
+                egui::Label::new(
+                    egui::RichText::new(format!("${formula}$"))
+                        .size(size)
+                        .monospace()
+                        .color(theme::TEXT),
+                )
+                .sense(egui::Sense::click()),
+            )
+            .clicked();
+    }
+    match cached_texture(ui.ctx(), formula, false) {
+        Some(tex) => ui
+            .add(
+                egui::Image::from_texture(&tex)
+                    .fit_to_original_size(1.0)
+                    .max_height(size * 1.4),
+            )
+            .clicked(),
+        None => ui
+            .add(
+                egui::Label::new(
+                    egui::RichText::new(format!("${formula}$"))
+                        .size(size)
+                        .monospace()
+                        .color(theme::TEXT),
+                )
+                .sense(egui::Sense::click()),
+            )
+            .clicked(),
+    }
+}
+
+fn cached_texture(ctx: &Context, formula: &str, display: bool) -> Option<TextureHandle> {
+    let key = egui::Id::new(("math_png", display, formula));
     if let Some(slot) = ctx.data(|d| d.get_temp::<MathSlot>(key)) {
         return slot.tex;
     }
-    let slot = match raster(formula) {
+    let slot = match raster(formula, display) {
         Ok(png) => match decode_texture(ctx, formula, &png) {
             Some(tex) => MathSlot { tex: Some(tex) },
             None => MathSlot { tex: None },
@@ -175,10 +220,10 @@ fn decode_texture(ctx: &Context, formula: &str, png: &[u8]) -> Option<TextureHan
     Some(ctx.load_texture(format!("math:{formula}"), color, TextureOptions::LINEAR))
 }
 
-fn raster(formula: &str) -> Result<Vec<u8>, String> {
+fn raster(formula: &str, display: bool) -> Result<Vec<u8>, String> {
     let font = math_font()?;
     let mut opt = PngOptions::new();
-    opt.display = true;
+    opt.display = display;
     // Near-white glyphs: the note canvas is almost black, default ink is black.
     opt.color = Color::rgb(theme::TEXT.r(), theme::TEXT.g(), theme::TEXT.b());
     opt.background = PngBackground::Transparent;
@@ -244,7 +289,7 @@ mod tests {
 
     #[test]
     fn latex_png_signature() {
-        let png = raster("x").expect("raster");
+        let png = raster("x", true).expect("raster");
         assert!(png.starts_with(b"\x89PNG"));
     }
 }

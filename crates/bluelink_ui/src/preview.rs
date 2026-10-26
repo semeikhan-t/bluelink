@@ -3,7 +3,9 @@ use egui::{
     Color32, CornerRadius, CursorIcon, FontFamily, FontId, OpenUrl, RichText, Sense, Ui,
 };
 use egui_phosphor::regular;
+use egui::text::{LayoutJob, TextFormat};
 
+use crate::math_block;
 use crate::media;
 use crate::theme;
 
@@ -79,12 +81,210 @@ pub enum LineClick {
     Wiki { raw: String, new_tab: bool },
     /// Enter raw edit for this line.
     Edit,
+    /// Toggle `- [ ]` / `- [x]` without opening the line.
+    ToggleCheck,
+    /// Host should open quick-switcher with this tag text (`#tag` without `#`).
+    Tag { query: String },
     /// Drag-resize finished: rewrite `![[target|…]]` size in the source buffer.
     ResizeEmbed {
         target: String,
         width: u32,
         height: Option<u32>,
     },
+}
+
+/// Checklist marker on a source line (`- [ ]` / `* [x]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckMark {
+    Unchecked,
+    Checked,
+}
+
+/// `Some((mark, body))` when the line is a task item.
+pub fn parse_checklist(line: &str) -> Option<(CheckMark, &str)> {
+    let trimmed = line.trim_start();
+    let after_bullet = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))?;
+    if let Some(body) = after_bullet.strip_prefix("[ ]") {
+        return Some((CheckMark::Unchecked, body.strip_prefix(' ').unwrap_or(body)));
+    }
+    if let Some(body) = after_bullet
+        .strip_prefix("[x]")
+        .or_else(|| after_bullet.strip_prefix("[X]"))
+    {
+        return Some((CheckMark::Checked, body.strip_prefix(' ').unwrap_or(body)));
+    }
+    None
+}
+
+/// Flip `[ ]` ↔ `[x]` on a checklist line. Returns `None` when not a task.
+pub fn toggle_checklist_line(line: &str) -> Option<String> {
+    let (mark, _) = parse_checklist(line)?;
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+    let bullet = if trimmed.starts_with("- ") {
+        "- "
+    } else if trimmed.starts_with("* ") {
+        "* "
+    } else {
+        "+ "
+    };
+    let body = parse_checklist(line)?.1;
+    let box_ = match mark {
+        CheckMark::Unchecked => "[x]",
+        CheckMark::Checked => "[ ]",
+    };
+    if body.is_empty() {
+        Some(format!("{indent}{bullet}{box_}"))
+    } else {
+        Some(format!("{indent}{bullet}{box_} {body}"))
+    }
+}
+
+/// Obsidian callout: `> [!type] title` plus following `>` lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalloutPlace {
+    None,
+    /// First line; `end` exclusive.
+    Head { end: usize },
+    Tail { start: usize, end: usize },
+}
+
+pub fn callout_places(lines: &[String]) -> Vec<CalloutPlace> {
+    let mut out = vec![CalloutPlace::None; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        if callout_type(&lines[i]).is_some() {
+            let mut end = i + 1;
+            while end < lines.len() && is_quote_line(&lines[end]) {
+                end += 1;
+            }
+            out[i] = CalloutPlace::Head { end };
+            for j in (i + 1)..end {
+                out[j] = CalloutPlace::Tail { start: i, end };
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `Some(type)` for `> [!type]…` (unknown types still count).
+pub fn callout_type(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    let t = t.strip_prefix('>')?.trim_start();
+    let t = t.strip_prefix("[!")?;
+    let close = t.find(']')?;
+    let ty = &t[..close];
+    if ty.is_empty()
+        || !ty
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    Some(ty)
+}
+
+fn is_quote_line(line: &str) -> bool {
+    line.trim_start().starts_with('>')
+}
+
+/// List / checklist marker to continue on Enter. Empty body → clear instead.
+pub fn continue_list_marker(line: &str) -> Option<ListContinue> {
+    let trimmed = line.trim_start();
+    let indent_len = line.len() - trimmed.len();
+    let indent = &line[..indent_len];
+    if let Some((mark, body)) = parse_checklist(line) {
+        let empty = body.trim().is_empty();
+        let bullet = if trimmed.starts_with("- ") {
+            "- "
+        } else if trimmed.starts_with("* ") {
+            "* "
+        } else {
+            "+ "
+        };
+        let box_ = match mark {
+            CheckMark::Unchecked => "[ ]",
+            CheckMark::Checked => "[ ]", // new item always unchecked
+        };
+        return Some(ListContinue {
+            empty_body: empty,
+            next_prefix: format!("{indent}{bullet}{box_} "),
+            clear_to: format!("{indent}"),
+        });
+    }
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        return Some(ListContinue {
+            empty_body: rest.trim().is_empty(),
+            next_prefix: format!("{indent}- "),
+            clear_to: indent.to_string(),
+        });
+    }
+    if let Some(rest) = trimmed.strip_prefix("* ") {
+        return Some(ListContinue {
+            empty_body: rest.trim().is_empty(),
+            next_prefix: format!("{indent}* "),
+            clear_to: indent.to_string(),
+        });
+    }
+    if let Some(rest) = numbered_list_rest(trimmed) {
+        let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+        let n: u64 = trimmed[..digits].parse().unwrap_or(1);
+        return Some(ListContinue {
+            empty_body: rest.trim().is_empty(),
+            next_prefix: format!("{indent}{}. ", n + 1),
+            clear_to: indent.to_string(),
+        });
+    }
+    if let Some(rest) = trimmed.strip_prefix("> ") {
+        // Don't continue callout headers specially — plain quote.
+        if callout_type(line).is_some() {
+            return None;
+        }
+        return Some(ListContinue {
+            empty_body: rest.trim().is_empty(),
+            next_prefix: format!("{indent}> "),
+            clear_to: indent.to_string(),
+        });
+    }
+    None
+}
+
+pub struct ListContinue {
+    pub empty_body: bool,
+    pub next_prefix: String,
+    pub clear_to: String,
+}
+
+fn numbered_list_rest(s: &str) -> Option<&str> {
+    let digits = s.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    s[digits..].strip_prefix(". ")
+}
+
+/// Language on an opening fence line (` ```rust ` → `rust`).
+pub fn fence_lang(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let rest = if let Some(r) = trimmed.strip_prefix("```") {
+        r
+    } else if let Some(r) = trimmed.strip_prefix("~~~") {
+        r
+    } else {
+        return None;
+    };
+    let lang = rest.trim();
+    if lang.is_empty() {
+        None
+    } else {
+        Some(lang.to_string())
+    }
 }
 
 /// Render a line using a preview parsed by the caller.
@@ -97,10 +297,14 @@ pub fn render_line_with_preview(
     source_path: Option<&str>,
     line: &str,
     role: FenceRole,
+    lang: Option<&str>,
     preview: Option<&PreviewDoc>,
 ) -> LineClick {
     if !matches!(role, FenceRole::Outside) {
-        return render_fence_stripe(ui, line, role);
+        return render_fence_stripe(ui, line, role, lang);
+    }
+    if let Some((mark, body)) = parse_checklist(line) {
+        return render_checklist(ui, vault, source_path, mark, body);
     }
     if line.is_empty() {
         let resp =
@@ -141,8 +345,84 @@ pub fn render_line_with_preview(
     click
 }
 
+fn render_checklist(
+    ui: &mut Ui,
+    vault: &Vault,
+    source_path: Option<&str>,
+    mark: CheckMark,
+    body: &str,
+) -> LineClick {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let side = 16.0;
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), Sense::click());
+        let stroke = egui::Stroke::new(1.5_f32, theme::ACCENT);
+        ui.painter()
+            .rect_stroke(rect, theme::round_sm(), stroke, egui::StrokeKind::Inside);
+        if matches!(mark, CheckMark::Checked) {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(rect.left() + 3.0, rect.center().y),
+                    egui::pos2(rect.center().x - 1.0, rect.bottom() - 3.0),
+                ],
+                egui::Stroke::new(1.8_f32, theme::ACCENT),
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(rect.center().x - 1.0, rect.bottom() - 3.0),
+                    egui::pos2(rect.right() - 3.0, rect.top() + 3.0),
+                ],
+                egui::Stroke::new(1.8_f32, theme::ACCENT),
+            );
+        }
+        resp.clone().on_hover_cursor(CursorIcon::PointingHand);
+        let click = if resp.clicked() {
+            LineClick::ToggleCheck
+        } else {
+            LineClick::None
+        };
+        let body_click = if body.is_empty() {
+            let r = ui.allocate_exact_size(
+                egui::vec2(ui.available_width().max(8.0), 22.0),
+                Sense::click(),
+            );
+            if r.1.clicked() {
+                LineClick::Edit
+            } else {
+                LineClick::None
+            }
+        } else {
+            let doc = parse_preview(body);
+            let spans = doc
+                .blocks
+                .iter()
+                .find_map(|b| match b {
+                    PreviewBlock::Paragraph { spans } => Some(spans.as_slice()),
+                    PreviewBlock::BulletItem { spans } => Some(spans.as_slice()),
+                    _ => None,
+                })
+                .unwrap_or(&[]);
+            if spans.is_empty() {
+                render_text_with_wikis(
+                    ui,
+                    vault,
+                    source_path,
+                    body,
+                    theme::EDITOR_SIZE,
+                    false,
+                    0,
+                )
+            } else {
+                render_spans(ui, vault, source_path, spans, theme::EDITOR_SIZE, false, 0)
+            }
+        };
+        merge_click(click, body_click)
+    })
+    .inner
+}
+
 /// One stripe of a multi-line fenced code block (open / body / close).
-fn render_fence_stripe(ui: &mut Ui, line: &str, role: FenceRole) -> LineClick {
+fn render_fence_stripe(ui: &mut Ui, line: &str, role: FenceRole, lang: Option<&str>) -> LineClick {
     let r = theme::ROUND;
     let corners = match role {
         FenceRole::Open => CornerRadius {
@@ -166,17 +446,6 @@ fn render_fence_stripe(ui: &mut Ui, line: &str, role: FenceRole) -> LineClick {
         FenceRole::Body => (2, 2),
         FenceRole::Outside => (4, 4),
     };
-    let rich = match role {
-        FenceRole::Open | FenceRole::Close => RichText::new(line)
-            .size(14.0)
-            .monospace()
-            .color(theme::WEAK),
-        FenceRole::Body | FenceRole::Outside => {
-            let shown = if line.is_empty() { " " } else { line };
-            // Explicit ink — clickable labels otherwise pick hovered.fg (dark) and vanish.
-            RichText::new(shown).size(16.0).monospace().color(theme::TEXT)
-        }
-    };
 
     let mut clicked = false;
     // No per-stripe stroke — adjacent stripes stack into one continuous block.
@@ -191,8 +460,44 @@ fn render_fence_stripe(ui: &mut Ui, line: &str, role: FenceRole) -> LineClick {
         })
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            let resp = ui.add(egui::Label::new(rich).sense(Sense::click()));
-            clicked = resp.clicked();
+            if matches!(role, FenceRole::Open) {
+                if let Some(lang) = lang {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(lang)
+                                .size(12.0)
+                                .monospace()
+                                .color(theme::WEAK),
+                        );
+                    });
+                }
+                let resp = ui.add(
+                    egui::Label::new(
+                        RichText::new(line)
+                            .size(14.0)
+                            .monospace()
+                            .color(theme::WEAK),
+                    )
+                    .sense(Sense::click()),
+                );
+                clicked = resp.clicked();
+            } else if matches!(role, FenceRole::Close) {
+                let resp = ui.add(
+                    egui::Label::new(
+                        RichText::new(line)
+                            .size(14.0)
+                            .monospace()
+                            .color(theme::WEAK),
+                    )
+                    .sense(Sense::click()),
+                );
+                clicked = resp.clicked();
+            } else {
+                let shown = if line.is_empty() { " " } else { line };
+                let job = highlight_code_line(shown, lang);
+                let resp = ui.add(egui::Label::new(job).sense(Sense::click()));
+                clicked = resp.clicked();
+            }
         });
     if clicked {
         LineClick::Edit
@@ -201,10 +506,93 @@ fn render_fence_stripe(ui: &mut Ui, line: &str, role: FenceRole) -> LineClick {
     }
 }
 
+fn highlight_code_line(line: &str, lang: Option<&str>) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let base = TextFormat {
+        font_id: FontId::new(16.0, FontFamily::Monospace),
+        color: theme::TEXT,
+        ..Default::default()
+    };
+    let kw = TextFormat {
+        font_id: FontId::new(16.0, FontFamily::Monospace),
+        color: theme::ACCENT,
+        ..Default::default()
+    };
+    let words = keywords_for(lang);
+    if words.is_empty() {
+        job.append(line, 0.0, base);
+        return job;
+    }
+    let mut rest = line;
+    while !rest.is_empty() {
+        let (tok, next) = next_code_token(rest);
+        rest = next;
+        let fmt = if is_ident(tok) && words.iter().any(|w| *w == tok) {
+            kw.clone()
+        } else {
+            base.clone()
+        };
+        job.append(tok, 0.0, fmt);
+    }
+    job
+}
+
+fn next_code_token(s: &str) -> (&str, &str) {
+    let bytes = s.as_bytes();
+    if bytes[0].is_ascii_alphanumeric() || bytes[0] == b'_' {
+        let n = bytes
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+            .count();
+        return (&s[..n], &s[n..]);
+    }
+    (&s[..1], &s[1..])
+}
+
+fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+fn keywords_for(lang: Option<&str>) -> &'static [&'static str] {
+    match lang.map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("rust" | "rs") => &[
+            "fn", "let", "mut", "pub", "struct", "enum", "impl", "use", "mod", "if", "else",
+            "match", "return", "for", "while", "loop", "in", "ref", "self", "Self", "crate",
+            "async", "await", "const", "static", "true", "false",
+        ],
+        Some("js" | "javascript" | "ts" | "typescript") => &[
+            "function", "const", "let", "var", "return", "if", "else", "for", "while", "class",
+            "new", "this", "import", "export", "from", "async", "await", "true", "false", "null",
+            "typeof", "of", "in",
+        ],
+        Some("python" | "py") => &[
+            "def", "class", "return", "if", "elif", "else", "for", "while", "import", "from",
+            "as", "True", "False", "None", "with", "try", "except", "async", "await", "yield",
+            "lambda", "pass",
+        ],
+        Some("go") => &[
+            "func", "return", "if", "else", "for", "range", "package", "import", "var", "const",
+            "type", "struct", "interface", "go", "defer", "true", "false", "nil",
+        ],
+        // mermaid / unknown: no keyword paint
+        _ => &[],
+    }
+}
+
 fn merge_click(a: LineClick, b: LineClick) -> LineClick {
     match (&a, &b) {
         (_, LineClick::ResizeEmbed { .. }) => b,
         (LineClick::ResizeEmbed { .. }, _) => a,
+        (_, LineClick::ToggleCheck) => b,
+        (LineClick::ToggleCheck, _) => a,
+        (_, LineClick::Tag { .. }) => b,
+        (LineClick::Tag { .. }, _) => a,
         (_, LineClick::Wiki { .. }) => b,
         (LineClick::Wiki { .. }, _) => a,
         (_, LineClick::Edit) => b,
@@ -267,11 +655,11 @@ fn render_block_compact(
                 });
             click
         }
-        PreviewBlock::CodeBlock { code, .. } => {
+        PreviewBlock::CodeBlock { code, lang } => {
             // Lone ``` lines parse as empty code blocks — don't draw hollow pills;
             // multi-line fences are handled via FenceRole in the editor.
             if code.trim().is_empty() {
-                return render_fence_stripe(ui, "```", FenceRole::Open);
+                return render_fence_stripe(ui, "```", FenceRole::Open, lang.as_deref());
             }
             let mut clicked = false;
             egui::Frame::NONE
@@ -281,16 +669,22 @@ fn render_block_compact(
                 .inner_margin(egui::Margin::symmetric(12, 8))
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    let resp = ui.add(
-                        egui::Label::new(
-                            RichText::new(code.trim_end_matches('\n'))
-                                .size(16.0)
-                                .monospace()
-                                .color(theme::TEXT),
-                        )
-                        .sense(Sense::click()),
-                    );
-                    clicked = resp.clicked();
+                    if let Some(lang) = lang {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                            ui.label(
+                                RichText::new(lang)
+                                    .size(12.0)
+                                    .monospace()
+                                    .color(theme::WEAK),
+                            );
+                        });
+                    }
+                    for line in code.trim_end_matches('\n').lines() {
+                        let shown = if line.is_empty() { " " } else { line };
+                        let job = highlight_code_line(shown, lang.as_deref());
+                        let resp = ui.add(egui::Label::new(job).sense(Sense::click()));
+                        clicked |= resp.clicked();
+                    }
                 });
             if clicked {
                 LineClick::Edit
@@ -370,20 +764,7 @@ fn render_one_span(
     level: u8,
 ) -> LineClick {
     match span {
-        Span::Text(t) => {
-            let rich = if heading {
-                theme::heading_rich(t, level)
-            } else {
-                // Pin ink: Sense::click labels use hovered.fg_stroke — keep explicit TEXT.
-                RichText::new(t).size(size).color(theme::TEXT)
-            };
-            let resp = ui.add(egui::Label::new(rich).sense(Sense::click()));
-            if resp.clicked() {
-                LineClick::Edit
-            } else {
-                LineClick::None
-            }
-        }
+        Span::Text(t) => render_text_chunks(ui, t, size, heading, level),
         Span::Strong(t) => {
             let resp = ui.add(
                 egui::Label::new(RichText::new(t).size(size).strong().color(theme::TEXT))
@@ -401,6 +782,53 @@ fn render_one_span(
                     .sense(Sense::click()),
             );
             if resp.clicked() {
+                LineClick::Edit
+            } else {
+                LineClick::None
+            }
+        }
+        Span::Strike(t) => {
+            let resp = ui.add(
+                egui::Label::new(
+                    RichText::new(t)
+                        .size(size)
+                        .strikethrough()
+                        .color(theme::WEAK),
+                )
+                .sense(Sense::click()),
+            );
+            if resp.clicked() {
+                LineClick::Edit
+            } else {
+                LineClick::None
+            }
+        }
+        Span::Highlight(t) => {
+            let mut clicked = false;
+            egui::Frame::NONE
+                .fill(Color32::from_rgba_unmultiplied(
+                    theme::WARN.r(),
+                    theme::WARN.g(),
+                    theme::WARN.b(),
+                    56,
+                ))
+                .corner_radius(theme::round_sm())
+                .inner_margin(egui::Margin::symmetric(3, 1))
+                .show(ui, |ui| {
+                    let resp = ui.add(
+                        egui::Label::new(RichText::new(t).size(size).color(theme::TEXT))
+                            .sense(Sense::click()),
+                    );
+                    clicked = resp.clicked();
+                });
+            if clicked {
+                LineClick::Edit
+            } else {
+                LineClick::None
+            }
+        }
+        Span::InlineMath { formula } => {
+            if math_block::show_inline(ui, formula, size) {
                 LineClick::Edit
             } else {
                 LineClick::None
@@ -496,6 +924,11 @@ fn render_one_span(
             height,
         } => {
             let label = alias.as_deref();
+            if let Some(path) = vault.index().resolve(target, source_path) {
+                if path.ends_with(".md") {
+                    return render_note_embed(ui, vault, &path, label);
+                }
+            }
             render_media_embed(ui, vault, target, label, *width, *height)
         }
         Span::Image {
@@ -537,6 +970,223 @@ fn embed_draw_width(ui: &Ui, width: Option<u32>) -> f32 {
         Some(w) => (w as f32).clamp(40.0, avail),
         None => avail.min(640.0),
     }
+}
+
+/// Split plain text on `#tags` (Obsidian-style: `#` + non-space run).
+fn render_text_chunks(
+    ui: &mut Ui,
+    text: &str,
+    size: f32,
+    heading: bool,
+    level: u8,
+) -> LineClick {
+    let mut click = LineClick::None;
+    let mut rest = text;
+    while !rest.is_empty() {
+        let Some(hash_at) = rest.find('#') else {
+            click = merge_click(click, paint_plain_text(ui, rest, size, heading, level));
+            break;
+        };
+        if hash_at > 0 {
+            click = merge_click(
+                click,
+                paint_plain_text(ui, &rest[..hash_at], size, heading, level),
+            );
+            rest = &rest[hash_at..];
+        }
+        // Tag: # then letters/digits/_/-//
+        let after = &rest[1..];
+        let tag_len = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '/')
+            .count();
+        if tag_len == 0 {
+            click = merge_click(click, paint_plain_text(ui, "#", size, heading, level));
+            rest = after;
+            continue;
+        }
+        // Don't treat heading markers or mid-word `#` as tags.
+        let tag = &after[..tag_len];
+        let resp = ui
+            .add(
+                egui::Label::new(
+                    RichText::new(format!("#{tag}"))
+                        .size(size)
+                        .color(theme::ACCENT),
+                )
+                .sense(Sense::click()),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand);
+        if resp.clicked() {
+            click = LineClick::Tag {
+                query: tag.to_string(),
+            };
+        }
+        rest = &after[tag_len..];
+    }
+    click
+}
+
+fn paint_plain_text(
+    ui: &mut Ui,
+    text: &str,
+    size: f32,
+    heading: bool,
+    level: u8,
+) -> LineClick {
+    if text.is_empty() {
+        return LineClick::None;
+    }
+    let rich = if heading {
+        theme::heading_rich(text, level)
+    } else {
+        RichText::new(text).size(size).color(theme::TEXT)
+    };
+    let resp = ui.add(egui::Label::new(rich).sense(Sense::click()));
+    if resp.clicked() {
+        LineClick::Edit
+    } else {
+        LineClick::None
+    }
+}
+
+/// `![[Note]]` card: title + first few lines. Click opens the note.
+fn render_note_embed(
+    ui: &mut Ui,
+    vault: &Vault,
+    path: &str,
+    alias: Option<&str>,
+) -> LineClick {
+    let content = vault.read(path).unwrap_or_default();
+    let title = alias
+        .map(str::to_string)
+        .unwrap_or_else(|| bluelink_core::title_from_content(&content, path));
+    let preview_lines: Vec<&str> = content
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with("---")
+        })
+        .take(4)
+        .collect();
+
+    let mut open = false;
+    egui::Frame::NONE
+        .fill(theme::CODE_BG)
+        .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+        .corner_radius(theme::round())
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            let title_resp = ui.add(
+                egui::Label::new(
+                    RichText::new(&title)
+                        .size(theme::EDITOR_SIZE)
+                        .strong()
+                        .color(theme::ACCENT),
+                )
+                .sense(Sense::click()),
+            );
+            open |= title_resp
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .clicked();
+            for line in preview_lines {
+                let resp = ui.add(
+                    egui::Label::new(
+                        RichText::new(line)
+                            .size(13.0)
+                            .color(theme::WEAK),
+                    )
+                    .sense(Sense::click()),
+                );
+                open |= resp.clicked();
+            }
+        });
+    if open {
+        LineClick::Wiki {
+            raw: path.trim_end_matches(".md").to_string(),
+            new_tab: ui.input(|i| i.modifiers.command),
+        }
+    } else {
+        LineClick::None
+    }
+}
+
+/// Paint a callout card for lines `[start, end)`. Returns clicked source line.
+pub fn paint_callout(
+    ui: &mut Ui,
+    lines: &[String],
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    let first = lines.get(start)?;
+    let ty = callout_type(first).unwrap_or("note");
+    let title = {
+        let t = first.trim_start();
+        let after_gt = t.strip_prefix('>').map(str::trim_start).unwrap_or(t);
+        after_gt
+            .find(']')
+            .map(|i| after_gt[i + 1..].trim())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut clicked_line = None;
+    egui::Frame::NONE
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT))
+        .corner_radius(theme::round())
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(ty.to_ascii_uppercase())
+                        .size(12.0)
+                        .strong()
+                        .color(theme::ACCENT),
+                );
+                if !title.is_empty() {
+                    let resp = ui.add(
+                        egui::Label::new(
+                            RichText::new(&title)
+                                .size(theme::EDITOR_SIZE)
+                                .strong()
+                                .color(theme::TEXT),
+                        )
+                        .sense(Sense::click()),
+                    );
+                    if resp.clicked() {
+                        clicked_line = Some(start);
+                    }
+                }
+            });
+            for (k, line) in lines.iter().enumerate().take(end).skip(start + 1) {
+                let body = line
+                    .trim_start()
+                    .strip_prefix('>')
+                    .map(str::trim_start)
+                    .unwrap_or(line.as_str());
+                let shown = if body.is_empty() { " " } else { body };
+                let resp = ui.add(
+                    egui::Label::new(RichText::new(shown).size(theme::EDITOR_SIZE).color(theme::TEXT))
+                        .sense(Sense::click()),
+                );
+                if resp.clicked() {
+                    clicked_line = Some(k);
+                }
+            }
+            // Click on empty title area still opens the header line.
+            if title.is_empty() {
+                let resp = ui.allocate_response(
+                    egui::vec2(ui.available_width(), 4.0),
+                    Sense::click(),
+                );
+                if resp.clicked() {
+                    clicked_line = Some(start);
+                }
+            }
+        });
+    clicked_line
 }
 
 /// Embed / local image: capped async texture (not egui file:// decode), other media as open-externally.
@@ -806,5 +1456,54 @@ mod fence_tests {
         assert_eq!(advance_fence("```", &mut open), FenceRole::Close);
         assert!(open.is_none());
         assert_eq!(advance_fence("after", &mut open), FenceRole::Outside);
+    }
+
+    #[test]
+    fn checklist_marker_roundtrip() {
+        assert_eq!(
+            parse_checklist("- [ ] buy milk"),
+            Some((CheckMark::Unchecked, "buy milk"))
+        );
+        assert_eq!(
+            parse_checklist("  * [x] done"),
+            Some((CheckMark::Checked, "done"))
+        );
+        assert_eq!(
+            toggle_checklist_line("- [ ] buy milk").as_deref(),
+            Some("- [x] buy milk")
+        );
+        assert_eq!(
+            toggle_checklist_line("- [x] buy milk").as_deref(),
+            Some("- [ ] buy milk")
+        );
+        assert!(parse_checklist("- not a task").is_none());
+    }
+
+    #[test]
+    fn callout_bounds() {
+        let lines = vec![
+            "before".into(),
+            "> [!note] Title".into(),
+            "> body".into(),
+            "> more".into(),
+            "after".into(),
+        ];
+        let places = callout_places(&lines);
+        assert_eq!(places[0], CalloutPlace::None);
+        assert_eq!(places[1], CalloutPlace::Head { end: 4 });
+        assert_eq!(places[2], CalloutPlace::Tail { start: 1, end: 4 });
+        assert_eq!(places[3], CalloutPlace::Tail { start: 1, end: 4 });
+        assert_eq!(places[4], CalloutPlace::None);
+        assert_eq!(callout_type("> [!warning]"), Some("warning"));
+        assert_eq!(callout_type("> plain"), None);
+    }
+
+    #[test]
+    fn continue_marker_on_empty_clears() {
+        let c = continue_list_marker("- [ ] ").unwrap();
+        assert!(c.empty_body);
+        let c = continue_list_marker("- item").unwrap();
+        assert!(!c.empty_body);
+        assert_eq!(c.next_prefix, "- ");
     }
 }

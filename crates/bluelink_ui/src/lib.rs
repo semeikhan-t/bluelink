@@ -2,11 +2,15 @@
 
 mod editor;
 mod editor_menu;
+mod find_bar;
 mod footnote;
 mod local_graph;
 mod math_block;
 mod media;
+mod note_history;
+mod outline;
 mod preview;
+mod properties_panel;
 mod quick_switcher;
 mod sync_panels;
 mod table;
@@ -27,8 +31,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bluelink_core::{
-    create_path_for_link, extract_wikilinks, title_from_content, validate_rel_path, NoteMeta, Vault,
-    VaultError, WikiIndex,
+    block_line, create_path_for_link, extract_wikilinks, heading_line, link_fragment,
+    rewrite_heading_links, title_from_content, validate_rel_path, NoteMeta, Vault, VaultError,
+    WikiIndex,
 };
 use eframe::egui;
 use egui_phosphor::regular;
@@ -75,6 +80,17 @@ struct QuickSwitcher {
     query: String,
     results: Vec<quick_switcher::SearchResult>,
     selected: usize,
+    request_focus: bool,
+}
+
+/// Ctrl+F find / replace strip above the note body.
+#[derive(Default)]
+struct FindBar {
+    open: bool,
+    query: String,
+    replace: String,
+    /// Index into `find_matches` for the open query.
+    cursor: usize,
     request_focus: bool,
 }
 
@@ -148,6 +164,14 @@ pub struct App {
     screen: sync_panels::Screen,
     /// Mirrored sync runtime state (drained from `sync_ui` each frame).
     sync_panel: sync_panels::SyncPanelState,
+    /// Per-note typing undo/redo (separate from vault delete undo).
+    note_history: note_history::NoteHistory,
+    /// Line the live editor should scroll to (consumed via `LiveResult`).
+    scroll_to_line: Option<usize>,
+    find_bar: FindBar,
+    outline_renaming: Option<outline::OutlineRename>,
+    /// Group property-panel keystrokes into one NoteHistory checkpoint.
+    props_burst: bool,
 }
 
 impl App {
@@ -196,6 +220,11 @@ impl App {
             sync_ui,
             screen: sync_panels::Screen::Notes,
             sync_panel: sync_panels::SyncPanelState::default(),
+            note_history: note_history::NoteHistory::new(),
+            scroll_to_line: None,
+            find_bar: FindBar::default(),
+            outline_renaming: None,
+            props_burst: false,
         };
 
         // --vault wins; otherwise reopen last known vault.
@@ -253,6 +282,11 @@ impl App {
                 self.open_tabs.clear();
                 self.active_tab = None;
                 self.undo_stack.clear();
+                self.note_history.clear();
+                self.scroll_to_line = None;
+                self.find_bar = FindBar::default();
+                self.outline_renaming = None;
+                self.props_burst = false;
                 self.recent.clear();
                 self.selected = None;
                 self.buffer.clear();
@@ -271,6 +305,7 @@ impl App {
                 self.open_tabs.clear();
                 self.active_tab = None;
                 self.undo_stack.clear();
+                self.note_history.clear();
                 self.recent.clear();
             }
         }
@@ -286,6 +321,11 @@ impl App {
         self.open_tabs.clear();
         self.active_tab = None;
         self.undo_stack.clear();
+        self.note_history.clear();
+        self.scroll_to_line = None;
+        self.find_bar = FindBar::default();
+        self.outline_renaming = None;
+        self.props_burst = false;
         self.recent.clear();
         self.selected = None;
         self.buffer.clear();
@@ -598,6 +638,12 @@ impl App {
                 self.last_edit = None;
                 self.active_line = None;
                 self.doc_edit = false;
+                // NoteHistory undo + redo stacks; vault delete undo is separate.
+                self.note_history.clear();
+                self.scroll_to_line = None;
+                self.outline_renaming = None;
+                self.props_burst = false;
+                self.find_bar.cursor = 0;
                 self.selected = Some(rel_path.to_string());
                 self.acked_external_sha = None;
                 self.selected_sha = self
@@ -615,6 +661,9 @@ impl App {
                 self.last_edit = None;
                 self.active_line = None;
                 self.doc_edit = false;
+                self.note_history.clear();
+                self.scroll_to_line = None;
+                self.outline_renaming = None;
                 self.selected = Some(rel_path.to_string());
                 self.acked_external_sha = None;
                 self.selected_sha = None;
@@ -839,7 +888,8 @@ impl App {
         self.clamp_active_tab();
     }
 
-    fn handle_wikilink(&mut self, raw: &str, new_tab: bool) {
+    fn handle_wikilink(&mut self, raw: &str, new_tab: bool, fragment: Option<String>) {
+        let fragment = fragment.or_else(|| link_fragment(raw));
         let Some(vault) = &self.vault else {
             return;
         };
@@ -851,6 +901,10 @@ impl App {
             } else {
                 self.select_note(&path);
             }
+            // Scroll even when the note was already open (open_note early-returns).
+            if let Some(frag) = fragment {
+                self.scroll_to_fragment(&frag);
+            }
             return;
         }
 
@@ -860,6 +914,161 @@ impl App {
             rel_path: rel,
             new_tab,
         });
+    }
+
+    fn scroll_to_fragment(&mut self, fragment: &str) {
+        let line = if fragment.starts_with('^') {
+            block_line(&self.buffer, fragment)
+        } else {
+            heading_line(&self.buffer, fragment)
+        };
+        let Some(line) = line else {
+            self.status = format!("not found: #{fragment}");
+            return;
+        };
+        self.scroll_to_line = Some(line);
+        self.active_line = Some(line);
+        self.doc_edit = false;
+    }
+
+    fn line_of_byte(text: &str, byte: usize) -> usize {
+        text.get(..byte)
+            .map(|prefix| prefix.bytes().filter(|&b| b == b'\n').count())
+            .unwrap_or(0)
+    }
+
+    fn find_jump_current(&mut self) {
+        let matches = find_bar::find_matches(&self.buffer, &self.find_bar.query);
+        if matches.is_empty() {
+            self.status = "no matches".into();
+            return;
+        }
+        self.find_bar.cursor %= matches.len();
+        let (start, _) = matches[self.find_bar.cursor];
+        let line = Self::line_of_byte(&self.buffer, start);
+        self.scroll_to_line = Some(line);
+        self.active_line = Some(line);
+        self.doc_edit = false;
+        self.status = format!("match {}/{}", self.find_bar.cursor + 1, matches.len());
+    }
+
+    fn find_next(&mut self, forward: bool) {
+        let n = find_bar::find_matches(&self.buffer, &self.find_bar.query).len();
+        if n == 0 {
+            self.status = "no matches".into();
+            return;
+        }
+        if forward {
+            self.find_bar.cursor = (self.find_bar.cursor + 1) % n;
+        } else {
+            self.find_bar.cursor = self.find_bar.cursor.checked_sub(1).unwrap_or(n - 1);
+        }
+        self.find_jump_current();
+    }
+
+    fn find_replace_one(&mut self) {
+        if self.readonly || self.find_bar.query.is_empty() {
+            return;
+        }
+        let q = self.find_bar.query.clone();
+        let repl = self.find_bar.replace.clone();
+        let idx = self.find_bar.cursor;
+        self.note_history.checkpoint(&self.buffer);
+        if find_bar::replace_one(&mut self.buffer, &q, &repl, idx) {
+            self.dirty = true;
+            self.last_edit = Some(Instant::now());
+            self.find_jump_current();
+        }
+    }
+
+    fn find_replace_all(&mut self) {
+        if self.readonly || self.find_bar.query.is_empty() {
+            return;
+        }
+        let q = self.find_bar.query.clone();
+        let repl = self.find_bar.replace.clone();
+        self.note_history.checkpoint(&self.buffer);
+        let n = find_bar::replace_all(&mut self.buffer, &q, &repl);
+        if n > 0 {
+            self.dirty = true;
+            self.last_edit = Some(Instant::now());
+            self.find_bar.cursor = 0;
+            self.status = format!("replaced {n}");
+        }
+    }
+
+    fn undo_note_or_file(&mut self) {
+        if self.note_history.undo(&mut self.buffer) {
+            self.dirty = true;
+            self.last_edit = Some(Instant::now());
+            self.active_line = None;
+            self.doc_edit = false;
+            self.status = "undo".into();
+            return;
+        }
+        self.undo();
+    }
+
+    fn redo_note(&mut self) {
+        if self.note_history.redo(&mut self.buffer) {
+            self.dirty = true;
+            self.last_edit = Some(Instant::now());
+            self.active_line = None;
+            self.doc_edit = false;
+            self.status = "redo".into();
+        }
+    }
+
+    fn note_stem(path: &str) -> &str {
+        Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(path)
+    }
+
+    fn apply_heading_rename(&mut self, line: usize, old: &str, new: &str) {
+        if self.readonly || old == new || new.is_empty() {
+            return;
+        }
+        let Some(note_path) = self.selected.clone() else {
+            return;
+        };
+        let stem = Self::note_stem(&note_path).to_string();
+        self.note_history.checkpoint(&self.buffer);
+        if !outline::rewrite_heading_line(&mut self.buffer, line, new) {
+            return;
+        }
+        self.buffer = rewrite_heading_links(&self.buffer, &stem, old, new);
+        self.dirty = true;
+        self.last_edit = Some(Instant::now());
+
+        // Other notes in the vault that link to this heading.
+        let paths: Vec<String> = self
+            .notes
+            .iter()
+            .map(|n| n.rel_path.clone())
+            .filter(|p| p != &note_path)
+            .collect();
+        for path in paths {
+            let updated = {
+                let Some(vault) = &self.vault else {
+                    return;
+                };
+                match vault.read(&path) {
+                    Ok(content) => {
+                        let next = rewrite_heading_links(&content, &stem, old, new);
+                        (next != content).then_some(next)
+                    }
+                    Err(_) => None,
+                }
+            };
+            if let Some(content) = updated {
+                if let Some(vault) = self.vault.as_mut() {
+                    let _ = vault.write(&path, &content);
+                }
+            }
+        }
+        self.status = format!("renamed heading to {new}");
     }
 
     fn create_note(&mut self, rel_path: &str, initial: &str, new_tab: bool) {
@@ -914,9 +1123,16 @@ impl App {
     }
 
     fn open_quick_switcher(&mut self) {
+        self.open_quick_switcher_with("");
+    }
+
+    fn open_quick_switcher_with(&mut self, query: &str) {
         if self.vault.is_some() {
+            let query = query.to_string();
+            let results = self.quick_switch_results(&query);
             self.quick_switcher = Some(QuickSwitcher {
-                results: self.quick_switch_results(""),
+                query,
+                results,
                 request_focus: true,
                 ..Default::default()
             });
@@ -1501,6 +1717,9 @@ impl App {
                 self.acked_external_sha = None;
                 self.active_line = None;
                 self.doc_edit = false;
+                self.note_history.clear();
+                self.scroll_to_line = None;
+                self.outline_renaming = None;
                 self.status = format!("reloaded from disk {}", hhmm_now());
             }
             Err(VaultError::NotUtf8) => {
@@ -1512,9 +1731,103 @@ impl App {
                 self.acked_external_sha = None;
                 self.active_line = None;
                 self.doc_edit = false;
+                self.note_history.clear();
+                self.scroll_to_line = None;
                 self.status = "note is not UTF-8 (read-only)".into();
             }
             Err(e) => self.status = format!("reload failed: {e}"),
+        }
+    }
+
+    fn show_find_bar(&mut self, ui: &mut egui::Ui) {
+        let mut close = false;
+        let mut go_next = false;
+        let mut go_prev = false;
+        let mut do_replace = false;
+        let mut do_replace_all = false;
+        let mut query_changed = false;
+
+        egui::Frame::NONE
+            .fill(theme::PANEL)
+            .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+            .corner_radius(theme::round_sm())
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Find")
+                            .size(13.0)
+                            .color(theme::WEAK),
+                    );
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.find_bar.query)
+                            .desired_width(160.0)
+                            .hint_text("Find…"),
+                    );
+                    if self.find_bar.request_focus {
+                        resp.request_focus();
+                        self.find_bar.request_focus = false;
+                    }
+                    if resp.changed() {
+                        query_changed = true;
+                    }
+                    if ui
+                        .small_button(regular::ARROW_DOWN.to_string())
+                        .on_hover_text("Next")
+                        .clicked()
+                    {
+                        go_next = true;
+                    }
+                    if ui
+                        .small_button(regular::ARROW_UP.to_string())
+                        .on_hover_text("Previous")
+                        .clicked()
+                    {
+                        go_prev = true;
+                    }
+                    ui.label(
+                        egui::RichText::new("Replace")
+                            .size(13.0)
+                            .color(theme::WEAK),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.find_bar.replace)
+                            .desired_width(120.0)
+                            .hint_text("Replace…"),
+                    );
+                    if ui.small_button("Replace").clicked() {
+                        do_replace = true;
+                    }
+                    if ui.small_button("All").on_hover_text("Replace all").clicked() {
+                        do_replace_all = true;
+                    }
+                    if ui.small_button(regular::X.to_string()).on_hover_text("Close").clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    {
+                        close = true;
+                    }
+                });
+            });
+
+        if close {
+            self.find_bar.open = false;
+            return;
+        }
+        if query_changed {
+            self.find_bar.cursor = 0;
+            self.find_jump_current();
+        }
+        if go_next {
+            self.find_next(true);
+        }
+        if go_prev {
+            self.find_next(false);
+        }
+        if do_replace {
+            self.find_replace_one();
+        }
+        if do_replace_all {
+            self.find_replace_all();
         }
     }
 
@@ -1754,25 +2067,47 @@ impl eframe::App for App {
             && (self.selected.is_some() || has_graph_tab)
             && self.dialog.is_none()
             && self.quick_switcher.is_none();
-        let (save, new_note, close_tab, next_tab, quick_switch, toggle_graph, delete_note, undo, nav_back, nav_fwd) =
-            ctx.input_mut(|i| {
-                (
-                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
-                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::T),
-                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::W),
-                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab),
-                    can_open_switcher && i.consume_key(egui::Modifiers::COMMAND, egui::Key::P),
-                    can_toggle_graph && i.consume_key(egui::Modifiers::COMMAND, egui::Key::G),
-                    can_bind && i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
-                    can_bind && i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z),
-                    i.modifiers.alt
-                        && !i.modifiers.command
-                        && i.key_pressed(egui::Key::ArrowLeft),
-                    i.modifiers.alt
-                        && !i.modifiers.command
-                        && i.key_pressed(egui::Key::ArrowRight),
-                )
-            });
+        let (
+            save,
+            new_note,
+            close_tab,
+            next_tab,
+            quick_switch,
+            toggle_graph,
+            delete_note,
+            undo,
+            redo,
+            find,
+            nav_back,
+            nav_fwd,
+        ) = ctx.input_mut(|i| {
+            let redo = can_bind
+                && i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::Z,
+                );
+            let undo = can_bind
+                && !redo
+                && i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z);
+            (
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::T),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::W),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab),
+                can_open_switcher && i.consume_key(egui::Modifiers::COMMAND, egui::Key::P),
+                can_toggle_graph && i.consume_key(egui::Modifiers::COMMAND, egui::Key::G),
+                can_bind && i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
+                undo,
+                redo,
+                can_open_switcher && i.consume_key(egui::Modifiers::COMMAND, egui::Key::F),
+                i.modifiers.alt
+                    && !i.modifiers.command
+                    && i.key_pressed(egui::Key::ArrowLeft),
+                i.modifiers.alt
+                    && !i.modifiers.command
+                    && i.key_pressed(egui::Key::ArrowRight),
+            )
+        });
         if save {
             self.save_current();
         }
@@ -1800,7 +2135,14 @@ impl eframe::App for App {
             }
         }
         if undo && on_notes {
-            self.undo();
+            self.undo_note_or_file();
+        }
+        if redo && on_notes {
+            self.redo_note();
+        }
+        if find && on_notes && !self.is_graph_active() && self.selected.is_some() {
+            self.find_bar.open = true;
+            self.find_bar.request_focus = true;
         }
         if nav_back && on_notes {
             self.go_back();
@@ -2001,7 +2343,7 @@ impl eframe::App for App {
                         self.delete_path(&path);
                     }
                     if action.undo {
-                        self.undo();
+                        self.undo_note_or_file();
                     }
                     if let Some((from, to)) = action.move_note {
                         self.move_note(&from, &to);
@@ -2046,6 +2388,8 @@ impl eframe::App for App {
 
         let notes_screen = self.screen == sync_panels::Screen::Notes;
         let mut open_backlink: Option<String> = None;
+        let mut outline_jump: Option<usize> = None;
+        let mut outline_rename: Option<(usize, String, String)> = None;
         let backlink_target = if notes_screen {
             if self.is_graph_active() {
                 self.graph_center().map(str::to_string)
@@ -2054,6 +2398,12 @@ impl eframe::App for App {
             }
         } else {
             None
+        };
+        let outline_entries = if notes_screen && !self.is_graph_active() && self.selected.is_some()
+        {
+            outline::headings(&self.buffer)
+        } else {
+            Vec::new()
         };
         let backlinks: Vec<(String, Option<String>)> =
             match (backlink_target.as_deref(), self.vault.as_ref()) {
@@ -2072,22 +2422,48 @@ impl eframe::App for App {
                 }
                 _ => Vec::new(),
             };
+        let show_right_rail =
+            notes_screen && (!outline_entries.is_empty() || !backlinks.is_empty());
         // show_animated: hide when empty without remounting the panel every note switch
         // (abrupt SidePanel mount/unmount has frozen the Wayland event loop before).
         egui::SidePanel::right("backlinks")
             .default_width(240.0)
             .min_width(180.0)
-            .show_animated(ctx, notes_screen && !backlinks.is_empty(), |ui| {
+            .show_animated(ctx, show_right_rail, |ui| {
                 ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("Backlinks")
-                        .size(16.0)
-                        .family(theme::display_family())
-                        .color(theme::TEXT),
-                );
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(6.0);
+
+                let outline_action =
+                    outline::show(ui, &outline_entries, &mut self.outline_renaming);
+                if let Some(line) = outline_action.jump {
+                    outline_jump = Some(line);
+                }
+                if let Some((line, title)) = outline_action.start_rename {
+                    self.outline_renaming = Some(outline::OutlineRename {
+                        line,
+                        old: title.clone(),
+                        draft: title,
+                        request_focus: true,
+                    });
+                }
+                if outline_action.cancel_rename {
+                    self.outline_renaming = None;
+                }
+                if let Some(commit) = outline_action.commit_rename {
+                    self.outline_renaming = None;
+                    outline_rename = Some(commit);
+                }
+
+                if !backlinks.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Backlinks")
+                            .size(16.0)
+                            .family(theme::display_family())
+                            .color(theme::TEXT),
+                    );
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                }
 
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -2127,6 +2503,14 @@ impl eframe::App for App {
             });
         if let Some(path) = open_backlink {
             self.select_note(&path);
+        }
+        if let Some(line) = outline_jump {
+            self.scroll_to_line = Some(line);
+            self.active_line = Some(line);
+            self.doc_edit = false;
+        }
+        if let Some((line, old, new)) = outline_rename {
+            self.apply_heading_rename(line, &old, &new);
         }
 
         egui::CentralPanel::default()
@@ -2248,10 +2632,36 @@ impl eframe::App for App {
                 return;
             }
 
+            if self.find_bar.open {
+                self.show_find_bar(ui);
+                ui.add_space(6.0);
+            }
+
+            {
+                let props = properties_panel::show(ui, &self.buffer, self.readonly);
+                if let Some(next) = props.rewritten {
+                    if next != self.buffer {
+                        if !self.props_burst {
+                            self.note_history.checkpoint(&self.buffer);
+                            self.props_burst = true;
+                        }
+                        self.buffer = next;
+                        self.dirty = true;
+                        self.last_edit = Some(Instant::now());
+                    }
+                }
+                if !props.focused {
+                    self.props_burst = false;
+                }
+                ui.add_space(8.0);
+            }
+
             // Take vault temporarily so we can mutate buffer alongside an immutable vault borrow.
             let vault = self.vault.take();
             let mut wiki_click = None;
             let mut want_attach = false;
+            let mut tag_query = None;
+            let scroll_to = self.scroll_to_line;
             if let Some(ref v) = vault {
                 let live = editor::show_live(
                     ui,
@@ -2261,24 +2671,33 @@ impl eframe::App for App {
                     &mut self.active_line,
                     &mut self.doc_edit,
                     self.readonly,
+                    scroll_to,
+                    &mut self.note_history,
                 );
                 if live.changed {
                     self.dirty = true;
                     self.last_edit = Some(Instant::now());
                     ctx.request_repaint_after(Duration::from_secs(1));
                 }
+                if live.scroll_consumed {
+                    self.scroll_to_line = None;
+                }
                 if let Some(msg) = live.status {
                     self.status = msg;
                 }
                 want_attach = live.attach_file;
                 wiki_click = live.wikilink;
+                tag_query = live.tag_query;
             }
             self.vault = vault;
             if want_attach {
                 self.pick_attach_file();
             }
             if let Some(click) = wiki_click {
-                self.handle_wikilink(&click.raw, click.new_tab);
+                self.handle_wikilink(&click.raw, click.new_tab, click.fragment);
+            }
+            if let Some(query) = tag_query {
+                self.open_quick_switcher_with(&query);
             }
         });
 
