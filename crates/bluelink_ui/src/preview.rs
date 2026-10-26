@@ -1,4 +1,4 @@
-use bluelink_core::{parse_preview, split_wikilinks, PreviewBlock, Span, Vault};
+use bluelink_core::{parse_preview, split_wikilinks, PreviewBlock, PreviewDoc, Span, Vault};
 use egui::{
     Color32, CornerRadius, CursorIcon, FontFamily, FontId, OpenUrl, RichText, Sense, Ui,
 };
@@ -87,14 +87,17 @@ pub enum LineClick {
     },
 }
 
-/// Compact preview of a single source line.
-/// Wikilinks render as accent underlines; click opens them. Other text click → edit.
-pub fn render_line_with_role(
+/// Render a line using a preview parsed by the caller.
+///
+/// The live editor keeps this model between frames so scrolling does not repeatedly
+/// allocate and parse the same Markdown line.
+pub fn render_line_with_preview(
     ui: &mut Ui,
     vault: &Vault,
     source_path: Option<&str>,
     line: &str,
     role: FenceRole,
+    preview: Option<&PreviewDoc>,
 ) -> LineClick {
     if !matches!(role, FenceRole::Outside) {
         return render_fence_stripe(ui, line, role);
@@ -108,7 +111,14 @@ pub fn render_line_with_role(
             LineClick::None
         };
     }
-    let doc = parse_preview(line);
+    let owned_preview;
+    let doc = match preview {
+        Some(doc) => doc,
+        None => {
+            owned_preview = parse_preview(line);
+            &owned_preview
+        }
+    };
     let mut click = LineClick::None;
     for block in &doc.blocks {
         let c = render_block_compact(ui, vault, source_path, block);

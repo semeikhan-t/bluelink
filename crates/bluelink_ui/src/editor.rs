@@ -1,9 +1,10 @@
 //! Line-based live preview: active line is raw Markdown, others are rendered.
 //! Ctrl+A opens full-document edit with everything selected.
 
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use bluelink_core::Vault;
+use bluelink_core::{PreviewDoc, Vault};
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{FontFamily, FontId, Id, Key, Order, TextEdit, Ui};
 
@@ -56,6 +57,148 @@ pub struct LiveResult {
     pub status: Option<String>,
 }
 
+#[derive(Clone)]
+struct CachedPreviewLine {
+    fingerprint: u64,
+    preview: Option<PreviewDoc>,
+    height: f32,
+}
+
+#[derive(Clone)]
+struct LiveLayoutCache {
+    lines: Vec<CachedPreviewLine>,
+}
+
+impl LiveLayoutCache {
+    fn for_lines(buffer: &str, ranges: &[(usize, usize)], roles: &[preview::FenceRole]) -> Self {
+        let lines = ranges
+            .iter()
+            .enumerate()
+            .map(|(i, &(start, end))| {
+                let line = buffer.get(start..end).unwrap_or("");
+                CachedPreviewLine {
+                    fingerprint: line_fingerprint(line),
+                    preview: None,
+                    height: estimate_row_height(line, roles[i]),
+                }
+            })
+            .collect();
+        Self { lines }
+    }
+}
+
+fn line_fingerprint(line: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    line.hash(&mut hasher);
+    hasher.finish()
+}
+
+const TOP_PAD: f32 = 12.0;
+const ROW_GAP: f32 = 10.0;
+/// Extra band so fast flings don't flash empty rows.
+const OVERSCAN: f32 = 600.0;
+
+/// On Wayland, winit often reports the mouse wheel as `PixelDelta` (Point units).
+/// `Options::line_scroll_speed` only scales `Line` units — Point notches stay ~15–40px
+/// and feel sluggish vs browsers (~120px). Discrete-sized Point deltas get this boost.
+const POINT_WHEEL_BOOST: f32 = 4.0;
+/// Gentler multiplier for small continuous Point deltas (trackpad).
+const POINT_TRACKPAD_BOOST: f32 = 1.5;
+
+fn point_scroll_boost(raw_len: f32) -> f32 {
+    if raw_len >= 8.0 {
+        POINT_WHEEL_BOOST
+    } else {
+        POINT_TRACKPAD_BOOST
+    }
+}
+
+/// Make note scrolling feel like a browser: unsmear wheel notches and boost Wayland Point deltas.
+/// Only when the pointer is over this ui (side-panel scroll already consumed input otherwise).
+fn boost_note_scroll(ui: &Ui) {
+    if !ui.rect_contains_pointer(ui.max_rect()) {
+        return;
+    }
+    ui.ctx().input_mut(|i| {
+        let mut saw_point = false;
+        let mut saw_line = false;
+        for ev in &i.events {
+            if let egui::Event::MouseWheel { unit, .. } = ev {
+                match *unit {
+                    egui::MouseWheelUnit::Point => saw_point = true,
+                    egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => saw_line = true,
+                }
+            }
+        }
+        let raw = i.raw_scroll_delta;
+        if raw == egui::Vec2::ZERO {
+            // Drop egui's multi-frame smear leftovers — one notch = one jump.
+            i.smooth_scroll_delta = egui::Vec2::ZERO;
+            return;
+        }
+        if saw_point && !saw_line {
+            i.smooth_scroll_delta = raw * point_scroll_boost(raw.length());
+        } else {
+            // Line/Page already scaled by line_scroll_speed — apply fully this frame.
+            i.smooth_scroll_delta = raw;
+        }
+    });
+}
+
+/// Gap after row `i` (baked into stride; column uses `item_spacing.y = 0`).
+fn gap_after_row(i: usize, n: usize, role: preview::FenceRole) -> f32 {
+    if i + 1 >= n {
+        return 0.0;
+    }
+    if matches!(role, preview::FenceRole::Outside) {
+        ROW_GAP
+    } else {
+        0.0
+    }
+}
+
+/// `prefix[i]` = y of row `i` start; `prefix[n]` = total content height (incl. top pad).
+fn row_prefix_heights(heights: &[f32], roles: &[preview::FenceRole]) -> Vec<f32> {
+    let n = heights.len();
+    debug_assert_eq!(n, roles.len());
+    let mut prefix = Vec::with_capacity(n + 1);
+    prefix.push(TOP_PAD);
+    for i in 0..n {
+        let h = heights[i].max(1.0);
+        prefix.push(prefix[i] + h + gap_after_row(i, n, roles[i]));
+    }
+    prefix
+}
+
+/// Half-open `[first, last)` of rows intersecting the viewport (± overscan).
+fn visible_row_range(
+    prefix: &[f32],
+    viewport_min_y: f32,
+    viewport_max_y: f32,
+    force: Option<usize>,
+) -> (usize, usize) {
+    let n = prefix.len().saturating_sub(1);
+    if n == 0 {
+        return (0, 0);
+    }
+    let top = viewport_min_y - OVERSCAN;
+    let bot = viewport_max_y + OVERSCAN;
+    let mut first = 0usize;
+    while first < n && prefix[first + 1] < top {
+        first += 1;
+    }
+    let mut last = first;
+    while last < n && prefix[last] <= bot {
+        last += 1;
+    }
+    if let Some(i) = force {
+        let i = i.min(n.saturating_sub(1));
+        first = first.min(i);
+        last = last.max(i + 1);
+    }
+    (first, last)
+}
+
 /// Show live editor. `active_line` is the raw-editing line index (0-based).
 /// `doc_edit` — full-buffer multiline mode (Ctrl+A).
 pub fn show_live(
@@ -100,6 +243,8 @@ pub fn show_live(
         return show_doc_edit(ui, vault, source_path, buffer, doc_edit, active_line, result);
     }
 
+    boost_note_scroll(ui);
+
     let mut ranges = line_ranges(buffer);
     if ranges.is_empty() {
         ranges.push((0, 0));
@@ -123,31 +268,67 @@ pub fn show_live(
     // Active line + char selection (primary, secondary) for Shift+↑/↓.
     let mut active_sel: Option<(usize, usize, usize)> = None;
 
+    // Precompute fence roles so viewport culling can skip lines without breaking ``` state.
+    let fence_roles = {
+        let mut open = None;
+        let mut roles = Vec::with_capacity(ranges.len());
+        for &(start, end) in &ranges {
+            let line = buffer.get(start..end).unwrap_or("");
+            roles.push(preview::advance_fence(line, &mut open));
+        }
+        roles
+    };
+
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show(ui, |ui| {
+        .show_viewport(ui, |ui, viewport| {
             // Viewport height at content start — used to fill empty space below lines
             // so clicks there hit a widget (ScrollArea empty chrome is not clickable).
-            let viewport_h = ui.available_height();
+            let viewport_h = viewport.height();
             let content_top = ui.cursor().top();
 
+            // Keep parsed previews and measured heights across frames. Scrolling should not
+            // re-run pulldown-cmark for every visible line on every repaint.
+            let layout_id = Id::new(("live_layout", vault.root(), source_path.unwrap_or("")));
+            let mut layout = ui.ctx().data(|d| d.get_temp::<LiveLayoutCache>(layout_id));
+            if layout
+                .as_ref()
+                .map_or(true, |cache| cache.lines.len() != ranges.len())
+            {
+                layout = Some(LiveLayoutCache::for_lines(buffer, &ranges, &fence_roles));
+            }
+            let mut layout = layout.expect("live layout cache initialized");
+
             centered_column(ui, |ui| {
-                ui.add_space(12.0);
-                ui.spacing_mut().item_spacing.y = 10.0;
+                // Gaps are baked into prefix strides — avoid egui item_spacing double-count.
+                ui.spacing_mut().item_spacing.y = 0.0;
 
-                let mut open_fence: Option<String> = None;
-                for (i, &(start, end)) in ranges.iter().enumerate() {
-                    let line = buffer.get(start..end).unwrap_or("").to_string();
-                    let fence_role = preview::advance_fence(&line, &mut open_fence);
+                let heights: Vec<f32> = layout.lines.iter().map(|l| l.height.max(1.0)).collect();
+                let prefix = row_prefix_heights(&heights, &fence_roles);
+                let n = ranges.len();
+                let force = if readonly {
+                    None
+                } else {
+                    active_line.filter(|&i| i < n)
+                };
+                let (first, last) =
+                    visible_row_range(&prefix, viewport.min.y, viewport.max.y, force);
+
+                ui.add_space(prefix[first]);
+
+                for i in first..last {
+                    let (start, end) = ranges[i];
+                    let fence_role = fence_roles[i];
                     let in_fence = !matches!(fence_role, preview::FenceRole::Outside);
-                    // Stack fence stripes flush so they read as one block.
-                    ui.spacing_mut().item_spacing.y = if in_fence { 0.0 } else { 10.0 };
-
                     let is_active = !readonly && *active_line == Some(i);
+
+                    let line = buffer.get(start..end).unwrap_or("");
+
                     let row_id = egui::Id::new(("live_line", i));
+                    let measured_h;
 
                     if is_active {
-                        let mut draft = line.clone();
+                        let mut draft = line.to_string();
                         let font = preview::edit_font_for(&line, fence_role);
                         // TextEdit floors height at interact_size (32px) — match preview row.
                         let row_h = if line.is_empty() {
@@ -367,23 +548,39 @@ pub fn show_live(
                         {
                             merge_with_prev = Some(i);
                         }
+                        measured_h = response.rect.height().max(1.0);
                     } else {
+                        let preview = if in_fence {
+                            None
+                        } else {
+                            let fingerprint = line_fingerprint(line);
+                            let cached = &mut layout.lines[i];
+                            if cached.preview.is_none() || cached.fingerprint != fingerprint {
+                                cached.fingerprint = fingerprint;
+                                cached.preview = Some(bluelink_core::parse_preview(line));
+                                // Prefer underestimate until painted — overestimates feel like dead scroll.
+                                cached.height = estimate_row_height(line, fence_role);
+                            }
+                            cached.preview.as_ref()
+                        };
                         let row = ui.allocate_ui_with_layout(
                             egui::vec2(ui.available_width(), 0.0),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| {
                                 ui.set_min_width(ui.available_width());
                                 ui.set_min_height(22.0);
-                                preview::render_line_with_role(
+                                preview::render_line_with_preview(
                                     ui,
                                     vault,
                                     source_path,
-                                    &line,
+                                    line,
                                     fence_role,
+                                    preview,
                                 )
                             },
                         );
                         let click = row.inner;
+                        measured_h = row.response.rect.height().max(1.0);
 
                         if !readonly && row.response.secondary_clicked() {
                             let n = line.chars().count();
@@ -417,9 +614,21 @@ pub fn show_live(
                             _ => {}
                         }
                     }
-                }
 
+                    layout.lines[i].height = measured_h;
+                    let gap = gap_after_row(i, n, fence_role);
+                    if gap > 0.0 {
+                        ui.add_space(gap);
+                    }
+                }
+                let total = *prefix.last().unwrap_or(&TOP_PAD);
+                let after = (total - prefix[last]).max(0.0);
+                if after > 0.0 {
+                    ui.add_space(after);
+                }
             });
+
+            ui.ctx().data_mut(|d| d.insert_temp(layout_id, layout));
 
             if !readonly {
                 let used = (ui.cursor().top() - content_top).max(0.0);
@@ -678,6 +887,8 @@ fn show_doc_edit(
 
     let id = egui::Id::new("live_doc_edit");
     let font = FontId::new(theme::EDITOR_SIZE, FontFamily::Monospace);
+
+    boost_note_scroll(ui);
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -999,6 +1210,50 @@ fn centered_column(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
     });
 }
 
+/// Cheap height guess for off-screen rows (refined once the row is painted).
+/// Prefer underestimates: overestimates create empty scroll travel that feels like low sensitivity.
+fn estimate_row_height(line: &str, role: preview::FenceRole) -> f32 {
+    if !matches!(role, preview::FenceRole::Outside) {
+        return 22.0;
+    }
+    if line.is_empty() {
+        return 22.0;
+    }
+    if line.contains("![[") || line.contains("![") {
+        // Undershoot on purpose; measured height corrects when the row enters the viewport.
+        return embed_width_hint(line)
+            .map(|w| (w as f32 * 0.4).clamp(48.0, 160.0))
+            .unwrap_or(64.0);
+    }
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        let level = 1 + rest.chars().take_while(|c| *c == '#').count();
+        return match level {
+            1 => 36.0,
+            2 => 32.0,
+            _ => 28.0,
+        };
+    }
+    22.0
+}
+
+fn embed_width_hint(line: &str) -> Option<u32> {
+    let start = line.find("![[")?;
+    let body = &line[start + 3..];
+    let end = body.find("]]")?;
+    let inner = &body[..end];
+    let size = inner.rsplit('|').next()?;
+    if size.bytes().all(|b| b.is_ascii_digit()) {
+        return size.parse().ok();
+    }
+    if let Some((w, _)) = size.split_once('x').or_else(|| size.split_once('X')) {
+        if w.bytes().all(|b| b.is_ascii_digit()) {
+            return w.parse().ok();
+        }
+    }
+    None
+}
+
 /// Remove one leading indent level (`\\t`, 4 spaces, or 2 spaces).
 fn unindent_line(s: &mut String, primary: usize, secondary: usize) -> (usize, usize) {
     let n = if s.starts_with('\t') {
@@ -1050,7 +1305,64 @@ fn line_ranges(s: &str) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{line_char_offset, line_ranges, open_wiki_query, unindent_line, wiki_candidates};
+    use super::{
+        estimate_row_height, gap_after_row, line_char_offset, line_ranges, open_wiki_query,
+        point_scroll_boost, row_prefix_heights, unindent_line, visible_row_range, wiki_candidates,
+        POINT_TRACKPAD_BOOST, POINT_WHEEL_BOOST, ROW_GAP, TOP_PAD,
+    };
+    use crate::preview::FenceRole;
+
+    #[test]
+    fn point_wheel_boost_scales_discrete_notches() {
+        assert_eq!(point_scroll_boost(15.0), POINT_WHEEL_BOOST);
+        assert_eq!(point_scroll_boost(2.0), POINT_TRACKPAD_BOOST);
+        assert!(POINT_WHEEL_BOOST > POINT_TRACKPAD_BOOST);
+    }
+
+    #[test]
+    fn prefix_sums_bake_gaps_without_double_count() {
+        // normal, fence-open, fence-body, fence-close, normal
+        let roles = [
+            FenceRole::Outside,
+            FenceRole::Open,
+            FenceRole::Body,
+            FenceRole::Close,
+            FenceRole::Outside,
+        ];
+        let heights = [22.0_f32, 22.0, 22.0, 22.0, 22.0];
+        let prefix = row_prefix_heights(&heights, &roles);
+        assert_eq!(prefix.len(), 6);
+        assert_eq!(prefix[0], TOP_PAD);
+        // After normal: height + ROW_GAP
+        assert_eq!(prefix[1], TOP_PAD + 22.0 + ROW_GAP);
+        // Fence rows: no gap between them
+        assert_eq!(prefix[2], prefix[1] + 22.0);
+        assert_eq!(prefix[3], prefix[2] + 22.0);
+        assert_eq!(prefix[4], prefix[3] + 22.0);
+        // Last normal: no trailing gap after final row
+        assert_eq!(prefix[5], prefix[4] + 22.0);
+        assert_eq!(gap_after_row(4, 5, FenceRole::Outside), 0.0);
+        assert_eq!(gap_after_row(0, 5, FenceRole::Outside), ROW_GAP);
+        assert_eq!(gap_after_row(1, 5, FenceRole::Open), 0.0);
+    }
+
+    #[test]
+    fn visible_range_includes_forced_active_line() {
+        let roles = [FenceRole::Outside; 10];
+        let heights = [20.0_f32; 10];
+        let prefix = row_prefix_heights(&heights, &roles);
+        // Viewport far below content — without `force` the range would be empty at end.
+        let (first, last) = visible_row_range(&prefix, 10_000.0, 10_100.0, Some(1));
+        assert!(first <= 1, "active row must not be clipped away");
+        assert!(last > 1, "active row must be in [first, last)");
+    }
+
+    #[test]
+    fn embed_estimate_undershoots() {
+        let h = estimate_row_height("![[pic|425]]", FenceRole::Outside);
+        assert!(h <= 160.0, "estimate {h} should undershoot measured embeds");
+        assert!(h >= 48.0);
+    }
 
     #[test]
     fn ranges_basic() {

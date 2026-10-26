@@ -159,6 +159,11 @@ impl App {
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        // Native egui default is 40; browsers feel closer to ~100–150px/notch.
+        // (Wayland PixelDelta wheels ignore this — see boost_note_scroll in editor.rs.)
+        cc.egui_ctx.options_mut(|o| {
+            o.line_scroll_speed = 160.0;
+        });
 
         let mut registry = VaultRegistry::load();
         registry.prune_missing();
