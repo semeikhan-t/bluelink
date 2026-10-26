@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::VaultError;
 use crate::meta::{self, DeviceMeta};
-use crate::path::{self, MAX_NOTE_BYTES};
+use crate::path::{self, ATTACHMENTS_DIR, MAX_NOTE_BYTES};
 use crate::wiki::{
     notes_after_renames, rewrite_wikilinks_in_content, WikiIndex,
 };
@@ -117,19 +117,100 @@ impl Vault {
     }
 
     pub fn read(&self, rel_path: &str) -> Result<String, VaultError> {
+        path::validate_rel_path(rel_path)?;
+        let bytes = self.read_bytes(rel_path)?;
+        String::from_utf8(bytes).map_err(|_| VaultError::NotUtf8)
+    }
+
+    /// Read raw bytes for a note or media path (size-capped by extension).
+    pub fn read_bytes(&self, rel_path: &str) -> Result<Vec<u8>, VaultError> {
         let abs = path::resolve_inside_vault(&self.root, rel_path)?;
         if !abs.is_file() {
             return Err(VaultError::NotFound);
         }
         let bytes = fs::read(&abs).map_err(VaultError::from_io)?;
-        if bytes.len() as u64 > MAX_NOTE_BYTES {
+        if bytes.len() as u64 > path::max_bytes_for_rel(rel_path) {
             return Err(VaultError::TooLarge);
         }
-        String::from_utf8(bytes).map_err(|_| VaultError::NotUtf8)
+        Ok(bytes)
     }
 
     pub fn write(&mut self, rel_path: &str, content: &str) -> Result<NoteMeta, VaultError> {
         self.write_inner(rel_path, content, true)
+    }
+
+    /// Atomic write of raw bytes (note or media). Updates wiki index when path is `.md` UTF-8.
+    pub fn write_bytes(&mut self, rel_path: &str, data: &[u8]) -> Result<NoteMeta, VaultError> {
+        path::validate_vault_rel_path(rel_path)?;
+        if data.len() as u64 > path::max_bytes_for_rel(rel_path) {
+            return Err(VaultError::TooLarge);
+        }
+
+        let abs = self.root.join(rel_path);
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent).map_err(VaultError::from_io)?;
+        }
+        let abs = path::resolve_inside_vault(&self.root, rel_path)?;
+        atomic_write(&abs, data, true)?;
+
+        if rel_path.ends_with(".md") {
+            if let Ok(text) = std::str::from_utf8(data) {
+                self.index.set_note(rel_path, text);
+            }
+        }
+        note_meta_for(&abs, rel_path)
+    }
+
+    /// Save bytes under `attachments/` with an Obsidian-style unique filename.
+    ///
+    /// `preferred_stem` may contain spaces (e.g. `Pasted image 20240101120000`).
+    /// Collisions append ` 1`, ` 2`, … before the extension.
+    /// `active_note_rel` is reserved (folder is always [`ATTACHMENTS_DIR`]).
+    pub fn save_attachment(
+        &self,
+        preferred_stem: &str,
+        ext: &str,
+        bytes: &[u8],
+        _active_note_rel: &str,
+    ) -> Result<String, VaultError> {
+        if bytes.len() as u64 > path::MAX_MEDIA_BYTES {
+            return Err(VaultError::TooLarge);
+        }
+
+        let ext = ext.trim_start_matches('.');
+        if !path::is_media_extension(ext) {
+            return Err(VaultError::InvalidPath);
+        }
+
+        let stem = sanitize_attachment_stem(preferred_stem);
+        if stem.is_empty() {
+            return Err(VaultError::InvalidPath);
+        }
+
+        let dir_rel = ATTACHMENTS_DIR;
+        path::validate_folder_rel(dir_rel)?;
+        let dir_abs = self.root.join(dir_rel);
+        if !dir_abs.starts_with(&self.root) {
+            return Err(VaultError::InvalidPath);
+        }
+        fs::create_dir_all(&dir_abs).map_err(VaultError::from_io)?;
+
+        let file_name = unique_attachment_name(&dir_abs, &stem, ext);
+        let rel_path = format!("{dir_rel}/{file_name}");
+        path::validate_vault_rel_path(&rel_path)?;
+
+        let abs = path::resolve_inside_vault(&self.root, &rel_path)?;
+        atomic_write(&abs, bytes, true)?;
+        Ok(rel_path)
+    }
+
+    /// All allowlisted vault files (`.md` + media) with sha256 — for sync inventory.
+    /// [`Self::list`] stays markdown-only for the note tree.
+    pub fn list_files(&self) -> Result<Vec<NoteMeta>, VaultError> {
+        let mut files = Vec::new();
+        self.walk_files(&self.root, "", &mut files)?;
+        files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        Ok(files)
     }
 
     /// Autosave path: atomic rename without `fsync`, so the UI thread stays responsive.
@@ -377,6 +458,36 @@ impl Vault {
         Ok(())
     }
 
+    fn walk_files(
+        &self,
+        dir: &Path,
+        rel_prefix: &str,
+        out: &mut Vec<NoteMeta>,
+    ) -> Result<(), VaultError> {
+        let entries = fs::read_dir(dir).map_err(VaultError::from_io)?;
+        for entry in entries {
+            let entry = entry.map_err(VaultError::from_io)?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+            let rel = if rel_prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{rel_prefix}/{name}")
+            };
+            let path = entry.path();
+            let ft = entry.file_type().map_err(VaultError::from_io)?;
+            if ft.is_dir() {
+                self.walk_files(&path, &rel, out)?;
+            } else if ft.is_file() && path::validate_vault_rel_path(&rel).is_ok() {
+                out.push(note_meta_for(&path, &rel)?);
+            }
+        }
+        Ok(())
+    }
+
     fn walk_folders(
         &self,
         dir: &Path,
@@ -406,6 +517,36 @@ impl Vault {
             }
         }
         Ok(())
+    }
+}
+
+/// Strip path separators / nulls; keep spaces for Obsidian-style paste names.
+fn sanitize_attachment_stem(stem: &str) -> String {
+    stem.chars()
+        .filter(|c| *c != '/' && *c != '\\' && *c != '\0')
+        .collect::<String>()
+        .trim()
+        .trim_start_matches('.')
+        .to_string()
+}
+
+/// Obsidian `getAvailablePath`: `stem.ext`, then `stem 1.ext`, `stem 2.ext`, …
+fn unique_attachment_name(dir: &Path, stem: &str, ext: &str) -> String {
+    let first = format!("{stem}.{ext}");
+    if !dir.join(&first).exists() {
+        return first;
+    }
+    let mut n = 1u32;
+    loop {
+        let candidate = format!("{stem} {n}.{ext}");
+        if !dir.join(&candidate).exists() {
+            return candidate;
+        }
+        n = n.saturating_add(1);
+        if n == 0 {
+            // ponytail: u32 wrap is absurd for vault attachments; fall back to pid suffix.
+            return format!("{stem} {}.{}", std::process::id(), ext);
+        }
     }
 }
 
@@ -481,5 +622,55 @@ mod title_tests {
     fn falls_back_to_stem_when_empty() {
         assert_eq!(title_from_content("\n\n", "inbox/todo.md"), "todo");
         assert_eq!(title_from_content("###\n", "note.md"), "note");
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn save_attachment_unique_names() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let png = b"\x89PNG";
+
+        let a = vault
+            .save_attachment("Pasted image 20240101120000", "png", png, "note.md")
+            .unwrap();
+        assert_eq!(a, "attachments/Pasted image 20240101120000.png");
+        assert_eq!(
+            fs::read(dir.path().join(&a)).unwrap(),
+            png
+        );
+
+        let b = vault
+            .save_attachment("Pasted image 20240101120000", "png", b"second", "note.md")
+            .unwrap();
+        assert_eq!(b, "attachments/Pasted image 20240101120000 1.png");
+
+        let c = vault
+            .save_attachment("Pasted image 20240101120000", "png", b"third", "note.md")
+            .unwrap();
+        assert_eq!(c, "attachments/Pasted image 20240101120000 2.png");
+
+        // Notes list stays md-only; inventory includes media.
+        assert!(vault.list().unwrap().is_empty());
+        let files = vault.list_files().unwrap();
+        assert_eq!(files.len(), 3);
+        assert!(files.iter().all(|f| f.rel_path.starts_with("attachments/")));
+        assert!(!files[0].sha256.is_empty());
+    }
+
+    #[test]
+    fn read_write_bytes_roundtrip() {
+        let dir = tempdir().unwrap();
+        let mut vault = Vault::open(dir.path()).unwrap();
+        let meta = vault
+            .write_bytes("attachments/shot.webp", b"WEBPDATA")
+            .unwrap();
+        assert_eq!(meta.rel_path, "attachments/shot.webp");
+        assert_eq!(vault.read_bytes("attachments/shot.webp").unwrap(), b"WEBPDATA");
     }
 }

@@ -19,6 +19,7 @@ bluelink_sync = { workspace = true }
 bluelink_ble = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
+egui_extras = { workspace = true }
 rfd = { workspace = true }
 notify = { workspace = true }
 tokio = { workspace = true }

@@ -10,6 +10,9 @@ bluelink_sync = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 egui-phosphor = { workspace = true }
+egui_extras = { workspace = true }
+image = { workspace = true }
+arboard = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

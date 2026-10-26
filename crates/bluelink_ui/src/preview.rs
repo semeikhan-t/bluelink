@@ -1,6 +1,10 @@
 use bluelink_core::{parse_preview, split_wikilinks, PreviewBlock, Span, Vault};
-use egui::{Color32, CornerRadius, CursorIcon, FontFamily, FontId, RichText, Sense, Ui};
+use egui::{
+    Color32, CornerRadius, CursorIcon, FontFamily, FontId, OpenUrl, RichText, Sense, Ui,
+};
+use egui_phosphor::regular;
 
+use crate::media;
 use crate::theme;
 
 /// Role of a source line inside a fenced code block (``` / ~~~).
@@ -75,6 +79,12 @@ pub enum LineClick {
     Wiki { raw: String, new_tab: bool },
     /// Enter raw edit for this line.
     Edit,
+    /// Drag-resize finished: rewrite `![[target|…]]` size in the source buffer.
+    ResizeEmbed {
+        target: String,
+        width: u32,
+        height: Option<u32>,
+    },
 }
 
 /// Compact preview of a single source line.
@@ -183,6 +193,8 @@ fn render_fence_stripe(ui: &mut Ui, line: &str, role: FenceRole) -> LineClick {
 
 fn merge_click(a: LineClick, b: LineClick) -> LineClick {
     match (&a, &b) {
+        (_, LineClick::ResizeEmbed { .. }) => b,
+        (LineClick::ResizeEmbed { .. }, _) => a,
         (_, LineClick::Wiki { .. }) => b,
         (LineClick::Wiki { .. }, _) => a,
         (_, LineClick::Edit) => b,
@@ -454,7 +466,299 @@ fn render_one_span(
                 LineClick::None
             }
         }
+        Span::Embed {
+            target,
+            alias,
+            width,
+            height,
+        } => {
+            let label = alias.as_deref();
+            render_media_embed(ui, vault, target, label, *width, *height)
+        }
+        Span::Image {
+            dest,
+            alt,
+            width,
+            height,
+        } => {
+            if dest.starts_with("http://") || dest.starts_with("https://") {
+                let draw_w = embed_draw_width(ui, *width);
+                let mut img = egui::Image::new(dest.as_str()).max_width(draw_w);
+                if let Some(h) = *height {
+                    img = img
+                        .fit_to_exact_size(egui::vec2(draw_w, h as f32))
+                        .maintain_aspect_ratio(false);
+                } else {
+                    img = img.maintain_aspect_ratio(true);
+                }
+                ui.add(img);
+                if !alt.is_empty() {
+                    ui.label(RichText::new(alt).size(13.0).color(theme::WEAK));
+                }
+                LineClick::None
+            } else {
+                let label = if alt.is_empty() {
+                    None
+                } else {
+                    Some(alt.as_str())
+                };
+                render_media_embed(ui, vault, dest, label, *width, *height)
+            }
+        }
     }
+}
+
+fn embed_draw_width(ui: &Ui, width: Option<u32>) -> f32 {
+    let avail = ui.available_width().max(40.0);
+    match width {
+        Some(w) => (w as f32).clamp(40.0, avail),
+        None => avail.min(640.0),
+    }
+}
+
+/// Embed / local image: capped async texture (not egui file:// decode), other media as open-externally.
+fn render_media_embed(
+    ui: &mut Ui,
+    vault: &Vault,
+    target: &str,
+    alias: Option<&str>,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> LineClick {
+    let display = alias.unwrap_or(target);
+    // Cache resolve across frames — avoid even `is_file` / dir walks while scrolling.
+    let resolve_id = egui::Id::new(("bl_media_resolve", target));
+    let abs = ui.ctx().data(|d| d.get_temp::<Option<std::path::PathBuf>>(resolve_id));
+    let abs = match abs {
+        Some(cached) => cached,
+        None => {
+            let found = media::resolve_media(vault, target);
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(resolve_id, found.clone()));
+            found
+        }
+    };
+    let Some(abs) = abs else {
+        let resp = ui
+            .add(
+                egui::Label::new(
+                    RichText::new(format!("{}  {display}", regular::IMAGE_BROKEN))
+                        .size(theme::EDITOR_SIZE)
+                        .color(theme::WEAK),
+                )
+                .sense(Sense::click()),
+            )
+            .on_hover_text(format!("Missing: {target}"));
+        return if resp.clicked() {
+            LineClick::Edit
+        } else {
+            LineClick::None
+        };
+    };
+
+    let ext = media::extension_of(&abs).unwrap_or_default();
+    let url = media::file_url(&abs);
+    let avail = ui.available_width().max(40.0);
+    let drag_id = ui.id().with("embed_w").with(target);
+    let drag_w = ui.ctx().data(|d| d.get_temp::<f32>(drag_id));
+    let base_w = embed_draw_width(ui, width);
+    let draw_w = drag_w.unwrap_or(base_w).clamp(40.0, avail);
+
+    if media::is_previewable_image(&ext) {
+        let (media_rect, img_clicked) = match embed_texture(ui, &abs) {
+            Some(tex) => {
+                let native = tex.size_vec2();
+                let draw_size = match height {
+                    Some(h) => egui::vec2(draw_w, h as f32),
+                    None => {
+                        let scale = draw_w / native.x.max(1.0);
+                        native * scale
+                    }
+                };
+                let resp = ui
+                    .add(
+                        egui::Image::new((tex.id(), draw_size))
+                            .maintain_aspect_ratio(height.is_none())
+                            .sense(Sense::click()),
+                    )
+                    .on_hover_text(abs.display().to_string());
+                (resp.rect, resp.clicked())
+            }
+            None => {
+                // Decode in flight or failed — keep layout stable while loading.
+                let ph_h = height.map(|h| h as f32).unwrap_or(draw_w * 0.55).clamp(40.0, 320.0);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(draw_w, ph_h), Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, theme::round_sm(), theme::CODE_BG);
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    regular::IMAGE,
+                    FontId::new(theme::EDITOR_SIZE, FontFamily::Proportional),
+                    theme::WEAK,
+                );
+                (rect, false)
+            }
+        };
+
+        let resized = paint_resize_handle(ui, media_rect, drag_id, draw_w, avail, target, height);
+        if let Some(click) = resized {
+            return click;
+        }
+        if img_clicked && drag_w.is_none() {
+            LineClick::Edit
+        } else {
+            LineClick::None
+        }
+    } else {
+        let kind = media_placeholder_kind(&ext);
+        let box_w = draw_w.min(avail);
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(box_w, 40.0),
+            Sense::click(),
+        );
+        ui.painter().rect_filled(rect, theme::round_sm(), theme::CODE_BG);
+        ui.painter().text(
+            rect.left_center() + egui::vec2(10.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            format!("{}  {display}", kind.icon),
+            FontId::new(theme::EDITOR_SIZE, FontFamily::Proportional),
+            theme::ACCENT,
+        );
+        let resized = paint_resize_handle(ui, rect, drag_id, draw_w, avail, target, height);
+        if let Some(click) = resized {
+            return click;
+        }
+        resp.clone()
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text(format!("Open {}", abs.display()));
+        if resp.clicked() && drag_w.is_none() {
+            ui.ctx().open_url(OpenUrl::new_tab(url));
+        }
+        LineClick::None
+    }
+}
+
+/// Off-thread capped decode → [`TextureHandle`]. Avoids egui_extras sync UI-thread decode.
+fn embed_texture(ui: &mut Ui, abs: &std::path::Path) -> Option<egui::TextureHandle> {
+    use std::sync::{Arc, Mutex};
+
+    let key = abs.to_string_lossy().to_string();
+    let id = egui::Id::new(("bl_embed_tex", key.as_str()));
+
+    #[derive(Clone)]
+    enum Slot {
+        Loading(Arc<Mutex<Option<Result<egui::ColorImage, String>>>>),
+        Ready(egui::TextureHandle),
+        Failed,
+    }
+
+    let slot = ui.ctx().data(|d| d.get_temp::<Slot>(id));
+    match slot {
+        Some(Slot::Ready(tex)) => return Some(tex),
+        Some(Slot::Failed) => return None,
+        Some(Slot::Loading(pending)) => {
+            let done = pending.lock().ok().and_then(|mut g| g.take());
+            match done {
+                Some(Ok(color)) => {
+                    let tex = ui.ctx().load_texture(
+                        format!("bluelink-embed:{key}"),
+                        color,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(id, Slot::Ready(tex.clone())));
+                    return Some(tex);
+                }
+                Some(Err(_)) => {
+                    ui.ctx().data_mut(|d| d.insert_temp(id, Slot::Failed));
+                    return None;
+                }
+                None => return None,
+            }
+        }
+        None => {}
+    }
+
+    let pending = Arc::new(Mutex::new(None));
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(id, Slot::Loading(pending.clone())));
+    let path = abs.to_path_buf();
+    let ctx = ui.ctx().clone();
+    let _ = std::thread::Builder::new()
+        .name("bluelink-embed-decode".into())
+        .spawn(move || {
+            let result = media::load_capped_color_image(&path);
+            if let Ok(mut g) = pending.lock() {
+                *g = Some(result);
+            }
+            ctx.request_repaint();
+        });
+    None
+}
+
+/// Corner handle: drag updates temp width; release → [`LineClick::ResizeEmbed`].
+fn paint_resize_handle(
+    ui: &mut Ui,
+    media_rect: egui::Rect,
+    drag_id: egui::Id,
+    draw_w: f32,
+    avail: f32,
+    target: &str,
+    height: Option<u32>,
+) -> Option<LineClick> {
+    let handle = 12.0;
+    let handle_rect = egui::Rect::from_center_size(
+        egui::pos2(media_rect.right() - 2.0, media_rect.bottom() - 2.0),
+        egui::vec2(handle, handle),
+    );
+    let dragging = ui.ctx().data(|d| d.get_temp::<f32>(drag_id)).is_some();
+    let hover = ui.input(|i| i.pointer.hover_pos());
+    let show = dragging
+        || hover.is_some_and(|p| media_rect.contains(p) || handle_rect.contains(p));
+    if !show {
+        return None;
+    }
+
+    ui.painter()
+        .rect_filled(handle_rect, 2.0, theme::ACCENT);
+    let sense = ui.interact(handle_rect, drag_id.with("h"), Sense::drag());
+    sense.clone().on_hover_cursor(CursorIcon::ResizeEast);
+
+    if sense.dragged() {
+        let new_w = (draw_w + sense.drag_delta().x).clamp(40.0, avail);
+        ui.ctx().data_mut(|d| d.insert_temp(drag_id, new_w));
+        ui.ctx().request_repaint();
+    }
+    if sense.drag_stopped() {
+        let final_w = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<f32>(drag_id))
+            .unwrap_or(draw_w)
+            .round()
+            .clamp(40.0, avail) as u32;
+        return Some(LineClick::ResizeEmbed {
+            target: target.to_string(),
+            width: final_w.max(40),
+            height,
+        });
+    }
+    None
+}
+
+struct MediaKind {
+    icon: &'static str,
+}
+
+fn media_placeholder_kind(ext: &str) -> MediaKind {
+    let icon = match ext {
+        "mp4" | "webm" | "ogv" | "mov" | "mkv" => regular::VIDEO,
+        "mp3" | "wav" | "m4a" | "flac" | "ogg" | "opus" => regular::MUSIC_NOTES,
+        "pdf" => regular::FILE_PDF,
+        "svg" | "avif" | "bmp" => regular::IMAGE,
+        _ => regular::FILE,
+    };
+    MediaKind { icon }
 }
 
 /// Brighten for hover on dark sheet (accent/warn stay legible).

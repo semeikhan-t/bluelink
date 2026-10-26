@@ -3,6 +3,7 @@
 mod editor;
 mod editor_menu;
 mod local_graph;
+mod media;
 mod preview;
 mod quick_switcher;
 mod sync_panels;
@@ -49,6 +50,9 @@ enum UndoItem {
 
 /// Folder picker supplied by the host (desktop uses `rfd`).
 pub type FolderPicker = Box<dyn FnMut() -> Option<PathBuf> + Send>;
+
+/// File picker for attaching media (desktop uses `rfd`).
+pub type FilePicker = Box<dyn FnMut() -> Option<PathBuf> + Send>;
 
 /// One strip tab: a note (with back/forward history) or the local graph.
 enum OpenTab {
@@ -122,6 +126,7 @@ pub struct App {
     renaming: Option<tree::InlineRename>,
     reload_flag: Arc<AtomicBool>,
     pick_folder: Option<FolderPicker>,
+    pick_file: Option<FilePicker>,
     /// SHA of selected note as last loaded/saved — used to detect external edits.
     selected_sha: Option<String>,
     /// Ignore notify reloads until this instant (our own saves).
@@ -148,10 +153,12 @@ impl App {
         vault_path: Option<PathBuf>,
         reload_flag: Arc<AtomicBool>,
         pick_folder: Option<FolderPicker>,
+        pick_file: Option<FilePicker>,
         sync_ui: Option<SyncUiHandle>,
     ) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
+        egui_extras::install_image_loaders(&cc.egui_ctx);
 
         let mut registry = VaultRegistry::load();
         registry.prune_missing();
@@ -174,6 +181,7 @@ impl App {
             renaming: None,
             reload_flag,
             pick_folder,
+            pick_file,
             selected_sha: None,
             suppress_reload_until: None,
             acked_external_sha: None,
@@ -293,6 +301,36 @@ impl App {
         };
         if let Some(path) = pick() {
             self.open_vault_path(&path);
+        }
+    }
+
+    /// Host file picker → `attachments/` + insert `![[rel]]` into the open note.
+    fn pick_attach_file(&mut self) {
+        if self.readonly || self.selected.is_none() {
+            return;
+        }
+        if self.pick_file.is_none() {
+            self.status = "attach file unavailable".into();
+            return;
+        }
+        let path = self.pick_file.as_mut().and_then(|pick| pick());
+        let Some(path) = path else {
+            return;
+        };
+        let note = self.selected.clone().unwrap_or_default();
+        let active = self.active_line;
+        let outcome = match self.vault.as_ref() {
+            Some(vault) => media::ingest_path(vault, &path, &note),
+            None => return,
+        };
+        match outcome {
+            Ok(rel) => {
+                media::insert_embed(&mut self.buffer, active, &rel);
+                self.dirty = true;
+                self.last_edit = Some(Instant::now());
+                self.status = format!("attached {rel}");
+            }
+            Err(e) => self.status = format!("attach failed: {e}"),
         }
     }
 
@@ -2151,6 +2189,7 @@ impl eframe::App for App {
             // Take vault temporarily so we can mutate buffer alongside an immutable vault borrow.
             let vault = self.vault.take();
             let mut wiki_click = None;
+            let mut want_attach = false;
             if let Some(ref v) = vault {
                 let live = editor::show_live(
                     ui,
@@ -2166,9 +2205,16 @@ impl eframe::App for App {
                     self.last_edit = Some(Instant::now());
                     ctx.request_repaint_after(Duration::from_secs(1));
                 }
+                if let Some(msg) = live.status {
+                    self.status = msg;
+                }
+                want_attach = live.attach_file;
                 wiki_click = live.wikilink;
             }
             self.vault = vault;
+            if want_attach {
+                self.pick_attach_file();
+            }
             if let Some(click) = wiki_click {
                 self.handle_wikilink(&click.raw, click.new_tab);
             }

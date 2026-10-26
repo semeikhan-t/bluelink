@@ -32,6 +32,9 @@ tempfile = "3"
 eframe = "0.31"
 egui = "0.31"
 egui-phosphor = "0.9"
+egui_extras = { version = "0.31", features = ["all_loaders"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+arboard = "3"
 rfd = "0.15"
 notify = "7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "signal", "net"] }

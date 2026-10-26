@@ -8,6 +8,7 @@ use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{FontFamily, FontId, Id, Key, Order, TextEdit, Ui};
 
 use crate::editor_menu::{self, EditorAction};
+use crate::media;
 use crate::preview;
 use crate::theme;
 
@@ -49,6 +50,10 @@ pub struct WikiClick {
 pub struct LiveResult {
     pub changed: bool,
     pub wikilink: Option<WikiClick>,
+    /// Context-menu / command: host should open a file picker and attach.
+    pub attach_file: bool,
+    /// Status line hint from media ingest (errors / confirmation).
+    pub status: Option<String>,
 }
 
 /// Show live editor. `active_line` is the raw-editing line index (0-based).
@@ -65,10 +70,20 @@ pub fn show_live(
     let mut result = LiveResult {
         changed: false,
         wikilink: None,
+        attach_file: false,
+        status: None,
     };
 
     if readonly {
         *doc_edit = false;
+    }
+
+    // Drops / clipboard images before TextEdit so paste does not also insert text.
+    if !readonly {
+        if let Some(note) = source_path {
+            handle_dropped_files(ui, vault, note, buffer, *active_line, &mut result);
+            handle_clipboard_image_paste(ui, vault, note, buffer, *active_line, &mut result);
+        }
     }
 
     // Ctrl+A → select entire note in full edit mode.
@@ -82,7 +97,7 @@ pub fn show_live(
     }
 
     if *doc_edit {
-        return show_doc_edit(ui, buffer, doc_edit, active_line);
+        return show_doc_edit(ui, vault, source_path, buffer, doc_edit, active_line, result);
     }
 
     let mut ranges = line_ranges(buffer);
@@ -385,6 +400,17 @@ pub fn show_live(
                             preview::LineClick::Wiki { raw, new_tab } => {
                                 result.wikilink = Some(WikiClick { raw, new_tab });
                             }
+                            preview::LineClick::ResizeEmbed {
+                                target,
+                                width,
+                                height,
+                            } if !readonly => {
+                                if media::rewrite_embed_size(
+                                    buffer, Some(i), &target, width, height,
+                                ) {
+                                    result.changed = true;
+                                }
+                            }
                             preview::LineClick::Edit if !readonly => {
                                 request_active = Some(i);
                             }
@@ -447,7 +473,37 @@ pub fn show_live(
                     EditorAction::SelectAll => {
                         request_select_all = true;
                     }
-                    EditorAction::Cut | EditorAction::Copy | EditorAction::Paste => {
+                    EditorAction::AttachFile => {
+                        result.attach_file = true;
+                        if let Some(i) = menu.line {
+                            request_active = Some(i);
+                        }
+                    }
+                    EditorAction::Paste => {
+                        if let Some(i) = menu.line {
+                            request_active = Some(i);
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(egui::Id::new(("live_focus", i)), true);
+                            });
+                        }
+                        // Prefer clipboard image → embed; else OS text paste.
+                        if let Some(note) = source_path {
+                            if try_insert_clipboard_image(
+                                vault,
+                                note,
+                                buffer,
+                                menu.line.or(*active_line),
+                                &mut result,
+                            ) {
+                                // Image consumed; skip RequestPaste.
+                            } else {
+                                pending_clipboard = PendingClipboard::Paste;
+                            }
+                        } else {
+                            pending_clipboard = PendingClipboard::Paste;
+                        }
+                    }
+                    EditorAction::Cut | EditorAction::Copy => {
                         if let Some(i) = menu.line {
                             request_active = Some(i);
                             ui.ctx().data_mut(|d| {
@@ -607,15 +663,13 @@ pub fn show_live(
 
 fn show_doc_edit(
     ui: &mut Ui,
+    vault: &Vault,
+    source_path: Option<&str>,
     buffer: &mut String,
     doc_edit: &mut bool,
     active_line: &mut Option<usize>,
+    mut result: LiveResult,
 ) -> LiveResult {
-    let mut result = LiveResult {
-        changed: false,
-        wikilink: None,
-    };
-
     if ui.input(|i| i.key_pressed(Key::Escape)) {
         *doc_edit = false;
         *active_line = None;
@@ -700,7 +754,19 @@ fn show_doc_edit(
                 ui.ctx()
                     .data_mut(|d| d.insert_temp(egui::Id::new("live_select_all"), true));
             }
-            EditorAction::Cut | EditorAction::Copy | EditorAction::Paste => {
+            EditorAction::AttachFile => {
+                result.attach_file = true;
+            }
+            EditorAction::Paste => {
+                if let Some(note) = source_path {
+                    if !try_insert_clipboard_image(vault, note, buffer, None, &mut result) {
+                        editor_menu::dispatch_clipboard(ui, &EditorAction::Paste);
+                    }
+                } else {
+                    editor_menu::dispatch_clipboard(ui, &EditorAction::Paste);
+                }
+            }
+            EditorAction::Cut | EditorAction::Copy => {
                 editor_menu::dispatch_clipboard(ui, &action);
             }
             ref text_action => {
@@ -723,6 +789,115 @@ fn show_doc_edit(
     }
 
     result
+}
+
+fn handle_dropped_files(
+    ui: &Ui,
+    vault: &Vault,
+    active_note: &str,
+    buffer: &mut String,
+    active_line: Option<usize>,
+    result: &mut LiveResult,
+) {
+    let dropped = ui.ctx().input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+    if dropped.is_empty() {
+        return;
+    }
+    let mut embedded = 0usize;
+    for file in dropped {
+        let Some(path) = file.path.as_deref() else {
+            // Web / in-memory drops: use bytes + name when present.
+            if let (Some(bytes), name) = (file.bytes.as_ref(), file.name.as_str()) {
+                let ext = std::path::Path::new(name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                if !bluelink_core::is_media_extension(ext) {
+                    continue;
+                }
+                let stem = std::path::Path::new(name)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("attachment");
+                match media::save_bytes(vault, stem, ext, bytes, active_note) {
+                    Ok(rel) => {
+                        media::insert_embed(buffer, active_line, &rel);
+                        embedded += 1;
+                        result.changed = true;
+                    }
+                    Err(e) => result.status = Some(format!("attach failed: {e}")),
+                }
+            }
+            continue;
+        };
+        match media::ingest_path(vault, path, active_note) {
+            Ok(rel) => {
+                media::insert_embed(buffer, active_line, &rel);
+                embedded += 1;
+                result.changed = true;
+            }
+            Err(e) => result.status = Some(format!("drop failed: {e}")),
+        }
+    }
+    if embedded > 0 && result.status.is_none() {
+        result.status = Some(if embedded == 1 {
+            "attached file".into()
+        } else {
+            format!("attached {embedded} files")
+        });
+    }
+}
+
+fn handle_clipboard_image_paste(
+    ui: &Ui,
+    vault: &Vault,
+    active_note: &str,
+    buffer: &mut String,
+    active_line: Option<usize>,
+    result: &mut LiveResult,
+) {
+    let wants_paste = ui.input(|i| {
+        let key = i.modifiers.command && i.key_pressed(Key::V) && !i.modifiers.shift;
+        let event = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
+        key || event
+    });
+    if !wants_paste {
+        return;
+    }
+    if !try_insert_clipboard_image(vault, active_note, buffer, active_line, result) {
+        return;
+    }
+    // Swallow text paste so TextEdit does not also insert clipboard text.
+    ui.ctx().input_mut(|i| {
+        i.events
+            .retain(|e| !matches!(e, egui::Event::Paste(_)));
+        let _ = i.consume_key(egui::Modifiers::COMMAND, Key::V);
+    });
+}
+
+fn try_insert_clipboard_image(
+    vault: &Vault,
+    active_note: &str,
+    buffer: &mut String,
+    active_line: Option<usize>,
+    result: &mut LiveResult,
+) -> bool {
+    let Some(png) = media::clipboard_image_png() else {
+        return false;
+    };
+    let stem = media::pasted_image_stem();
+    match media::save_bytes(vault, &stem, "png", &png, active_note) {
+        Ok(rel) => {
+            media::insert_embed(buffer, active_line, &rel);
+            result.changed = true;
+            result.status = Some(format!("pasted {rel}"));
+            true
+        }
+        Err(e) => {
+            result.status = Some(format!("paste image failed: {e}"));
+            true // still consume — image was present
+        }
+    }
 }
 
 /// Unclosed `[[query` before `cursor_byte`. Returns byte index of `[[` and query.

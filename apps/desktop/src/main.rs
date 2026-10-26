@@ -48,16 +48,31 @@ fn main() -> eframe::Result<()> {
             ..Default::default()
         },
         Box::new(move |cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             let pick: bluelink_ui::FolderPicker = Box::new(|| {
                 rfd::FileDialog::new()
                     .set_title("Open BlueLink vault")
                     .pick_folder()
+            });
+            let pick_file: bluelink_ui::FilePicker = Box::new(|| {
+                rfd::FileDialog::new()
+                    .set_title("Attach file")
+                    .add_filter(
+                        "Media",
+                        &[
+                            "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif", "mp4",
+                            "webm", "ogv", "mov", "mkv", "mp3", "wav", "m4a", "flac", "ogg",
+                            "opus", "pdf",
+                        ],
+                    )
+                    .pick_file()
             });
             let app = App::new(
                 cc,
                 vault_for_ui.clone(),
                 reload_for_ui,
                 Some(pick),
+                Some(pick_file),
                 Some(sync_handle),
             );
             // Defer watcher + BlueZ start until the first frame so the window can

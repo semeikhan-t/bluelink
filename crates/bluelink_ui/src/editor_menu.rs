@@ -16,6 +16,8 @@ pub enum EditorAction {
     },
     SetLinePrefix(&'static str),
     InsertSnippet(&'static str),
+    /// Host opens a file picker and inserts `![[attachments/…]]`.
+    AttachFile,
     Cut,
     Copy,
     Paste,
@@ -192,6 +194,9 @@ pub fn show_popup(ctx: &egui::Context) -> Option<(CtxMenu, EditorAction)> {
                             }
                         }
                         SubMenu::Insert => {
+                            if row(ui, regular::PAPERCLIP, "Attach file…", false) {
+                                action = Some(EditorAction::AttachFile);
+                            }
                             if row(ui, regular::CODE_BLOCK, "Code block", false) {
                                 action = Some(EditorAction::InsertSnippet("```\n\n```"));
                             }
@@ -394,7 +399,8 @@ pub fn apply_text_action(
         EditorAction::Cut
         | EditorAction::Copy
         | EditorAction::Paste
-        | EditorAction::SelectAll => None,
+        | EditorAction::SelectAll
+        | EditorAction::AttachFile => None,
     }
 }
 

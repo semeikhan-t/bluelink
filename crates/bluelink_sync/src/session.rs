@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use bluelink_core::{validate_rel_path, NoteMeta, Vault, MAX_NOTE_BYTES};
+use bluelink_core::{
+    max_bytes_for_rel, validate_vault_rel_path, NoteMeta, Vault,
+};
 
 use crate::conflict::conflict_path;
 use crate::error::SyncError;
@@ -187,8 +189,8 @@ async fn initiator_body(
                 if let Some(hash) = remote_hash {
                     pull_file(noise, transport, vault, rel_path, hash).await?;
                 } else {
-                    // delete local
-                    if vault.read(rel_path).is_ok() {
+                    // delete local (md or media)
+                    if vault.read_bytes(rel_path).is_ok() {
                         vault.delete(rel_path)?;
                     }
                 }
@@ -200,10 +202,8 @@ async fn initiator_body(
                     .ok_or_else(|| SyncError::Protocol("conflict missing remote".into()))?;
                 let remote_bytes =
                     fetch_bytes(noise, transport, rel_path, remote_hash).await?;
-                let remote_text = String::from_utf8(remote_bytes)
-                    .map_err(|_| SyncError::IntegrityError)?;
                 let cpath = conflict_path(rel_path, peer_name);
-                vault.write(&cpath, &remote_text)?;
+                write_synced(vault, &cpath, remote_bytes)?;
                 let local_hash = local_notes
                     .get(rel_path)
                     .ok_or_else(|| SyncError::Protocol("conflict missing local".into()))?;
@@ -304,8 +304,8 @@ async fn responder_body(
                 rel_path,
                 expected_sha256,
             } => {
-                if let Ok(content) = vault.read(&rel_path) {
-                    let hash = hex_sha256(content.as_bytes());
+                if let Ok(bytes) = vault.read_bytes(&rel_path) {
+                    let hash = hex_sha256(&bytes);
                     if hash == expected_sha256 || expected_sha256.is_empty() {
                         vault.delete(&rel_path)?;
                     }
@@ -344,7 +344,8 @@ async fn serve_put_start(
     vault: &mut Vault,
     first: PutAcc,
 ) -> Result<(), SyncError> {
-    validate_rel_path(&first.rel_path).map_err(|_| SyncError::InvalidPath)?;
+    validate_vault_rel_path(&first.rel_path).map_err(|_| SyncError::InvalidPath)?;
+    let max = max_bytes_for_rel(&first.rel_path);
     let mut buf = Vec::new();
     if first.offset != 0 {
         return Err(SyncError::Protocol("put offset must start at 0".into()));
@@ -355,6 +356,9 @@ async fn serve_put_start(
     let mut last = first.last;
 
     while !last {
+        if buf.len() as u64 > max {
+            return Err(SyncError::TooLarge);
+        }
         match recv_msg(noise, transport).await? {
             Message::Put {
                 rel_path,
@@ -378,15 +382,14 @@ async fn serve_put_start(
         }
     }
 
-    if buf.len() as u64 > MAX_NOTE_BYTES {
+    if buf.len() as u64 > max {
         return Err(SyncError::TooLarge);
     }
     let got = hex_sha256(&buf);
     if got != sha {
         return Err(SyncError::IntegrityError);
     }
-    let text = String::from_utf8(buf).map_err(|_| SyncError::IntegrityError)?;
-    vault.write(&path, &text)?;
+    write_synced(vault, &path, buf)?;
     Ok(())
 }
 
@@ -397,12 +400,12 @@ async fn serve_get(
     rel_path: &str,
     sha256: &str,
 ) -> Result<(), SyncError> {
-    let content = vault.read(rel_path)?;
-    let hash = hex_sha256(content.as_bytes());
+    let content = vault.read_bytes(rel_path)?;
+    let hash = hex_sha256(&content);
     if hash != sha256 {
         return Err(SyncError::IntegrityError);
     }
-    send_put_chunks(noise, transport, rel_path, &hash, content.as_bytes()).await
+    send_put_chunks(noise, transport, rel_path, &hash, &content).await
 }
 
 async fn push_file(
@@ -412,12 +415,12 @@ async fn push_file(
     rel_path: &str,
     hash: &str,
 ) -> Result<(), SyncError> {
-    let content = vault.read(rel_path)?;
-    let got = hex_sha256(content.as_bytes());
+    let content = vault.read_bytes(rel_path)?;
+    let got = hex_sha256(&content);
     if got != hash {
         return Err(SyncError::IntegrityError);
     }
-    send_put_chunks(noise, transport, rel_path, hash, content.as_bytes()).await
+    send_put_chunks(noise, transport, rel_path, hash, &content).await
 }
 
 async fn pull_file(
@@ -428,8 +431,7 @@ async fn pull_file(
     hash: &str,
 ) -> Result<(), SyncError> {
     let bytes = fetch_bytes(noise, transport, rel_path, hash).await?;
-    let text = String::from_utf8(bytes).map_err(|_| SyncError::IntegrityError)?;
-    vault.write(rel_path, &text)?;
+    write_synced(vault, rel_path, bytes)?;
     Ok(())
 }
 
@@ -449,6 +451,7 @@ async fn fetch_bytes(
     )
     .await?;
 
+    let max = max_bytes_for_rel(rel_path);
     let mut buf = Vec::new();
     loop {
         match recv_msg(noise, transport).await? {
@@ -466,6 +469,9 @@ async fn fetch_bytes(
                     return Err(SyncError::Protocol("put gap".into()));
                 }
                 buf.extend_from_slice(&data);
+                if buf.len() as u64 > max {
+                    return Err(SyncError::TooLarge);
+                }
                 if last {
                     break;
                 }
@@ -630,14 +636,33 @@ async fn recv_msg(
 }
 
 fn list_as_map(vault: &Vault) -> Result<HashMap<String, String>, SyncError> {
-    let notes: Vec<NoteMeta> = vault.list()?;
-    if notes.len() > MAX_NOTES {
+    // Inventory is md + media; notes UI still uses Vault::list() (md-only).
+    let files: Vec<NoteMeta> = vault.list_files()?;
+    if files.len() > MAX_NOTES {
         return Err(SyncError::TooManyNotes);
     }
-    Ok(notes
+    Ok(files
         .into_iter()
         .map(|n| (n.rel_path, n.sha256))
         .collect())
+}
+
+/// Write sync payload: `.md` must be UTF-8 via [`Vault::write`]; media via bytes.
+fn write_synced(vault: &mut Vault, rel_path: &str, buf: Vec<u8>) -> Result<(), SyncError> {
+    if is_markdown_rel(rel_path) {
+        let text = String::from_utf8(buf).map_err(|_| SyncError::IntegrityError)?;
+        vault.write(rel_path, &text)?;
+    } else {
+        vault.write_bytes(rel_path, &buf)?;
+    }
+    Ok(())
+}
+
+fn is_markdown_rel(rel_path: &str) -> bool {
+    std::path::Path::new(rel_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("md"))
 }
 
 fn hex_sha256(data: &[u8]) -> String {

@@ -25,9 +25,71 @@ pub enum Span {
     Code(String),
     Link { text: String, dest: String },
     WikiLink { raw: String, alias: Option<String> },
+    /// Obsidian-style embed `![[target]]` / `![[target|alias]]` / `![[target|400]]`.
+    Embed {
+        target: String,
+        alias: Option<String>,
+        width: Option<u32>,
+        height: Option<u32>,
+    },
+    /// Markdown image `![alt](dest)` / `![alt|400](dest)`.
+    Image {
+        dest: String,
+        alt: String,
+        width: Option<u32>,
+        height: Option<u32>,
+    },
 }
 
-/// Parse markdown into a preview document. Wikilinks `[[...]]` become `Span::WikiLink`.
+/// Obsidian size suffix: `400` or `400x300` (x case-insensitive). Not a display alias.
+pub fn parse_embed_size(s: &str) -> Option<(u32, Option<u32>)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        let w: u32 = s.parse().ok()?;
+        return (w > 0).then_some((w, None));
+    }
+    let x = s.find(|c| c == 'x' || c == 'X')?;
+    let (w, h) = (&s[..x], &s[x + 1..]);
+    if w.is_empty()
+        || h.is_empty()
+        || !w.bytes().all(|b| b.is_ascii_digit())
+        || !h.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let w: u32 = w.parse().ok()?;
+    let h: u32 = h.parse().ok()?;
+    (w > 0 && h > 0).then_some((w, Some(h)))
+}
+
+/// Split a pipe suffix into display alias vs Obsidian size.
+fn alias_or_size(pipe: &str) -> (Option<String>, Option<u32>, Option<u32>) {
+    match parse_embed_size(pipe) {
+        Some((w, h)) => (None, Some(w), h),
+        None => (Some(pipe.to_string()), None, None),
+    }
+}
+
+/// Alt text may end with `|400` / `|400x200`; pure size alt → empty display string.
+fn split_image_alt(alt: &str) -> (String, Option<u32>, Option<u32>) {
+    if let Some((before, after)) = alt.rsplit_once('|') {
+        if let Some((w, h)) = parse_embed_size(after) {
+            return (before.to_string(), Some(w), h);
+        }
+        return (alt.to_string(), None, None);
+    }
+    if let Some((w, h)) = parse_embed_size(alt) {
+        return (String::new(), Some(w), h);
+    }
+    (alt.to_string(), None, None)
+}
+
+/// Parse markdown into a preview document.
+/// Wikilinks `[[...]]` → [`Span::WikiLink`]; embeds `![[...]]` → [`Span::Embed`];
+/// markdown images `![](…)` → [`Span::Image`].
 ///
 /// Note: pulldown-cmark emits `[[Note]]` as separate Text events (`[`, `[`, `Note`, `]`, `]`),
 /// so plain text is buffered and run through [`split_wikilinks`] before being pushed as spans.
@@ -54,6 +116,8 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
     let mut strong_buf: Option<String> = None;
     let mut em_buf: Option<String> = None;
     let mut pending_link_dest: Option<String> = None;
+    let mut pending_image_dest: Option<String> = None;
+    let mut image_alt_buf: Option<String> = None;
 
     // Coalesce fragmented Text events so `[[wikilinks]]` can be detected.
     let mut pending_text = String::new();
@@ -326,10 +390,42 @@ pub fn parse_preview(input: &str) -> PreviewDoc {
                     );
                 }
             }
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                flush_text(
+                    &mut pending_text,
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    heading_level.is_some(),
+                );
+                pending_image_dest = Some(dest_url.into_string());
+                image_alt_buf = Some(String::new());
+            }
+            Event::End(TagEnd::Image) => {
+                let dest = pending_image_dest.take().unwrap_or_default();
+                let raw_alt = image_alt_buf.take().unwrap_or_default();
+                let (alt, width, height) = split_image_alt(&raw_alt);
+                push_span(
+                    &mut para_spans,
+                    &mut quote_spans,
+                    &mut list_item_spans,
+                    &mut heading_text,
+                    heading_level.is_some(),
+                    Span::Image {
+                        dest,
+                        alt,
+                        width,
+                        height,
+                    },
+                );
+            }
             Event::Text(text) => {
                 let s = text.into_string();
                 if in_code {
                     code_buf.push_str(&s);
+                } else if let Some(buf) = image_alt_buf.as_mut() {
+                    buf.push_str(&s);
                 } else if let Some(buf) = strong_buf.as_mut().or(em_buf.as_mut()) {
                     buf.push_str(&s);
                 } else {
@@ -386,7 +482,8 @@ fn push_span(
     }
 }
 
-/// Split plain text into `Text` / `WikiLink` spans.
+/// Split plain text into `Text` / `WikiLink` / `Embed` spans.
+/// `![[target|alias]]` becomes [`Span::Embed`]; `[[…]]` without `!` stays [`Span::WikiLink`].
 pub fn split_wikilinks(text: &str) -> Vec<Span> {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
@@ -394,19 +491,37 @@ pub fn split_wikilinks(text: &str) -> Vec<Span> {
     let mut last = 0;
     while i + 1 < bytes.len() {
         if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            let is_embed = i > 0 && bytes[i - 1] == b'!';
+            let text_end = if is_embed { i - 1 } else { i };
             let start = i + 2;
             let mut j = start;
             while j + 1 < bytes.len() {
                 if bytes[j] == b']' && bytes[j + 1] == b']' {
-                    if last < i {
-                        out.push(Span::Text(text[last..i].to_string()));
+                    if last < text_end {
+                        out.push(Span::Text(text[last..text_end].to_string()));
                     }
                     let raw = &text[start..j];
-                    let alias = raw.split_once('|').map(|(_, a)| a.to_string());
-                    out.push(Span::WikiLink {
-                        raw: raw.to_string(),
-                        alias,
-                    });
+                    if is_embed {
+                        let (target, alias, width, height) = match raw.split_once('|') {
+                            Some((t, a)) => {
+                                let (alias, width, height) = alias_or_size(a);
+                                (t.to_string(), alias, width, height)
+                            }
+                            None => (raw.to_string(), None, None, None),
+                        };
+                        out.push(Span::Embed {
+                            target,
+                            alias,
+                            width,
+                            height,
+                        });
+                    } else {
+                        let alias = raw.split_once('|').map(|(_, a)| a.to_string());
+                        out.push(Span::WikiLink {
+                            raw: raw.to_string(),
+                            alias,
+                        });
+                    }
                     i = j + 2;
                     last = i;
                     break;
@@ -479,5 +594,161 @@ mod tests {
             _ => false,
         });
         assert!(has, "blocks={:?}", doc.blocks);
+    }
+
+    #[test]
+    fn parses_embed_attachment() {
+        let doc = parse_preview("see ![[attachments/x.png]] now");
+        let spans = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                PreviewBlock::Paragraph { spans } => Some(spans.clone()),
+                _ => None,
+            })
+            .expect("paragraph");
+        assert!(
+            spans.iter().any(|s| matches!(
+                s,
+                Span::Embed {
+                    target,
+                    alias: None,
+                    width: None,
+                    height: None,
+                } if target == "attachments/x.png"
+            )),
+            "spans={spans:?}"
+        );
+        // Leading `!` must not remain as text glued to the embed.
+        assert!(
+            !spans.iter().any(|s| matches!(s, Span::Text(t) if t.ends_with('!'))),
+            "spans={spans:?}"
+        );
+    }
+
+    #[test]
+    fn parses_embed_with_alias() {
+        let spans = split_wikilinks("![[photo.png|cap]]");
+        assert_eq!(
+            spans,
+            vec![Span::Embed {
+                target: "photo.png".into(),
+                alias: Some("cap".into()),
+                width: None,
+                height: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_embed_width() {
+        let spans = split_wikilinks("![[a.png|400]]");
+        assert_eq!(
+            spans,
+            vec![Span::Embed {
+                target: "a.png".into(),
+                alias: None,
+                width: Some(400),
+                height: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_embed_width_height() {
+        let spans = split_wikilinks("![[a.png|400x200]]");
+        assert_eq!(
+            spans,
+            vec![Span::Embed {
+                target: "a.png".into(),
+                alias: None,
+                width: Some(400),
+                height: Some(200),
+            }]
+        );
+        let spans = split_wikilinks("![[a.png|400X200]]");
+        assert!(matches!(
+            &spans[..],
+            [Span::Embed {
+                width: Some(400),
+                height: Some(200),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn parses_embed_caption_not_size() {
+        let spans = split_wikilinks("![[a.png|caption]]");
+        assert_eq!(
+            spans,
+            vec![Span::Embed {
+                target: "a.png".into(),
+                alias: Some("caption".into()),
+                width: None,
+                height: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_embed_size_rejects_zero() {
+        assert!(parse_embed_size("0").is_none());
+        assert!(parse_embed_size("10x0").is_none());
+    }
+
+    #[test]
+    fn parses_markdown_image() {
+        let doc = parse_preview("![alt text](https://example.com/a.png)");
+        let spans = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                PreviewBlock::Paragraph { spans } => Some(spans.clone()),
+                _ => None,
+            })
+            .expect("paragraph");
+        assert!(
+            spans.iter().any(|s| matches!(
+                s,
+                Span::Image { dest, alt, width: None, height: None }
+                    if dest == "https://example.com/a.png" && alt == "alt text"
+            )),
+            "spans={spans:?}"
+        );
+    }
+
+    #[test]
+    fn parses_markdown_image_size_in_alt() {
+        let doc = parse_preview("![shot|320](https://example.com/a.png)");
+        let spans = doc
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                PreviewBlock::Paragraph { spans } => Some(spans.clone()),
+                _ => None,
+            })
+            .expect("paragraph");
+        assert!(
+            spans.iter().any(|s| matches!(
+                s,
+                Span::Image {
+                    dest,
+                    alt,
+                    width: Some(320),
+                    height: None,
+                } if dest == "https://example.com/a.png" && alt == "shot"
+            )),
+            "spans={spans:?}"
+        );
+    }
+
+    #[test]
+    fn wiki_without_bang_stays_wikilink() {
+        let spans = split_wikilinks("[[attachments/x.png]]");
+        assert!(matches!(
+            &spans[..],
+            [Span::WikiLink { raw, alias: None }] if raw == "attachments/x.png"
+        ));
     }
 }
