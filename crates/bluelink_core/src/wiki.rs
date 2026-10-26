@@ -352,85 +352,218 @@ mod tests {
         i
     }
 
+    /// Obsidian 1.14 `MetadataCache.getFirstLinkpathDest` corpus.
+    /// Recovered from shipped `app.js` (Obsidian-1.14.5); static, not runtime.
     #[test]
-    fn resolve_exact_and_alias() {
-        let i = idx(&["Folder/Note.md", "note.md"]);
+    fn obsidian_114_resolve_corpus() {
+        // (notes, link, source, expected)
+        let cases: &[(&[&str], &str, Option<&str>, Option<&str>)] = &[
+            // unique basename, any folder
+            (&["deep/x/Note.md"], "Note", Some("other.md"), Some("deep/x/Note.md")),
+            (&["deep/x/Note.md"], "note", None, Some("deep/x/Note.md")),
+            (&["deep/x/Note.md"], "NOTE.md", None, Some("deep/x/Note.md")),
+            // alias + heading stripped before resolve (BlueLink; Obsidian stores path sans alias)
+            (&["Folder/Note.md"], "Folder/Note|алиас", None, Some("Folder/Note.md")),
+            (&["Folder/Note.md"], "Folder/Note#Heading", None, Some("Folder/Note.md")),
+            (&["Folder/Note.md"], "Folder/Note#H|a", None, Some("Folder/Note.md")),
+            // empty / heading-only → source
+            (&["a.md"], "", Some("a.md"), Some("a.md")),
+            (&["a.md"], "#heading", Some("a.md"), Some("a.md")),
+            (&["a.md"], "|alias", Some("a.md"), Some("a.md")),
+            (&["a.md"], "", None, None),
+            // exact vault-relative path
+            (
+                &["Folder/Note.md", "note.md"],
+                "Folder/Note",
+                None,
+                Some("Folder/Note.md"),
+            ),
+            (
+                &["Folder/Note.md", "note.md"],
+                "folder/note",
+                None,
+                Some("Folder/Note.md"),
+            ),
+            // bare name: exact path `todo.md` wins before same-folder preference
+            (
+                &["a/todo.md", "todo.md"],
+                "todo",
+                Some("a/other.md"),
+                Some("todo.md"),
+            ),
+            // no root hit → prefer source directory, then shortest elsewhere
+            (
+                &["a/todo.md", "b/todo.md"],
+                "todo",
+                Some("a/other.md"),
+                Some("a/todo.md"),
+            ),
+            (
+                &["a/todo.md", "b/todo.md"],
+                "todo",
+                Some("b/x.md"),
+                Some("b/todo.md"),
+            ),
+            // no source → shortest path (RR = path.length)
+            (
+                &["a/deep/todo.md", "todo.md"],
+                "todo",
+                None,
+                Some("todo.md"),
+            ),
+            (
+                &["a/deep/todo.md", "b/todo.md"],
+                "todo",
+                None,
+                Some("b/todo.md"),
+            ),
+            // nested path suffix among same basename
+            (
+                &["x/a/b/todo.md", "a/b/todo.md"],
+                "a/b/todo",
+                None,
+                Some("a/b/todo.md"),
+            ),
+            (
+                &["x/a/b/todo.md"],
+                "a/b/todo",
+                None,
+                Some("x/a/b/todo.md"),
+            ),
+            // relative ./ ../
+            (
+                &["proj/alpha.md", "proj/sub/beta.md", "other.md"],
+                "./alpha",
+                Some("proj/readme.md"),
+                Some("proj/alpha.md"),
+            ),
+            (
+                &["proj/alpha.md", "proj/sub/beta.md"],
+                "../alpha",
+                Some("proj/sub/beta.md"),
+                Some("proj/alpha.md"),
+            ),
+            (
+                &["proj/alpha.md", "proj/sub/beta.md"],
+                "./beta",
+                Some("proj/sub/note.md"),
+                Some("proj/sub/beta.md"),
+            ),
+            (
+                &["proj/alpha.md", "proj/sub/beta.md"],
+                "./alpha",
+                Some("proj/sub/beta.md"),
+                None,
+            ),
+            (
+                &["proj/alpha.md", "proj/sub/beta.md"],
+                "./../alpha",
+                Some("proj/sub/beta.md"),
+                Some("proj/alpha.md"),
+            ),
+            (
+                &["top.md", "a/b/c.md"],
+                "../../top",
+                Some("a/b/c.md"),
+                Some("top.md"),
+            ),
+            // vault-root absolute: miss must not fuzzy
+            (
+                &["Folder/Note.md", "Note.md"],
+                "/Folder/Note",
+                Some("Note.md"),
+                Some("Folder/Note.md"),
+            ),
+            (&["Folder/Note.md"], "/missing", Some("Note.md"), None),
+            (
+                &["a/todo.md", "todo.md"],
+                "/todo",
+                Some("a/x.md"),
+                Some("todo.md"),
+            ),
+            (
+                &["a/todo.md"],
+                "/todo",
+                Some("a/x.md"),
+                None, // absolute miss — no fuzzy to a/todo.md
+            ),
+            // backslash separators normalized
+            (
+                &["Folder/Note.md"],
+                r"Folder\Note",
+                None,
+                Some("Folder/Note.md"),
+            ),
+            // missing
+            (&["a.md"], "nope", None, None),
+            // deeper same-folder beats far
+            (
+                &["proj/sub/todo.md", "other/todo.md"],
+                "todo",
+                Some("proj/sub/x.md"),
+                Some("proj/sub/todo.md"),
+            ),
+            // source in parent: child still "near" via under_dir
+            (
+                &["proj/sub/todo.md", "other/todo.md"],
+                "todo",
+                Some("proj/readme.md"),
+                Some("proj/sub/todo.md"),
+            ),
+        ];
+
+        for (notes, link, source, expected) in cases {
+            let i = idx(notes);
+            let got = i.resolve(link, *source);
+            assert_eq!(
+                got.as_deref(),
+                *expected,
+                "link={link:?} source={source:?} notes={notes:?}"
+            );
+        }
+    }
+
+    /// Intentional divergences from Obsidian's raw `endsWith` / `startsWith`.
+    /// Obsidian 1.14: `mytodo.md`.endsWith(`todo.md`) and `folder2`.startsWith(`folder`).
+    /// BlueLink requires a path-segment boundary.
+    #[test]
+    fn resolve_rejects_obsidian_false_positive_suffix() {
+        let i = idx(&["a/mytodo.md"]);
         assert_eq!(
-            i.resolve("Folder/Note", None).as_deref(),
-            Some("Folder/Note.md")
+            i.resolve("todo", Some("a/x.md")),
+            None,
+            "Obsidian would resolve to a/mytodo.md via endsWith"
         );
-        assert_eq!(
-            i.resolve("Folder/Note|алиас", None).as_deref(),
-            Some("Folder/Note.md")
-        );
-        assert_eq!(i.resolve("note", None).as_deref(), Some("note.md"));
     }
 
     #[test]
-    fn resolve_shortest_on_name_clash_without_source() {
-        let i = idx(&["a/deep/todo.md", "todo.md"]);
-        assert_eq!(i.resolve("todo", None).as_deref(), Some("todo.md"));
-    }
-
-    #[test]
-    fn resolve_prefers_same_folder_when_source_set() {
-        // No root `todo.md`: exact path miss → same-folder preference.
-        let i = idx(&["a/todo.md", "b/todo.md"]);
+    fn resolve_rejects_obsidian_false_positive_folder_prefix() {
+        // Source dir `fo` must not treat `folder/todo.md` as "near".
+        let i = idx(&["folder/todo.md", "z/todo.md"]);
         assert_eq!(
-            i.resolve("todo", Some("a/other.md")).as_deref(),
-            Some("a/todo.md")
-        );
-        assert_eq!(
-            i.resolve("todo", Some("b/x.md")).as_deref(),
-            Some("b/todo.md")
+            i.resolve("todo", Some("fo/x.md")).as_deref(),
+            Some("z/todo.md"),
+            "near-empty → shortest far; Obsidian would prefer folder/ via startsWith(\"fo\")"
         );
     }
 
     #[test]
-    fn resolve_exact_path_beats_same_folder() {
-        // Bare `todo` matches root path exactly before folder preference.
-        let i = idx(&["a/todo.md", "todo.md"]);
-        assert_eq!(
-            i.resolve("todo", Some("a/other.md")).as_deref(),
-            Some("todo.md")
-        );
+    fn normalize_link_target_strips_alias_and_heading() {
+        assert_eq!(normalize_link_target("A|b"), "A");
+        assert_eq!(normalize_link_target("A#h"), "A");
+        assert_eq!(normalize_link_target("A#h|b"), "A");
+        assert_eq!(normalize_link_target("  x  "), "x");
     }
 
     #[test]
-    fn resolve_relative_dot_paths() {
-        let i = idx(&["proj/alpha.md", "proj/sub/beta.md", "other.md"]);
-        // `./` is same directory as the source note.
+    fn extract_wikilinks_basic() {
         assert_eq!(
-            i.resolve("./alpha", Some("proj/readme.md")).as_deref(),
-            Some("proj/alpha.md")
+            extract_wikilinks("see [[A]] and [[B|x]] [[C#h]]"),
+            vec!["A", "B|x", "C#h"]
         );
-        assert_eq!(
-            i.resolve("../alpha", Some("proj/sub/beta.md")).as_deref(),
-            Some("proj/alpha.md")
-        );
-        assert_eq!(
-            i.resolve("./beta", Some("proj/sub/note.md")).as_deref(),
-            Some("proj/sub/beta.md")
-        );
-        // `./alpha` from sub/ looks for sub/alpha.md — miss.
-        assert_eq!(i.resolve("./alpha", Some("proj/sub/beta.md")), None);
-    }
-
-    #[test]
-    fn resolve_vault_root_absolute() {
-        let i = idx(&["Folder/Note.md", "Note.md"]);
-        assert_eq!(
-            i.resolve("/Folder/Note", Some("Note.md")).as_deref(),
-            Some("Folder/Note.md")
-        );
-        assert_eq!(i.resolve("/missing", Some("Note.md")), None);
-    }
-
-    #[test]
-    fn resolve_empty_is_source() {
-        let i = idx(&["a.md"]);
-        assert_eq!(i.resolve("", Some("a.md")).as_deref(), Some("a.md"));
-        assert_eq!(i.resolve("#heading", Some("a.md")).as_deref(), Some("a.md"));
+        assert_eq!(extract_wikilinks("[[  spaced  ]]"), vec!["spaced"]);
+        assert!(extract_wikilinks("[[]").is_empty());
+        assert!(extract_wikilinks("no links").is_empty());
     }
 
     #[test]
@@ -478,14 +611,15 @@ mod tests {
             create_path_for_link("Note|alias", Some("proj/sub/a.md")),
             "proj/sub/Note.md"
         );
-        assert_eq!(
-            create_path_for_link("Note", Some("root.md")),
-            "Note.md"
-        );
+        assert_eq!(create_path_for_link("Note", Some("root.md")), "Note.md");
         assert_eq!(create_path_for_link("Note", None), "Note.md");
         assert_eq!(
             create_path_for_link("folder/Note", Some("proj/a.md")),
             "folder/Note.md"
+        );
+        assert_eq!(
+            create_path_for_link("/Abs", Some("proj/a.md")),
+            "Abs.md"
         );
     }
 }
