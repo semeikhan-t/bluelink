@@ -44,6 +44,7 @@ fn main() -> eframe::Result<()> {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([1280.0, 840.0])
                 .with_min_inner_size([900.0, 600.0])
+                .with_decorations(false)
                 .with_title(title),
             ..Default::default()
         },
@@ -148,11 +149,7 @@ impl DesktopApp {
 
         if let Some(root) = self.inner.vault_root() {
             let root = root.to_path_buf();
-            let needs = self
-                .watching
-                .as_ref()
-                .map(|w| w != &root)
-                .unwrap_or(true);
+            let needs = self.watching.as_ref().map(|w| w != &root).unwrap_or(true);
             if needs {
                 self.attach_watcher(&root);
                 self.sync_runtime.set_vault(Some(root));
@@ -179,10 +176,7 @@ impl DesktopApp {
     }
 }
 
-fn start_watcher(
-    path: &Path,
-    flag: Arc<AtomicBool>,
-) -> Result<RecommendedWatcher, notify::Error> {
+fn start_watcher(path: &Path, flag: Arc<AtomicBool>) -> Result<RecommendedWatcher, notify::Error> {
     let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
         let Ok(event) = res else {
             return;

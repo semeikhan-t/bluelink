@@ -14,14 +14,6 @@ use crate::theme;
 
 const LOG_CAP: usize = 50;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Screen {
-    #[default]
-    Notes,
-    Devices,
-    Sync,
-}
-
 #[derive(Debug, Clone)]
 struct PairingUi {
     code: String,
@@ -128,59 +120,6 @@ pub fn status_label(status: &SyncStatus) -> String {
     }
 }
 
-pub fn show_screen_nav(ui: &mut egui::Ui, screen: &mut Screen) {
-    let full = ui.available_width();
-    let gap = 4.0_f32;
-    let cell = ((full - gap * 2.0) / 3.0).max(64.0);
-
-    egui::Frame::NONE
-        .fill(theme::FAINT)
-        .corner_radius(theme::round())
-        .inner_margin(egui::Margin::same(3))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = gap;
-                nav_btn(ui, screen, Screen::Notes, regular::NOTEBOOK, "Notes", cell);
-                nav_btn(ui, screen, Screen::Devices, regular::DEVICES, "Devices", cell);
-                nav_btn(
-                    ui,
-                    screen,
-                    Screen::Sync,
-                    regular::ARROWS_CLOCKWISE,
-                    "Sync",
-                    cell,
-                );
-            });
-        });
-}
-
-fn nav_btn(
-    ui: &mut egui::Ui,
-    screen: &mut Screen,
-    target: Screen,
-    icon: &str,
-    label: &str,
-    width: f32,
-) {
-    let selected = *screen == target;
-    let color = if selected { theme::TEXT } else { theme::WEAK };
-    let text = egui::RichText::new(format!("{icon}  {label}"))
-        .size(13.0)
-        .color(color);
-    let mut btn = egui::Button::new(text)
-        .min_size(egui::vec2(width, 30.0))
-        .corner_radius(theme::round_sm())
-        .stroke(egui::Stroke::NONE);
-    if selected {
-        btn = btn.fill(theme::PANEL);
-    } else {
-        btn = btn.fill(egui::Color32::TRANSPARENT);
-    }
-    if ui.add(btn).clicked() {
-        *screen = target;
-    }
-}
-
 pub fn show_devices(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -212,11 +151,7 @@ pub fn show_devices(
     let runtime_ok = handle.is_some();
     if initiator {
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Code")
-                    .size(13.0)
-                    .color(theme::WEAK),
-            );
+            ui.label(egui::RichText::new("Code").size(13.0).color(theme::WEAK));
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut state.join_code)
                     .desired_width(100.0)
@@ -228,7 +163,8 @@ pub fn show_devices(
             }
             let join = ui.add_enabled(
                 runtime_ok && state.join_code.len() == 6,
-                egui::Button::new(format!("{}  Join", regular::KEY)).min_size(egui::vec2(0.0, 36.0)),
+                egui::Button::new(format!("{}  Join", regular::KEY))
+                    .min_size(egui::vec2(0.0, 36.0)),
             );
             if join.clicked() {
                 if let Some(h) = handle {
@@ -343,17 +279,18 @@ pub fn show_devices(
                 for dev in &state.trusted {
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new(format!("{}  {}", regular::DEVICE_MOBILE, dev.name))
-                                .size(15.0)
-                                .color(theme::TEXT),
+                            egui::RichText::new(format!(
+                                "{}  {}",
+                                regular::DEVICE_MOBILE,
+                                dev.name
+                            ))
+                            .size(15.0)
+                            .color(theme::TEXT),
                         );
                         ui.label(
-                            egui::RichText::new(format!(
-                                "paired {}",
-                                format_hhmm(dev.paired_at)
-                            ))
-                            .size(12.0)
-                            .color(theme::WEAK),
+                            egui::RichText::new(format!("paired {}", format_hhmm(dev.paired_at)))
+                                .size(12.0)
+                                .color(theme::WEAK),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let btn = ui.add_enabled(

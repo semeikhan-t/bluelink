@@ -19,3 +19,6 @@ local.properties
 .vscode/
 .DS_Store
 graphify*/
+
+# BlueLink vault identity and trust state
+.bluelink/

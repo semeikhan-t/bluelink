@@ -18,13 +18,8 @@ pub const FOOTNOTE_CONT: &str = "    ";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FootnotePlace {
     None,
-    Head {
-        end: usize,
-    },
-    Tail {
-        start: usize,
-        end: usize,
-    },
+    Head { end: usize },
+    Tail { start: usize, end: usize },
 }
 
 pub fn valid_id(s: &str) -> bool {
@@ -202,7 +197,7 @@ pub fn show_field(
                 if editing && at_start && backspace {
                     erase = true;
                 }
-                let _ = ui.add(egui::Button::new(regular::ARTICLE).frame(false));
+                ui.label(regular::ARTICLE);
             });
         });
 
@@ -425,10 +420,7 @@ mod tests {
 
     #[test]
     fn parse_and_format_named_and_numeric() {
-        assert_eq!(
-            parse_def("[^1]: hello"),
-            Some(("1".into(), "hello".into()))
-        );
+        assert_eq!(parse_def("[^1]: hello"), Some(("1".into(), "hello".into())));
         assert_eq!(
             parse_def("[^bignote]: x"),
             Some(("bignote".into(), "x".into()))
@@ -497,6 +489,8 @@ mod tests {
 
         // A def-shaped token must not hide a later real marker.
         let pieces = split_inline_footnotes("x [^skip]: y [^ok] z");
-        assert!(pieces.iter().any(|p| matches!(p, InlinePiece::Ref { id: "ok" })));
+        assert!(pieces
+            .iter()
+            .any(|p| matches!(p, InlinePiece::Ref { id: "ok" })));
     }
 }

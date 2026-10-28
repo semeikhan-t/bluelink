@@ -15,8 +15,8 @@ use crate::editor_menu::{self, EditorAction};
 use crate::fold;
 use crate::footnote;
 use crate::math_block::{self, MathRole};
-use crate::mermaid::{self, MermaidRole};
 use crate::media;
+use crate::mermaid::{self, MermaidRole};
 use crate::note_history::NoteHistory;
 use crate::preview;
 use crate::table::{self, Place};
@@ -152,7 +152,8 @@ fn line_fingerprint(line: &str) -> u64 {
 }
 
 const TOP_PAD: f32 = 12.0;
-const ROW_GAP: f32 = 10.0;
+/// 16px note text with a 24px baseline rhythm (Obsidian's 1.5 line height).
+const ROW_GAP: f32 = 2.0;
 /// Extra band so fast flings don't flash empty rows.
 const OVERSCAN: f32 = 600.0;
 
@@ -357,8 +358,7 @@ fn paint_structured_row(
                 .get(block_end.saturating_sub(1))
                 .map(|&(_, e)| e)
                 .unwrap_or(start);
-            let editing = !readonly
-                && active_line.is_some_and(|a| (i..block_end).contains(&a));
+            let editing = !readonly && active_line.is_some_and(|a| (i..block_end).contains(&a));
             let top = ui.cursor().top();
             if editing {
                 let want = take_line_focus(ui, i);
@@ -876,87 +876,87 @@ pub fn show_live(
     }
 
     scroll_area.show_viewport(ui, |ui, viewport| {
-            // Viewport height at content start — used to fill empty space below lines
-            // so clicks there hit a widget (ScrollArea empty chrome is not clickable).
-            let viewport_h = viewport.height();
+        // Viewport height at content start — used to fill empty space below lines
+        // so clicks there hit a widget (ScrollArea empty chrome is not clickable).
+        let viewport_h = viewport.height();
 
-            // Keep parsed previews and measured heights across frames. Scrolling should not
-            // re-run pulldown-cmark for every visible line on every repaint.
-            let mut layout = ui.ctx().data(|d| d.get_temp::<LiveLayoutCache>(layout_id));
-            if layout
-                .as_ref()
-                .map_or(true, |cache| cache.lines.len() != ranges.len())
-            {
-                layout = Some(LiveLayoutCache::for_lines(buffer, &ranges, &fence_roles));
-            }
-            let mut layout = layout.expect("live layout cache initialized");
+        // Keep parsed previews and measured heights across frames. Scrolling should not
+        // re-run pulldown-cmark for every visible line on every repaint.
+        let mut layout = ui.ctx().data(|d| d.get_temp::<LiveLayoutCache>(layout_id));
+        if layout
+            .as_ref()
+            .map_or(true, |cache| cache.lines.len() != ranges.len())
+        {
+            layout = Some(LiveLayoutCache::for_lines(buffer, &ranges, &fence_roles));
+        }
+        let mut layout = layout.expect("live layout cache initialized");
 
-            let heights: Vec<f32> = layout.lines.iter().map(|l| l.height.max(1.0)).collect();
+        let heights: Vec<f32> = layout.lines.iter().map(|l| l.height.max(1.0)).collect();
         let prefix = row_prefix_heights(&heights, &fence_roles, &hidden);
-            let content_top = ui.cursor().top();
-            let pane = ui.available_rect_before_wrap();
-            // Registered before the lines so text, links, and embeds stay on top.
-            // Empty space at the same height (side margins and the tail of a short line)
-            // still hits this widget and opens that row.
-            let margin = if !can_edit {
-                None
-            } else {
-                let total = *prefix.last().unwrap_or(&TOP_PAD);
-                let rect = egui::Rect::from_min_max(
-                    egui::pos2(pane.left(), content_top),
-                    egui::pos2(pane.right(), content_top + total),
-                );
-                Some(
-                    ui.interact(
-                        rect,
-                        Id::new(("live_margin", source_path.unwrap_or(""))),
-                        egui::Sense::click(),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::Text),
+        let content_top = ui.cursor().top();
+        let pane = ui.available_rect_before_wrap();
+        // Registered before the lines so text, links, and embeds stay on top.
+        // Empty space at the same height (side margins and the tail of a short line)
+        // still hits this widget and opens that row.
+        let margin = if !can_edit {
+            None
+        } else {
+            let total = *prefix.last().unwrap_or(&TOP_PAD);
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(pane.left(), content_top),
+                egui::pos2(pane.right(), content_top + total),
+            );
+            Some(
+                ui.interact(
+                    rect,
+                    Id::new(("live_margin", source_path.unwrap_or(""))),
+                    egui::Sense::click(),
                 )
-            };
+                .on_hover_cursor(egui::CursorIcon::Text),
+            )
+        };
 
-            let mut column_top = content_top;
-            let mut column_left = pane.left();
-            centered_column(ui, |ui| {
-                // Prefix heights are measured from this cursor, not the outer pane.
-                column_top = ui.cursor().top();
-                column_left = ui.cursor().left();
-                // Gaps are baked into prefix strides — avoid egui item_spacing double-count.
-                ui.spacing_mut().item_spacing.y = 0.0;
+        let mut column_top = content_top;
+        let mut column_left = pane.left();
+        centered_column(ui, |ui| {
+            // Prefix heights are measured from this cursor, not the outer pane.
+            column_top = ui.cursor().top();
+            column_left = ui.cursor().left();
+            // Gaps are baked into prefix strides — avoid egui item_spacing double-count.
+            ui.spacing_mut().item_spacing.y = 0.0;
 
-                let n = ranges.len();
-                let force = scroll_to_line.filter(|&i| i < n).or_else(|| {
-                    if can_edit {
-                        active_line.filter(|&i| i < n)
-                    } else {
-                        None
-                    }
-                });
+            let n = ranges.len();
+            let force = scroll_to_line.filter(|&i| i < n).or_else(|| {
+                if can_edit {
+                    active_line.filter(|&i| i < n)
+                } else {
+                    None
+                }
+            });
             let (first, last) = visible_row_range(&prefix, viewport.min.y, viewport.max.y, force);
 
-                ui.add_space(prefix[first]);
+            ui.add_space(prefix[first]);
 
-                let lines: Vec<String> = ranges
-                    .iter()
-                    .map(|&(s, e)| buffer.get(s..e).unwrap_or("").to_string())
-                    .collect();
-                let math_spans = math_block::spans(&lines, &fence_roles);
-                let mermaid_spans = mermaid::spans(&lines, &fence_roles, &fence_langs);
-                let table_places = table::places(&lines);
-                let callout_places = preview::callout_places(&lines);
-                let footnote_places = footnote::places(&lines);
-                if let Some(i) = *active_line {
-                    active_in_math = math_spans
-                        .get(i)
-                        .is_some_and(|span| span.role != MathRole::Outside);
-                    active_in_mermaid = mermaid_spans
-                        .get(i)
-                        .is_some_and(|span| span.role != MermaidRole::Outside);
-                }
+            let lines: Vec<String> = ranges
+                .iter()
+                .map(|&(s, e)| buffer.get(s..e).unwrap_or("").to_string())
+                .collect();
+            let math_spans = math_block::spans(&lines, &fence_roles);
+            let mermaid_spans = mermaid::spans(&lines, &fence_roles, &fence_langs);
+            let table_places = table::places(&lines);
+            let callout_places = preview::callout_places(&lines);
+            let footnote_places = footnote::places(&lines);
+            if let Some(i) = *active_line {
+                active_in_math = math_spans
+                    .get(i)
+                    .is_some_and(|span| span.role != MathRole::Outside);
+                active_in_mermaid = mermaid_spans
+                    .get(i)
+                    .is_some_and(|span| span.role != MermaidRole::Outside);
+            }
 
             let mut fold_clicked: Option<usize> = None;
-                for i in first..last {
+            for i in first..last {
                 if hidden.get(i).copied().unwrap_or(false) {
                     continue;
                 }
@@ -973,436 +973,435 @@ pub fn show_live(
                         fold_clicked = Some(i);
                     }
                 }
-                    let (start, end) = ranges[i];
-                    let fence_role = fence_roles[i];
-                    let fence_lang = fence_langs[i].as_deref();
-                    let in_fence = !matches!(fence_role, preview::FenceRole::Outside);
-                    let is_active = can_edit && *active_line == Some(i);
+                let (start, end) = ranges[i];
+                let fence_role = fence_roles[i];
+                let fence_lang = fence_langs[i].as_deref();
+                let in_fence = !matches!(fence_role, preview::FenceRole::Outside);
+                let is_active = can_edit && *active_line == Some(i);
 
-                    let line = buffer.get(start..end).unwrap_or("");
+                let line = buffer.get(start..end).unwrap_or("");
 
-                    if let Some(painted) = paint_structured_row(
-                        ui,
-                        i,
-                        start,
-                        end,
-                        line,
-                        &lines,
-                        &math_spans,
-                        &mermaid_spans,
-                        &table_places,
-                        &callout_places,
-                        &footnote_places,
-                        &ranges,
-                        *active_line,
-                        !can_edit,
-                        &mut splice,
-                        &mut table_edit,
-                        &mut request_active,
-                        &mut leave_edit_after_wiki,
-                        &mut erase_footnote,
-                        &mut footnote_jump,
-                    ) {
-                        layout.lines[i].height = painted.height;
-                        if !painted.skip_gap {
-                            let gap = gap_after_row(i, n, fence_role);
-                            if gap > 0.0 {
-                                ui.add_space(gap);
-                            }
+                if let Some(painted) = paint_structured_row(
+                    ui,
+                    i,
+                    start,
+                    end,
+                    line,
+                    &lines,
+                    &math_spans,
+                    &mermaid_spans,
+                    &table_places,
+                    &callout_places,
+                    &footnote_places,
+                    &ranges,
+                    *active_line,
+                    !can_edit,
+                    &mut splice,
+                    &mut table_edit,
+                    &mut request_active,
+                    &mut leave_edit_after_wiki,
+                    &mut erase_footnote,
+                    &mut footnote_jump,
+                ) {
+                    layout.lines[i].height = painted.height;
+                    if !painted.skip_gap {
+                        let gap = gap_after_row(i, n, fence_role);
+                        if gap > 0.0 {
+                            ui.add_space(gap);
                         }
-                        continue;
+                    }
+                    continue;
+                }
+
+                let row_id = egui::Id::new(("live_line", i));
+                let mut measured_h;
+
+                if is_active {
+                    let mut draft = line.to_string();
+                    let font = preview::edit_font_for(&line, fence_role);
+                    // TextEdit floors height at interact_size (32px) — match preview row.
+                    let row_h = if line.is_empty() {
+                        22.0
+                    } else {
+                        ui.fonts(|f| f.row_height(&font))
+                    };
+                    ui.spacing_mut().interact_size.y = row_h;
+                    let mut layouter = |ui: &Ui, text: &str, wrap_width: f32| {
+                        layout_line_edit(ui, text, wrap_width)
+                    };
+                    let output = TextEdit::singleline(&mut draft)
+                        .id(row_id)
+                        .desired_width(f32::INFINITY)
+                        .font(font)
+                        .layouter(&mut layouter)
+                        .frame(false)
+                        .margin(egui::Margin::ZERO)
+                        // Tab inserts indent instead of moving focus.
+                        .lock_focus(true)
+                        .show(ui);
+                    let response = output.response;
+
+                    let focus_key = egui::Id::new(("live_focus", i));
+                    let want_focus = ui.ctx().data_mut(|d| {
+                        let v = d.get_temp::<bool>(focus_key).unwrap_or(false);
+                        if v {
+                            d.insert_temp(focus_key, false);
+                        }
+                        v
+                    });
+                    if want_focus {
+                        response.request_focus();
                     }
 
-                    let row_id = egui::Id::new(("live_line", i));
-                    let mut measured_h;
+                    // Place cursor after merge-up / wiki insert / context-menu edit.
+                    let cursor_key = egui::Id::new(("live_cursor", i));
+                    if let Some(idx) = ui.ctx().data_mut(|d| d.remove_temp::<usize>(cursor_key)) {
+                        let mut state = output.state.clone();
+                        state
+                            .cursor
+                            .set_char_range(Some(CCursorRange::one(CCursor::new(idx))));
+                        state.store(ui.ctx(), row_id);
+                    }
 
-                    if is_active {
-                        let mut draft = line.to_string();
-                        let font = preview::edit_font_for(&line, fence_role);
-                        // TextEdit floors height at interact_size (32px) — match preview row.
-                        let row_h = if line.is_empty() {
-                            22.0
-                        } else {
-                            ui.fonts(|f| f.row_height(&font))
-                        };
-                        ui.spacing_mut().interact_size.y = row_h;
-                        let mut layouter = |ui: &Ui, text: &str, wrap_width: f32| {
-                            layout_line_edit(ui, text, wrap_width)
-                        };
-                        let output = TextEdit::singleline(&mut draft)
-                            .id(row_id)
-                            .desired_width(f32::INFINITY)
-                            .font(font)
-                            .layouter(&mut layouter)
-                            .frame(false)
-                            .margin(egui::Margin::ZERO)
-                            // Tab inserts indent instead of moving focus.
-                            .lock_focus(true)
-                            .show(ui);
-                        let response = output.response;
-
-                        let focus_key = egui::Id::new(("live_focus", i));
-                        let want_focus = ui.ctx().data_mut(|d| {
-                            let v = d.get_temp::<bool>(focus_key).unwrap_or(false);
-                            if v {
-                                d.insert_temp(focus_key, false);
-                            }
-                            v
+                    // Deferred clipboard from preview-row / fill context menu.
+                    let clip_key = egui::Id::new("live_pending_clipboard");
+                    if response.has_focus() {
+                        let clip = ui.ctx().data_mut(|d| {
+                            d.remove_temp::<PendingClipboard>(clip_key)
+                                .unwrap_or_default()
                         });
-                        if want_focus {
-                            response.request_focus();
-                        }
+                        clip.dispatch(ui);
+                    }
 
-                        // Place cursor after merge-up / wiki insert / context-menu edit.
-                        let cursor_key = egui::Id::new(("live_cursor", i));
-                        if let Some(idx) = ui.ctx().data_mut(|d| d.remove_temp::<usize>(cursor_key)) {
-                            let mut state = output.state.clone();
-                            state
-                                .cursor
-                                .set_char_range(Some(CCursorRange::one(CCursor::new(idx))));
-                            state.store(ui.ctx(), row_id);
-                        }
+                    let enter = ui.input(|inp| inp.key_pressed(Key::Enter));
+                    let backspace = ui.input(|inp| inp.key_pressed(Key::Backspace));
+                    let focused = response.has_focus() || response.lost_focus();
 
-                        // Deferred clipboard from preview-row / fill context menu.
-                        let clip_key = egui::Id::new("live_pending_clipboard");
-                        if response.has_focus() {
-                            let clip = ui.ctx().data_mut(|d| {
-                                d.remove_temp::<PendingClipboard>(clip_key)
-                                    .unwrap_or_default()
-                            });
-                            clip.dispatch(ui);
-                        }
+                    let (mut primary, mut secondary) = output
+                        .cursor_range
+                        .map(|r| (r.primary.ccursor.index, r.secondary.ccursor.index))
+                        .unwrap_or_else(|| {
+                            let n = draft.chars().count();
+                            (n, n)
+                        });
 
-                        let enter = ui.input(|inp| inp.key_pressed(Key::Enter));
-                        let backspace = ui.input(|inp| inp.key_pressed(Key::Backspace));
-                        let focused = response.has_focus() || response.lost_focus();
-
-                        let (mut primary, mut secondary) = output
-                            .cursor_range
-                            .map(|r| (r.primary.ccursor.index, r.secondary.ccursor.index))
-                            .unwrap_or_else(|| {
-                                let n = draft.chars().count();
-                                (n, n)
-                            });
-
-                        // egui only inserts Tab in multiline — handle it for the live line.
-                        // ponytail: Live has no multi-line selection; Source applies per list line in the range.
-                        let tab_pressed = focused
-                            && ui.input(|inp| {
-                                inp.key_pressed(Key::Tab)
-                                    && !inp.modifiers.command
-                                    && !inp.modifiers.alt
-                            });
-                        if tab_pressed && splice.is_none() {
-                            let unindent = ui.input(|inp| inp.modifiers.shift);
-                            let mut applied = false;
-                            if preview::is_list_line(&draft) {
-                                if unindent {
-                                    if let Some(next) = preview::unindent_list_line(&draft) {
-                                        let n = draft.chars().count() - next.chars().count();
-                                        draft = next;
-                                        primary = primary.saturating_sub(n);
-                                        secondary = secondary.saturating_sub(n);
-                                        applied = true;
-                                    }
-                                } else {
-                                    draft = preview::indent_list_line(&draft);
-                                    let n = preview::LIST_INDENT.chars().count();
-                                    primary += n;
-                                    secondary += n;
+                    // egui only inserts Tab in multiline — handle it for the live line.
+                    // ponytail: Live has no multi-line selection; Source applies per list line in the range.
+                    let tab_pressed = focused
+                        && ui.input(|inp| {
+                            inp.key_pressed(Key::Tab)
+                                && !inp.modifiers.command
+                                && !inp.modifiers.alt
+                        });
+                    if tab_pressed && splice.is_none() {
+                        let unindent = ui.input(|inp| inp.modifiers.shift);
+                        let mut applied = false;
+                        if preview::is_list_line(&draft) {
+                            if unindent {
+                                if let Some(next) = preview::unindent_list_line(&draft) {
+                                    let n = draft.chars().count() - next.chars().count();
+                                    draft = next;
+                                    primary = primary.saturating_sub(n);
+                                    secondary = secondary.saturating_sub(n);
                                     applied = true;
                                 }
-                            } else if unindent {
-                                let (p, s) = unindent_line(&mut draft, primary, secondary);
-                                primary = p;
-                                secondary = s;
-                                applied = true;
                             } else {
-                                // Non-list (paragraph or fence): insert a literal tab.
-                                let lo = primary.min(secondary);
-                                let hi = primary.max(secondary);
-                                let b0 = editor_menu::char_to_byte(&draft, lo);
-                                let b1 = editor_menu::char_to_byte(&draft, hi);
-                                draft.replace_range(b0..b1, "\t");
-                                primary = lo + 1;
-                                secondary = primary;
+                                draft = preview::indent_list_line(&draft);
+                                let n = preview::LIST_INDENT.chars().count();
+                                primary += n;
+                                secondary += n;
                                 applied = true;
                             }
-                            if applied {
-                                splice = Some((start, end, draft.clone()));
-                                ui.ctx().data_mut(|d| {
-                                    d.insert_temp(egui::Id::new(("live_cursor", i)), primary);
-                                });
-                            }
+                        } else if unindent {
+                            let (p, s) = unindent_line(&mut draft, primary, secondary);
+                            primary = p;
+                            secondary = s;
+                            applied = true;
+                        } else {
+                            // Non-list (paragraph or fence): insert a literal tab.
+                            let lo = primary.min(secondary);
+                            let hi = primary.max(secondary);
+                            let b0 = editor_menu::char_to_byte(&draft, lo);
+                            let b1 = editor_menu::char_to_byte(&draft, hi);
+                            draft.replace_range(b0..b1, "\t");
+                            primary = lo + 1;
+                            secondary = primary;
+                            applied = true;
                         }
-
-                        // Format shortcuts when the line field has focus (not S/P/Z/F/A/W/T/G).
-                        if focused && splice.is_none() {
-                            let wrap = ui.input(|inp| {
-                            if !inp.modifiers.command || inp.modifiers.shift || inp.modifiers.alt {
-                                    return None;
-                                }
-                                if inp.key_pressed(Key::B) {
-                                    Some(("**", "**"))
-                                } else if inp.key_pressed(Key::I) {
-                                    Some(("*", "*"))
-                                } else if inp.key_pressed(Key::K) {
-                                    Some(("[[", "]]"))
-                                } else {
-                                    None
-                                }
+                        if applied {
+                            splice = Some((start, end, draft.clone()));
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(egui::Id::new(("live_cursor", i)), primary);
                             });
-                            if let Some((before, after)) = wrap {
-                                structural_checkpoint = true;
-                                let caret = editor_menu::wrap_selection(
-                                    &mut draft, primary, secondary, before, after,
-                                );
-                                primary = caret;
-                                secondary = caret;
-                                splice = Some((start, end, draft.clone()));
-                                ui.ctx().data_mut(|d| {
-                                    d.insert_temp(egui::Id::new(("live_cursor", i)), caret);
-                                });
-                            }
                         }
+                    }
 
-                        active_sel = Some((i, primary, secondary));
-                        if response.secondary_clicked() {
-                            if let Some(pos) = response.interact_pointer_pos() {
+                    // Format shortcuts when the line field has focus (not S/P/Z/F/A/W/T/G).
+                    if focused && splice.is_none() {
+                        let wrap = ui.input(|inp| {
+                            if !inp.modifiers.command || inp.modifiers.shift || inp.modifiers.alt {
+                                return None;
+                            }
+                            if inp.key_pressed(Key::B) {
+                                Some(("**", "**"))
+                            } else if inp.key_pressed(Key::I) {
+                                Some(("*", "*"))
+                            } else if inp.key_pressed(Key::K) {
+                                Some(("[[", "]]"))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some((before, after)) = wrap {
+                            structural_checkpoint = true;
+                            let caret = editor_menu::wrap_selection(
+                                &mut draft, primary, secondary, before, after,
+                            );
+                            primary = caret;
+                            secondary = caret;
+                            splice = Some((start, end, draft.clone()));
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(egui::Id::new(("live_cursor", i)), caret);
+                            });
+                        }
+                    }
+
+                    active_sel = Some((i, primary, secondary));
+                    if response.secondary_clicked() {
+                        if let Some(pos) = response.interact_pointer_pos() {
                             editor_menu::open_at(ui.ctx(), pos, Some(i), primary, secondary);
-                            }
                         }
+                    }
 
-                        let byte_idx = draft
-                            .char_indices()
-                            .nth(primary)
-                            .map(|(b, _)| b)
-                            .unwrap_or(draft.len());
+                    let byte_idx = draft
+                        .char_indices()
+                        .nth(primary)
+                        .map(|(b, _)| b)
+                        .unwrap_or(draft.len());
 
-                        // Wiki autocomplete. Clicking a candidate steals TextEdit focus on
-                        // pointer-down and only registers `clicked` on pointer-up next frame —
-                        // keep the popup alive for a few frames after lost_focus so the pick lands.
-                        let mut wiki_consumed_enter = false;
-                        let wiki_open = open_wiki_query(&draft, byte_idx);
-                        let grace_key = egui::Id::new(("wiki_ac_grace", i));
-                        let mut grace: u8 = ui
-                            .ctx()
-                            .data_mut(|d| d.get_temp::<u8>(grace_key).unwrap_or(0));
-                        if wiki_open.is_none() {
-                            grace = 0;
-                        } else if response.lost_focus() {
-                            grace = 24; // ~0.4s at 60fps
-                        } else if focused {
-                            grace = 2;
-                        } else if grace > 0 {
-                            grace -= 1;
-                        }
-                        let show_wiki = wiki_open.is_some() && (focused || grace > 0);
-                        if let Some((brack_at, query)) = wiki_open {
-                            if show_wiki {
+                    // Wiki autocomplete. Clicking a candidate steals TextEdit focus on
+                    // pointer-down and only registers `clicked` on pointer-up next frame —
+                    // keep the popup alive for a few frames after lost_focus so the pick lands.
+                    let mut wiki_consumed_enter = false;
+                    let wiki_open = open_wiki_query(&draft, byte_idx);
+                    let grace_key = egui::Id::new(("wiki_ac_grace", i));
+                    let mut grace: u8 = ui
+                        .ctx()
+                        .data_mut(|d| d.get_temp::<u8>(grace_key).unwrap_or(0));
+                    if wiki_open.is_none() {
+                        grace = 0;
+                    } else if response.lost_focus() {
+                        grace = 24; // ~0.4s at 60fps
+                    } else if focused {
+                        grace = 2;
+                    } else if grace > 0 {
+                        grace -= 1;
+                    }
+                    let show_wiki = wiki_open.is_some() && (focused || grace > 0);
+                    if let Some((brack_at, query)) = wiki_open {
+                        if show_wiki {
                             let candidates = wiki_candidates(&vault.index().note_paths(), &query);
-                                let mut picked: Option<String> = None;
-                                if !candidates.is_empty() {
-                                    egui::Area::new(Id::new(("wiki_ac", i)))
-                                        .order(Order::Foreground)
+                            let mut picked: Option<String> = None;
+                            if !candidates.is_empty() {
+                                egui::Area::new(Id::new(("wiki_ac", i)))
+                                    .order(Order::Foreground)
                                     .fixed_pos(response.rect.left_bottom() + egui::vec2(0.0, 4.0))
-                                        .show(ui.ctx(), |ui| {
-                                            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                                ui.set_min_width(220.0);
-                                                ui.label(
-                                                    egui::RichText::new("Link to note")
-                                                        .size(12.0)
-                                                        .color(theme::WEAK),
-                                                );
-                                                for path in candidates.iter().take(12) {
-                                                    let label = path.trim_end_matches(".md");
-                                                    let r = ui.selectable_label(false, label);
-                                                    if r.hovered() || r.clicked() {
-                                                        grace = 24;
-                                                    }
-                                                    if r.clicked() {
-                                                        picked = Some(label.to_string());
-                                                    }
+                                    .show(ui.ctx(), |ui| {
+                                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                            ui.set_min_width(220.0);
+                                            ui.label(
+                                                egui::RichText::new("Link to note")
+                                                    .size(12.0)
+                                                    .color(theme::WEAK),
+                                            );
+                                            for path in candidates.iter().take(12) {
+                                                let label = path.trim_end_matches(".md");
+                                                let r = ui.selectable_label(false, label);
+                                                if r.hovered() || r.clicked() {
+                                                    grace = 24;
                                                 }
-                                            });
+                                                if r.clicked() {
+                                                    picked = Some(label.to_string());
+                                                }
+                                            }
                                         });
-                                    if enter && focused {
+                                    });
+                                if enter && focused {
                                     picked =
                                         Some(candidates[0].trim_end_matches(".md").to_string());
-                                        wiki_consumed_enter = true;
-                                    }
-                                }
-                                if let Some(name) = picked {
-                                    let prefix = &draft[..brack_at];
-                                    let suffix = &draft[byte_idx..];
-                                    let inserted = format!("{prefix}[[{name}]]{suffix}");
-                                    splice = Some((start, end, inserted));
-                                    // Drop raw edit so the link renders as a clickable preview.
-                                    leave_edit_after_wiki = true;
+                                    wiki_consumed_enter = true;
                                 }
                             }
+                            if let Some(name) = picked {
+                                let prefix = &draft[..brack_at];
+                                let suffix = &draft[byte_idx..];
+                                let inserted = format!("{prefix}[[{name}]]{suffix}");
+                                splice = Some((start, end, inserted));
+                                // Drop raw edit so the link renders as a clickable preview.
+                                leave_edit_after_wiki = true;
+                            }
                         }
-                        ui.ctx().data_mut(|d| d.insert_temp(grace_key, grace));
+                    }
+                    ui.ctx().data_mut(|d| d.insert_temp(grace_key, grace));
 
-                        // singleline TextEdit loses focus on Enter — newline, unless wiki picked.
+                    // singleline TextEdit loses focus on Enter — newline, unless wiki picked.
                     let enter_here = enter && focused && !wiki_consumed_enter && splice.is_none();
-                        if enter_here {
-                            let left = draft[..byte_idx].to_string();
-                            let right = draft[byte_idx..].to_string();
-                            // Empty list/checklist item: strip marker. Else continue it.
-                            if right.is_empty() {
-                                if let Some(cont) = preview::continue_list_marker(&left) {
-                                    structural_checkpoint = true;
-                                    if cont.empty_body {
-                                        splice = Some((start, end, cont.clear_to));
-                                        leave_edit_after_wiki = true;
-                                    } else {
-                                    split_at_cursor = Some((start, end, left, cont.next_prefix));
-                                    }
+                    if enter_here {
+                        let left = draft[..byte_idx].to_string();
+                        let right = draft[byte_idx..].to_string();
+                        // Empty list/checklist item: strip marker. Else continue it.
+                        if right.is_empty() {
+                            if let Some(cont) = preview::continue_list_marker(&left) {
+                                structural_checkpoint = true;
+                                if cont.empty_body {
+                                    splice = Some((start, end, cont.clear_to));
+                                    leave_edit_after_wiki = true;
                                 } else {
-                                    split_at_cursor = Some((start, end, left, right));
+                                    split_at_cursor = Some((start, end, left, cont.next_prefix));
                                 }
                             } else {
                                 split_at_cursor = Some((start, end, left, right));
                             }
-                        } else if splice.is_none() && response.changed() && draft != line {
-                            // Typing the closing `]]` → switch to preview so the link is clickable.
-                            let closed_wiki = open_wiki_query(&draft, byte_idx).is_none()
-                                && draft.contains("[[")
-                                && draft.contains("]]")
-                                && open_wiki_query(&line, line.len()).is_some();
-                            splice = Some((start, end, draft.clone()));
-                            if closed_wiki {
-                                leave_edit_after_wiki = true;
-                            }
-                        }
-
-                        // Backspace at start of line → join onto previous line
-                        // (draft == line means TextEdit did not consume the key).
-                        let cursor_at_start = output
-                            .cursor_range
-                        .map(|r| r.primary.ccursor.index == 0 && r.secondary.ccursor.index == 0)
-                            .unwrap_or(false);
-                        if backspace
-                            && i > 0
-                            && cursor_at_start
-                            && draft == line
-                            && focused
-                            && splice.is_none()
-                        {
-                            merge_with_prev = Some(i);
-                        }
-                        measured_h = response.rect.height().max(1.0);
-                    } else {
-                        let preview = if in_fence {
-                            None
                         } else {
-                            let fingerprint = line_fingerprint(line);
-                            let cached = &mut layout.lines[i];
-                            if cached.preview.is_none() || cached.fingerprint != fingerprint {
-                                cached.fingerprint = fingerprint;
-                                cached.preview = Some(bluelink_core::parse_preview(line));
-                                // Prefer underestimate until painted — overestimates feel like dead scroll.
-                                cached.height = estimate_row_height(line, fence_role);
-                            }
-                            cached.preview.as_ref()
-                        };
-                        let row = ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), 0.0),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                ui.set_min_width(ui.available_width());
-                                ui.set_min_height(22.0);
-                                preview::render_line_with_preview(
-                                    ui,
-                                    vault,
-                                    source_path,
-                                    line,
-                                    fence_role,
-                                    fence_lang,
-                                    preview,
-                                    show_comments,
-                                )
-                            },
-                        );
-                        let click = row.inner;
-                        measured_h = row.response.rect.height().max(1.0);
+                            split_at_cursor = Some((start, end, left, right));
+                        }
+                    } else if splice.is_none() && response.changed() && draft != line {
+                        // Typing the closing `]]` → switch to preview so the link is clickable.
+                        let closed_wiki = open_wiki_query(&draft, byte_idx).is_none()
+                            && draft.contains("[[")
+                            && draft.contains("]]")
+                            && open_wiki_query(&line, line.len()).is_some();
+                        splice = Some((start, end, draft.clone()));
+                        if closed_wiki {
+                            leave_edit_after_wiki = true;
+                        }
+                    }
 
-                        if can_edit && row.response.secondary_clicked() {
-                            let n = line.chars().count();
-                            if let Some(pos) = row.response.interact_pointer_pos() {
-                                editor_menu::open_at(ui.ctx(), pos, Some(i), n, n);
-                            }
-                            request_active = Some(i);
-                            ui.ctx().data_mut(|d| {
-                                d.insert_temp(egui::Id::new(("live_focus", i)), true);
+                    // Backspace at start of line → join onto previous line
+                    // (draft == line means TextEdit did not consume the key).
+                    let cursor_at_start = output
+                        .cursor_range
+                        .map(|r| r.primary.ccursor.index == 0 && r.secondary.ccursor.index == 0)
+                        .unwrap_or(false);
+                    if backspace
+                        && i > 0
+                        && cursor_at_start
+                        && draft == line
+                        && focused
+                        && splice.is_none()
+                    {
+                        merge_with_prev = Some(i);
+                    }
+                    measured_h = response.rect.height().max(1.0);
+                } else {
+                    let preview = if in_fence {
+                        None
+                    } else {
+                        let fingerprint = line_fingerprint(line);
+                        let cached = &mut layout.lines[i];
+                        if cached.preview.is_none() || cached.fingerprint != fingerprint {
+                            cached.fingerprint = fingerprint;
+                            cached.preview = Some(bluelink_core::parse_preview(line));
+                            // Prefer underestimate until painted — overestimates feel like dead scroll.
+                            cached.height = estimate_row_height(line, fence_role);
+                        }
+                        cached.preview.as_ref()
+                    };
+                    let row = ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.set_min_height(22.0);
+                            preview::render_line_with_preview(
+                                ui,
+                                vault,
+                                source_path,
+                                line,
+                                fence_role,
+                                fence_lang,
+                                preview,
+                                show_comments,
+                            )
+                        },
+                    );
+                    let click = row.inner;
+                    measured_h = row.response.rect.height().max(1.0);
+
+                    if can_edit && row.response.secondary_clicked() {
+                        let n = line.chars().count();
+                        if let Some(pos) = row.response.interact_pointer_pos() {
+                            editor_menu::open_at(ui.ctx(), pos, Some(i), n, n);
+                        }
+                        request_active = Some(i);
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(egui::Id::new(("live_focus", i)), true);
+                        });
+                    }
+
+                    match click {
+                        preview::LineClick::Wiki { raw, new_tab } => {
+                            result.wikilink = Some(WikiClick {
+                                fragment: link_fragment(&raw),
+                                raw,
+                                new_tab,
                             });
                         }
-
-                        match click {
-                            preview::LineClick::Wiki { raw, new_tab } => {
-                                result.wikilink = Some(WikiClick {
-                                    fragment: link_fragment(&raw),
-                                    raw,
-                                    new_tab,
-                                });
-                            }
-                            preview::LineClick::Tag { query } => {
-                                result.tag_query = Some(query);
-                            }
-                            preview::LineClick::Footnote { id } => {
-                                if let Some(line) = footnote::def_line(buffer, &id) {
-                                    footnote_jump = Some(line);
-                                    request_active = Some(line);
-                                }
-                            }
-                            preview::LineClick::ToggleCheck if can_edit => {
-                                if let Some(next) = preview::toggle_checklist_line(line) {
-                                    structural_checkpoint = true;
-                                    splice = Some((start, end, next));
-                                }
-                            }
-                            preview::LineClick::ResizeEmbed {
-                                target,
-                                width,
-                                height,
-                            } if can_edit => {
-                                history.checkpoint(buffer);
-                            if media::rewrite_embed_size(buffer, Some(i), &target, width, height) {
-                                    result.changed = true;
-                                    if *active_line == Some(i) {
-                                        history.begin_burst(buffer);
-                                    }
-                                }
-                            }
-                            preview::LineClick::Edit if can_edit => {
-                                request_active = Some(i);
-                            }
-                            _ => {}
+                        preview::LineClick::Tag { query } => {
+                            result.tag_query = Some(query);
                         }
-                    }
-
-                    let span = math_spans[i];
-                    let editing_math = active_line.is_some_and(|a| span.contains(a));
-                    if editing_math && span.role == MathRole::Close {
-                        let (extra, _) =
-                            math_block::show_preview(ui, &math_block::formula(&lines, span), false);
-                        measured_h += extra;
-                    }
-                    let mspan = mermaid_spans[i];
-                    let editing_mermaid = active_line.is_some_and(|a| mspan.contains(a));
-                    if editing_mermaid && mspan.role == MermaidRole::Close {
-                        let (extra, _) =
-                            mermaid::show_preview(ui, &mermaid::source(&lines, mspan));
-                        measured_h += extra;
-                    }
-
-                    layout.lines[i].height = measured_h;
-                    let gap = gap_after_row(i, n, fence_role);
-                    if gap > 0.0 {
-                        ui.add_space(gap);
+                        preview::LineClick::Footnote { id } => {
+                            if let Some(line) = footnote::def_line(buffer, &id) {
+                                footnote_jump = Some(line);
+                                request_active = Some(line);
+                            }
+                        }
+                        preview::LineClick::ToggleCheck if can_edit => {
+                            if let Some(next) = preview::toggle_checklist_line(line) {
+                                structural_checkpoint = true;
+                                splice = Some((start, end, next));
+                            }
+                        }
+                        preview::LineClick::ResizeEmbed {
+                            target,
+                            width,
+                            height,
+                        } if can_edit => {
+                            history.checkpoint(buffer);
+                            if media::rewrite_embed_size(buffer, Some(i), &target, width, height) {
+                                result.changed = true;
+                                if *active_line == Some(i) {
+                                    history.begin_burst(buffer);
+                                }
+                            }
+                        }
+                        preview::LineClick::Edit if can_edit => {
+                            request_active = Some(i);
+                        }
+                        _ => {}
                     }
                 }
+
+                let span = math_spans[i];
+                let editing_math = active_line.is_some_and(|a| span.contains(a));
+                if editing_math && span.role == MathRole::Close {
+                    let (extra, _) =
+                        math_block::show_preview(ui, &math_block::formula(&lines, span), false);
+                    measured_h += extra;
+                }
+                let mspan = mermaid_spans[i];
+                let editing_mermaid = active_line.is_some_and(|a| mspan.contains(a));
+                if editing_mermaid && mspan.role == MermaidRole::Close {
+                    let (extra, _) = mermaid::show_preview(ui, &mermaid::source(&lines, mspan));
+                    measured_h += extra;
+                }
+
+                layout.lines[i].height = measured_h;
+                let gap = gap_after_row(i, n, fence_role);
+                if gap > 0.0 {
+                    ui.add_space(gap);
+                }
+            }
             if let Some(i) = fold_clicked {
                 let closed_now = if let Some(pos) = folds.iter().position(|&start| start == i) {
                     folds.remove(pos);
@@ -1422,144 +1421,169 @@ pub fn show_live(
                     }
                 }
             }
-                let total = *prefix.last().unwrap_or(&TOP_PAD);
-                let after = (total - prefix[last]).max(0.0);
-                if after > 0.0 {
-                    ui.add_space(after);
-                }
-            });
+            let total = *prefix.last().unwrap_or(&TOP_PAD);
+            let after = (total - prefix[last]).max(0.0);
+            if after > 0.0 {
+                ui.add_space(after);
+            }
+        });
 
-            if let Some(resp) = margin {
-                let primary = resp.clicked();
-                let secondary = resp.secondary_clicked();
-                if primary || secondary {
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        let local_y = pos.y - column_top;
+        if let Some(resp) = margin {
+            let primary = resp.clicked();
+            let secondary = resp.secondary_clicked();
+            if primary || secondary {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let local_y = pos.y - column_top;
                     if let Some(mut i) = row_at_local_y(&prefix, &heights, local_y) {
                         if hidden.get(i).copied().unwrap_or(false) {
                             i = jump_to.get(i).copied().flatten().unwrap_or(i);
                         }
-                            let n = ranges
-                                .get(i)
-                                .and_then(|&(s, e)| buffer.get(s..e))
-                                .map(|t| t.chars().count())
-                                .unwrap_or(0);
-                            // Left of the text column → start of the line. Anywhere else
-                            // the click is past the glyphs, so the caret goes to the end.
-                            let caret = if pos.x < column_left { 0 } else { n };
-                            if secondary {
-                                editor_menu::open_at(ui.ctx(), pos, Some(i), caret, caret);
-                            }
-                            request_active = Some(i);
-                            ui.ctx().data_mut(|d| {
-                                d.insert_temp(egui::Id::new(("live_cursor", i)), caret);
-                            });
+                        let n = ranges
+                            .get(i)
+                            .and_then(|&(s, e)| buffer.get(s..e))
+                            .map(|t| t.chars().count())
+                            .unwrap_or(0);
+                        // Left of the text column → start of the line. Anywhere else
+                        // the click is past the glyphs, so the caret goes to the end.
+                        let caret = if pos.x < column_left { 0 } else { n };
+                        if secondary {
+                            editor_menu::open_at(ui.ctx(), pos, Some(i), caret, caret);
                         }
+                        request_active = Some(i);
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(egui::Id::new(("live_cursor", i)), caret);
+                        });
                     }
                 }
             }
+        }
 
-            ui.ctx().data_mut(|d| d.insert_temp(layout_id, layout));
+        ui.ctx().data_mut(|d| d.insert_temp(layout_id, layout));
 
-            if can_edit {
-                let used = (ui.cursor().top() - content_top).max(0.0);
-                // Full editor width (not only the centered column) + at least the viewport.
-                let fill_h = (viewport_h - used).max(120.0);
-                let resp = ui.allocate_response(
-                    egui::vec2(ui.available_width(), fill_h),
-                    egui::Sense::click(),
-                );
-                if resp.clicked() || resp.secondary_clicked() {
-                    // Empty area under the note edits the line after the last one.
-                    let (i, created) = line_below_last(buffer);
-                    if created {
-                        result.changed = true;
-                    }
-                    if resp.secondary_clicked() {
-                        if let Some(pos) = resp.interact_pointer_pos() {
-                            editor_menu::open_at(ui.ctx(), pos, Some(i), 0, 0);
-                        }
-                    }
-                    request_active = Some(i);
-                    ui.ctx().data_mut(|d| {
-                        d.insert_temp(egui::Id::new(("live_focus", i)), true);
-                        d.insert_temp(egui::Id::new(("live_cursor", i)), 0);
-                    });
-                }
-            }
-        });
-
-        // One floating menu for the whole editor (not per-line egui context_menu).
         if can_edit {
-            let menu_was_open = editor_menu::load_menu(ui.ctx()).is_some();
-            let table_was_open = table::menu_open(ui.ctx());
-            if let Some((menu, action)) = editor_menu::show_popup(ui.ctx()) {
-                match action {
-                    EditorAction::SelectAll => {
-                        request_select_all = true;
+            let used = (ui.cursor().top() - content_top).max(0.0);
+            // Full editor width (not only the centered column) + at least the viewport.
+            let fill_h = (viewport_h - used).max(120.0);
+            let resp = ui.allocate_response(
+                egui::vec2(ui.available_width(), fill_h),
+                egui::Sense::click(),
+            );
+            if resp.clicked() || resp.secondary_clicked() {
+                // Empty area under the note edits the line after the last one.
+                let (i, created) = line_below_last(buffer);
+                if created {
+                    result.changed = true;
+                }
+                if resp.secondary_clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        editor_menu::open_at(ui.ctx(), pos, Some(i), 0, 0);
                     }
-                    EditorAction::AttachFile => {
-                        result.attach_file = true;
-                        if let Some(i) = menu.line {
-                            request_active = Some(i);
-                        }
+                }
+                request_active = Some(i);
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(egui::Id::new(("live_focus", i)), true);
+                    d.insert_temp(egui::Id::new(("live_cursor", i)), 0);
+                });
+            }
+        }
+    });
+
+    // One floating menu for the whole editor (not per-line egui context_menu).
+    if can_edit {
+        let menu_was_open = editor_menu::load_menu(ui.ctx()).is_some();
+        let table_was_open = table::menu_open(ui.ctx());
+        if let Some((menu, action)) = editor_menu::show_popup(ui.ctx()) {
+            match action {
+                EditorAction::SelectAll => {
+                    request_select_all = true;
+                }
+                EditorAction::AttachFile => {
+                    result.attach_file = true;
+                    if let Some(i) = menu.line {
+                        request_active = Some(i);
                     }
-                    EditorAction::Paste => {
-                        if let Some(i) = menu.line {
-                            request_active = Some(i);
-                            ui.ctx().data_mut(|d| {
-                                d.insert_temp(egui::Id::new(("live_focus", i)), true);
-                            });
-                        }
-                        // Prefer clipboard image → embed; else OS text paste.
-                        if let Some(note) = source_path {
-                            if try_insert_clipboard_image(
-                                vault,
-                                note,
-                                buffer,
-                                menu.line.or(*active_line),
-                                history,
-                                &mut result,
+                }
+                EditorAction::Paste => {
+                    if let Some(i) = menu.line {
+                        request_active = Some(i);
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(egui::Id::new(("live_focus", i)), true);
+                        });
+                    }
+                    // Prefer clipboard image → embed; else OS text paste.
+                    if let Some(note) = source_path {
+                        if try_insert_clipboard_image(
+                            vault,
+                            note,
+                            buffer,
+                            menu.line.or(*active_line),
+                            history,
+                            &mut result,
                             &mut folds,
-                            ) {
-                                // Image consumed; skip RequestPaste.
-                            } else {
-                                pending_clipboard = PendingClipboard::Paste;
-                            }
+                        ) {
+                            // Image consumed; skip RequestPaste.
                         } else {
                             pending_clipboard = PendingClipboard::Paste;
                         }
+                    } else {
+                        pending_clipboard = PendingClipboard::Paste;
                     }
-                    EditorAction::Cut | EditorAction::Copy => {
-                        if let Some(i) = menu.line {
-                            request_active = Some(i);
-                            ui.ctx().data_mut(|d| {
-                                d.insert_temp(egui::Id::new(("live_focus", i)), true);
-                            });
-                        }
-                        pending_clipboard = PendingClipboard::from_action(&action);
+                }
+                EditorAction::Cut | EditorAction::Copy => {
+                    if let Some(i) = menu.line {
+                        request_active = Some(i);
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(egui::Id::new(("live_focus", i)), true);
+                        });
                     }
-                    EditorAction::InsertSnippet(snip)
-                        if snip == math_block::SNIPPET || snip == table::SNIPPET =>
-                    {
-                        history.checkpoint(buffer);
-                        let (primary, secondary) = match menu.line {
-                            Some(i) => (
-                                line_char_offset(buffer, &ranges, i, menu.primary),
-                                line_char_offset(buffer, &ranges, i, menu.secondary),
-                            ),
-                            None => (menu.primary, menu.secondary),
-                        };
-                        let caret_in = if snip == math_block::SNIPPET {
-                            "$$\n".chars().count()
-                        } else {
-                            0
-                        };
+                    pending_clipboard = PendingClipboard::from_action(&action);
+                }
+                EditorAction::InsertSnippet(snip)
+                    if snip == math_block::SNIPPET || snip == table::SNIPPET =>
+                {
+                    history.checkpoint(buffer);
+                    let (primary, secondary) = match menu.line {
+                        Some(i) => (
+                            line_char_offset(buffer, &ranges, i, menu.primary),
+                            line_char_offset(buffer, &ranges, i, menu.secondary),
+                        ),
+                        None => (menu.primary, menu.secondary),
+                    };
+                    let caret_in = if snip == math_block::SNIPPET {
+                        "$$\n".chars().count()
+                    } else {
+                        0
+                    };
                     let nl_before = buffer.matches('\n').count() as i32;
                     let insert_line = menu.line.unwrap_or(0);
                     let caret = insert_isolated_block(buffer, primary, secondary, snip, caret_in);
                     let delta = buffer.matches('\n').count() as i32 - nl_before;
                     fold::shift_lines(&mut folds, insert_line + 1, delta);
+                    let (line, col) = caret_line_col(buffer, caret);
+                    request_active = Some(line);
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new(("live_focus", line)), true);
+                        d.insert_temp(egui::Id::new(("live_cursor", line)), col);
+                    });
+                    history.begin_burst(buffer);
+                    result.changed = true;
+                }
+                // Definition belongs at the end of the note, not on this line.
+                EditorAction::Footnote => {
+                    history.checkpoint(buffer);
+                    let (primary, secondary) = match menu.line {
+                        Some(i) => (
+                            line_char_offset(buffer, &ranges, i, menu.primary),
+                            line_char_offset(buffer, &ranges, i, menu.secondary),
+                        ),
+                        None => (menu.primary, menu.secondary),
+                    };
+                    if let Some(caret) = editor_menu::apply_text_action(
+                        buffer,
+                        primary,
+                        secondary,
+                        &EditorAction::Footnote,
+                    ) {
                         let (line, col) = caret_line_col(buffer, caret);
                         request_active = Some(line);
                         ui.ctx().data_mut(|d| {
@@ -1569,32 +1593,7 @@ pub fn show_live(
                         history.begin_burst(buffer);
                         result.changed = true;
                     }
-                    // Definition belongs at the end of the note, not on this line.
-                    EditorAction::Footnote => {
-                        history.checkpoint(buffer);
-                        let (primary, secondary) = match menu.line {
-                            Some(i) => (
-                                line_char_offset(buffer, &ranges, i, menu.primary),
-                                line_char_offset(buffer, &ranges, i, menu.secondary),
-                            ),
-                            None => (menu.primary, menu.secondary),
-                        };
-                        if let Some(caret) = editor_menu::apply_text_action(
-                            buffer,
-                            primary,
-                            secondary,
-                            &EditorAction::Footnote,
-                        ) {
-                            let (line, col) = caret_line_col(buffer, caret);
-                            request_active = Some(line);
-                            ui.ctx().data_mut(|d| {
-                                d.insert_temp(egui::Id::new(("live_focus", line)), true);
-                                d.insert_temp(egui::Id::new(("live_cursor", line)), col);
-                            });
-                            history.begin_burst(buffer);
-                            result.changed = true;
-                        }
-                    }
+                }
                 EditorAction::FoldMore
                 | EditorAction::FoldLess
                 | EditorAction::FoldAll
@@ -1620,50 +1619,46 @@ pub fn show_live(
                     *view_mode = view_mode.toggle_source();
                     *active_line = None;
                 }
-                    ref text_action => {
-                        if let Some(i) = menu.line {
-                            if let Some(&(s, e)) = ranges.get(i) {
-                                let mut draft = buffer.get(s..e).unwrap_or("").to_string();
-                                let n = draft.chars().count();
-                                let primary = menu.primary.min(n);
-                                let secondary = menu.secondary.min(n);
-                                if let Some(caret) = editor_menu::apply_text_action(
-                                    &mut draft,
-                                    primary,
-                                    secondary,
-                                    text_action,
-                                ) {
-                                    structural_checkpoint = true;
-                                    splice = Some((s, e, draft));
-                                    request_active = Some(i);
-                                    ui.ctx().data_mut(|d| {
-                                        d.insert_temp(egui::Id::new(("live_focus", i)), true);
+                ref text_action => {
+                    if let Some(i) = menu.line {
+                        if let Some(&(s, e)) = ranges.get(i) {
+                            let mut draft = buffer.get(s..e).unwrap_or("").to_string();
+                            let n = draft.chars().count();
+                            let primary = menu.primary.min(n);
+                            let secondary = menu.secondary.min(n);
+                            if let Some(caret) = editor_menu::apply_text_action(
+                                &mut draft,
+                                primary,
+                                secondary,
+                                text_action,
+                            ) {
+                                structural_checkpoint = true;
+                                splice = Some((s, e, draft));
+                                request_active = Some(i);
+                                ui.ctx().data_mut(|d| {
+                                    d.insert_temp(egui::Id::new(("live_focus", i)), true);
                                     d.insert_temp(egui::Id::new(("live_cursor", i)), caret);
-                                    });
-                                }
+                                });
                             }
                         }
                     }
                 }
             }
+        }
 
-            if let Some(choice) = table::show_menu(ui.ctx()) {
-                if table_edit.is_none() && !result.changed {
-                    history.checkpoint(buffer);
+        if let Some(choice) = table::show_menu(ui.ctx()) {
+            if table_edit.is_none() && !result.changed {
+                history.checkpoint(buffer);
                 if apply_table_choice(buffer, &ranges, choice, &mut folds) {
-                        result.changed = true;
-                    }
+                    result.changed = true;
                 }
             }
-            let esc = ui.input(|i| i.key_pressed(Key::Escape));
-            if esc
-                && !menu_was_open
-                && !table_was_open
-                && (active_in_math || active_in_mermaid)
-            {
-                *active_line = None;
-            }
         }
+        let esc = ui.input(|i| i.key_pressed(Key::Escape));
+        if esc && !menu_was_open && !table_was_open && (active_in_math || active_in_mermaid) {
+            *active_line = None;
+        }
+    }
 
     // Shift+↑/↓ → full-doc edit with selection extended by one line.
     // A focused table cell owns the arrows.
@@ -1861,9 +1856,8 @@ fn show_doc_edit(
                 let n = buffer.chars().count();
                 (n, n)
             });
-        let wants_tab = ui.input(|inp| {
-            inp.key_pressed(Key::Tab) && !inp.modifiers.command && !inp.modifiers.alt
-        });
+        let wants_tab = ui
+            .input(|inp| inp.key_pressed(Key::Tab) && !inp.modifiers.command && !inp.modifiers.alt);
         if wants_tab {
             let deeper = !ui.input(|inp| inp.modifiers.shift);
             if preview::adjust_list_indent_in_range(buffer, p, s, deeper).is_some() {
@@ -1999,7 +1993,8 @@ fn show_doc_edit(
     }
 
     if let Some((deeper, p, s)) = pending_list_tab {
-        if let Some((next, new_p, new_s)) = preview::adjust_list_indent_in_range(buffer, p, s, deeper)
+        if let Some((next, new_p, new_s)) =
+            preview::adjust_list_indent_in_range(buffer, p, s, deeper)
         {
             history.checkpoint(buffer);
             *buffer = next;

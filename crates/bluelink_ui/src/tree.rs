@@ -190,11 +190,7 @@ fn folder_block(
     let resp = ui.vertical(|ui| {
         if editing {
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(regular::FOLDER)
-                        .size(14.0)
-                        .color(theme::WEAK),
-                );
+                ui.label(RichText::new(regular::FOLDER).size(14.0).color(theme::WEAK));
                 rename_field(ui, renaming, action, true);
             });
             if list.is_empty() {
@@ -242,9 +238,7 @@ fn note_row(
     renaming: &mut Option<InlineRename>,
     action: &mut TreeAction,
 ) {
-    let editing = renaming
-        .as_ref()
-        .is_some_and(|r| r.from == note.rel_path);
+    let editing = renaming.as_ref().is_some_and(|r| r.from == note.rel_path);
 
     if editing {
         ui.horizontal(|ui| {
@@ -275,12 +269,11 @@ fn note_row(
         let fill = if is_sel {
             theme::FAINT
         } else if hovered {
-            Color32::from_rgb(0x1c, 0x1c, 0x1f)
+            theme::BG_ALT
         } else {
             Color32::TRANSPARENT
         };
-        ui.painter()
-            .rect_filled(rect, theme::round_sm(), fill);
+        ui.painter().rect_filled(rect, theme::round_sm(), fill);
         if is_sel {
             let bar = egui::Rect::from_min_max(
                 egui::pos2(rect.left(), rect.top() + 6.0),
@@ -298,9 +291,8 @@ fn note_row(
                 icon_color,
             )
         });
-        let name_galley = ui.fonts(|f| {
-            f.layout_no_wrap(name.to_owned(), FontId::proportional(14.0), theme::TEXT)
-        });
+        let name_galley = ui
+            .fonts(|f| f.layout_no_wrap(name.to_owned(), FontId::proportional(14.0), theme::TEXT));
         let mut x = rect.left() + 8.0;
         ui.painter().galley(
             egui::pos2(x, cy - icon_galley.size().y * 0.5),
@@ -424,19 +416,16 @@ fn open_tree_menu_on_right_click(response: &egui::Response, path: Option<String>
     response.ctx.data_mut(|d| {
         d.insert_temp(
             Id::new(TREE_MENU_KEY),
-            Some(TreeMenu {
-                pos,
-                path,
-                is_note,
-            }),
+            Some(TreeMenu { pos, path, is_note }),
         );
     });
 }
 
 fn show_tree_menu(ctx: &egui::Context, can_undo: bool, action: &mut TreeAction) {
-    let Some(menu) =
-        ctx.data_mut(|d| d.get_temp::<Option<TreeMenu>>(Id::new(TREE_MENU_KEY)).flatten())
-    else {
+    let Some(menu) = ctx.data_mut(|d| {
+        d.get_temp::<Option<TreeMenu>>(Id::new(TREE_MENU_KEY))
+            .flatten()
+    }) else {
         return;
     };
 
@@ -448,7 +437,10 @@ fn show_tree_menu(ctx: &egui::Context, can_undo: bool, action: &mut TreeAction) 
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_min_width(160.0);
-                if can_undo && ui.button(format!("{}  Undo", regular::ARROW_COUNTER_CLOCKWISE)).clicked()
+                if can_undo
+                    && ui
+                        .button(format!("{}  Undo", regular::ARROW_COUNTER_CLOCKWISE))
+                        .clicked()
                 {
                     action.undo = true;
                     chosen = true;
@@ -469,10 +461,7 @@ fn show_tree_menu(ctx: &egui::Context, can_undo: bool, action: &mut TreeAction) 
                         action.start_rename = Some(path.clone());
                         chosen = true;
                     }
-                    if ui
-                        .button(format!("{}  Delete", regular::TRASH))
-                        .clicked()
-                    {
+                    if ui.button(format!("{}  Delete", regular::TRASH)).clicked() {
                         action.delete = Some(path.clone());
                         chosen = true;
                     }

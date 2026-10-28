@@ -20,6 +20,7 @@ mod tabs;
 mod theme;
 mod tree;
 mod vault_registry;
+mod workspace_prefs;
 
 pub mod sync_ui;
 pub use sync_ui::{
@@ -40,17 +41,29 @@ use bluelink_core::{
 use eframe::egui;
 use egui_phosphor::regular;
 use vault_registry::{validate_vault_name, VaultRegistry};
+use workspace_prefs::{RightDockView, WorkspacePrefs};
 
 enum Dialog {
-    NewVault { name: String },
-    CreateLink { rel_path: String, new_tab: bool },
+    NewVault {
+        name: String,
+    },
+    CreateLink {
+        rel_path: String,
+        new_tab: bool,
+    },
     /// Dirty buffer vs newer on-disk content — Reload discards, Keep keeps local.
-    ExternalEdit { path: String, disk_sha: String },
+    ExternalEdit {
+        path: String,
+        disk_sha: String,
+    },
 }
 
 /// One undoable vault change (delete for now).
 enum UndoItem {
-    DeletedNote { path: String, content: String },
+    DeletedNote {
+        path: String,
+        content: String,
+    },
     DeletedFolder {
         path: String,
         /// Notes that lived under the folder, with contents.
@@ -74,6 +87,8 @@ enum OpenTab {
     Graph {
         center_path: String,
     },
+    Devices,
+    Sync,
 }
 
 /// State held only while the quick switcher is visible.
@@ -111,15 +126,31 @@ impl OpenTab {
         }
     }
 
+    fn devices() -> Self {
+        Self::Devices
+    }
+
+    fn sync() -> Self {
+        Self::Sync
+    }
+
     fn note_path(&self) -> Option<&str> {
         match self {
             Self::Note { path, .. } => Some(path.as_str()),
-            Self::Graph { .. } => None,
+            Self::Graph { .. } | Self::Devices | Self::Sync => None,
         }
     }
 
     fn is_graph(&self) -> bool {
         matches!(self, Self::Graph { .. })
+    }
+
+    fn is_note(&self) -> bool {
+        matches!(self, Self::Note { .. })
+    }
+
+    fn is_sync(&self) -> bool {
+        matches!(self, Self::Sync)
     }
 }
 
@@ -162,10 +193,13 @@ pub struct App {
     local_graph: local_graph::LocalGraphUi,
     /// Desktop sync bridge (Devices / Sync panels — Agent D). `None` without BLE runtime.
     sync_ui: Option<SyncUiHandle>,
-    /// Notes / Devices / Sync screen (ТЗ table).
-    screen: sync_panels::Screen,
     /// Mirrored sync runtime state (drained from `sync_ui` each frame).
     sync_panel: sync_panels::SyncPanelState,
+    workspace: WorkspacePrefs,
+    workspace_save_due: Option<Instant>,
+    /// Session-only overrides let users reopen docks hidden by responsive layout.
+    force_left_dock: bool,
+    force_right_dock: bool,
     /// Per-note typing undo/redo (separate from vault delete undo).
     note_history: note_history::NoteHistory,
     /// Line the live editor should scroll to (consumed via `LiveResult`).
@@ -224,8 +258,11 @@ impl App {
             recent: Vec::new(),
             local_graph: local_graph::LocalGraphUi::default(),
             sync_ui,
-            screen: sync_panels::Screen::Notes,
             sync_panel: sync_panels::SyncPanelState::default(),
+            workspace: WorkspacePrefs::load(),
+            workspace_save_due: None,
+            force_left_dock: false,
+            force_right_dock: false,
             note_history: note_history::NoteHistory::new(),
             scroll_to_line: None,
             find_bar: FindBar::default(),
@@ -406,10 +443,9 @@ impl App {
         let active = self.vault_root().map(|r| r.to_path_buf());
         self.registry.forget(path);
         let _ = self.registry.save();
-        let closing = active.as_ref().is_some_and(|a| {
-            a == path
-                || a.canonicalize().ok() == path.canonicalize().ok()
-        });
+        let closing = active
+            .as_ref()
+            .is_some_and(|a| a == path || a.canonicalize().ok() == path.canonicalize().ok());
         if closing {
             self.close_vault();
             self.status = "vault forgotten".into();
@@ -481,8 +517,7 @@ impl App {
                     self.notes.push(meta);
                 }
                 // Notify will fire for our own write — skip the echo reload briefly.
-                self.suppress_reload_until =
-                    Some(Instant::now() + Duration::from_millis(750));
+                self.suppress_reload_until = Some(Instant::now() + Duration::from_millis(750));
             }
             Err(e) => self.status = format!("save failed: {e}"),
         }
@@ -503,6 +538,14 @@ impl App {
                         kind: tabs::TabKind::Graph,
                     }
                 }
+                OpenTab::Devices => tabs::TabView {
+                    title: "Devices".into(),
+                    kind: tabs::TabKind::Devices,
+                },
+                OpenTab::Sync => tabs::TabView {
+                    title: "Sync".into(),
+                    kind: tabs::TabKind::Sync,
+                },
             })
             .collect()
     }
@@ -513,12 +556,30 @@ impl App {
             .is_some_and(|t| t.is_graph())
     }
 
+    fn is_note_active(&self) -> bool {
+        self.active_tab
+            .and_then(|i| self.open_tabs.get(i))
+            .is_some_and(OpenTab::is_note)
+    }
+
+    fn is_sync_active(&self) -> bool {
+        self.active_tab
+            .and_then(|i| self.open_tabs.get(i))
+            .is_some_and(OpenTab::is_sync)
+    }
+
+    fn is_devices_active(&self) -> bool {
+        self.active_tab
+            .and_then(|i| self.open_tabs.get(i))
+            .is_some_and(|tab| matches!(tab, OpenTab::Devices))
+    }
+
     fn graph_center(&self) -> Option<&str> {
         self.active_tab
             .and_then(|i| self.open_tabs.get(i))
             .and_then(|t| match t {
                 OpenTab::Graph { center_path } => Some(center_path.as_str()),
-                OpenTab::Note { .. } => None,
+                OpenTab::Note { .. } | OpenTab::Devices | OpenTab::Sync => None,
             })
     }
 
@@ -534,7 +595,7 @@ impl App {
                     let _ = self.load_note_content(&path);
                 }
             }
-            OpenTab::Graph { .. } => {
+            OpenTab::Graph { .. } | OpenTab::Devices | OpenTab::Sync => {
                 if self.dirty {
                     self.save_current();
                 }
@@ -572,6 +633,23 @@ impl App {
         self.focus_tab(self.open_tabs.len() - 1);
     }
 
+    fn open_devices_tab(&mut self) {
+        self.open_singleton_tab(OpenTab::devices(), |tab| matches!(tab, OpenTab::Devices));
+    }
+
+    fn open_sync_tab(&mut self) {
+        self.open_singleton_tab(OpenTab::sync(), |tab| matches!(tab, OpenTab::Sync));
+    }
+
+    fn open_singleton_tab(&mut self, tab: OpenTab, matches: impl Fn(&OpenTab) -> bool) {
+        if let Some(index) = self.open_tabs.iter().position(matches) {
+            self.focus_tab(index);
+            return;
+        }
+        self.open_tabs.push(tab);
+        self.focus_tab(self.open_tabs.len() - 1);
+    }
+
     /// Open a note in the current tab (replace), or switch to it if already open.
     fn select_note(&mut self, rel_path: &str) {
         self.open_note(rel_path, false, true);
@@ -604,8 +682,8 @@ impl App {
                 Some(OpenTab::Note { path, .. }) => {
                     *path = rel_path.to_string();
                 }
-                Some(OpenTab::Graph { .. }) | None => {
-                    // Don't replace a graph tab — open the note beside it.
+                Some(OpenTab::Graph { .. } | OpenTab::Devices | OpenTab::Sync) | None => {
+                    // Don't replace a tool tab — open the note beside it.
                     self.open_tabs.push(OpenTab::note(rel_path));
                     self.active_tab = Some(self.open_tabs.len() - 1);
                 }
@@ -718,7 +796,7 @@ impl App {
     fn can_go_back(&self) -> bool {
         self.active_tab.is_some_and(|i| match &self.open_tabs[i] {
             OpenTab::Note { history_index, .. } => *history_index > 0,
-            OpenTab::Graph { .. } => false,
+            OpenTab::Graph { .. } | OpenTab::Devices | OpenTab::Sync => false,
         })
     }
 
@@ -729,7 +807,7 @@ impl App {
                 history_index,
                 ..
             } => history_index + 1 < history.len(),
-            OpenTab::Graph { .. } => false,
+            OpenTab::Graph { .. } | OpenTab::Devices | OpenTab::Sync => false,
         })
     }
 
@@ -859,9 +937,7 @@ impl App {
     fn retarget_tab(&mut self, from: &str, to: &str) {
         for tab in &mut self.open_tabs {
             match tab {
-                OpenTab::Note {
-                    path, history, ..
-                } => {
+                OpenTab::Note { path, history, .. } => {
                     if path == from {
                         *path = to.to_string();
                     }
@@ -876,6 +952,7 @@ impl App {
                         *center_path = to.to_string();
                     }
                 }
+                OpenTab::Devices | OpenTab::Sync => {}
             }
         }
     }
@@ -886,9 +963,8 @@ impl App {
         let keep_note = self.selected.clone();
         self.open_tabs.retain(|t| match t {
             OpenTab::Note { path, .. } => path != prefix && !path.starts_with(&p),
-            OpenTab::Graph { center_path } => {
-                center_path != prefix && !center_path.starts_with(&p)
-            }
+            OpenTab::Graph { center_path } => center_path != prefix && !center_path.starts_with(&p),
+            OpenTab::Devices | OpenTab::Sync => true,
         });
         self.active_tab = if keep_graph {
             self.open_tabs.iter().position(|t| t.is_graph())
@@ -1234,177 +1310,172 @@ impl App {
         let mut create_query: Option<String> = None;
         let query_id = egui::Id::new("bluelink_quick_switch_query");
 
-        let modal = egui::Modal::new(egui::Id::new("bluelink_quick_switcher"))
-            .show(ctx, |ui| {
-                ui.set_width(620.0);
-                ui.label(
-                    egui::RichText::new("Find a note")
-                        .size(22.0)
-                        .family(theme::display_family())
-                        .color(theme::TEXT),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("Titles, paths, and note text — all local to this vault")
-                        .size(14.0)
+        let modal = egui::Modal::new(egui::Id::new("bluelink_quick_switcher")).show(ctx, |ui| {
+            ui.set_width(620.0);
+            ui.label(
+                egui::RichText::new("Find a note")
+                    .size(22.0)
+                    .family(theme::display_family())
+                    .color(theme::TEXT),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Titles, paths, and note text — all local to this vault")
+                    .size(14.0)
+                    .color(theme::WEAK),
+            );
+            ui.add_space(12.0);
+
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut switcher.query)
+                    .id(query_id)
+                    .hint_text("Search notes…")
+                    .desired_width(f32::INFINITY),
+            );
+            if switcher.request_focus {
+                response.request_focus();
+                switcher.request_focus = false;
+            }
+            if response.changed() {
+                switcher.selected = 0;
+                switcher.results = self.quick_switch_results(&switcher.query);
+            }
+
+            let results = &switcher.results;
+            switcher.selected = switcher.selected.min(results.len().saturating_sub(1));
+
+            let (up, down, open_new, open_current, create) = ctx.input_mut(|input| {
+                let open_new = input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter);
+                let create = input.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter);
+                (
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                    open_new,
+                    !open_new
+                        && !create
+                        && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                    create,
+                )
+            });
+            if up && !results.is_empty() {
+                switcher.selected = switcher
+                    .selected
+                    .checked_sub(1)
+                    .unwrap_or(results.len() - 1);
+            }
+            if down && !results.is_empty() {
+                switcher.selected = (switcher.selected + 1) % results.len();
+            }
+            if create && !switcher.query.trim().is_empty() {
+                create_query = Some(switcher.query.clone());
+            } else if (open_current || open_new) && !results.is_empty() {
+                open = Some((results[switcher.selected].path.clone(), open_new));
+            }
+
+            ui.add_space(10.0);
+            let empty_query = switcher.query.trim().is_empty();
+            let count = if empty_query && !self.recent.is_empty() && !results.is_empty() {
+                format!("{} recent", results.len())
+            } else if results.len() == 1 {
+                "1 note".into()
+            } else {
+                format!("{} notes", results.len())
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(count).size(13.0).color(theme::WEAK));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Enter open  ·  Ctrl+Enter new tab  ·  Shift+Enter create  ·  Esc",
+                        )
+                        .size(13.0)
                         .color(theme::WEAK),
-                );
-                ui.add_space(12.0);
-
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut switcher.query)
-                        .id(query_id)
-                        .hint_text("Search notes…")
-                        .desired_width(f32::INFINITY),
-                );
-                if switcher.request_focus {
-                    response.request_focus();
-                    switcher.request_focus = false;
-                }
-                if response.changed() {
-                    switcher.selected = 0;
-                    switcher.results = self.quick_switch_results(&switcher.query);
-                }
-
-                let results = &switcher.results;
-                switcher.selected = switcher.selected.min(results.len().saturating_sub(1));
-
-                let (up, down, open_new, open_current, create) = ctx.input_mut(|input| {
-                    let open_new = input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter);
-                    let create = input.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter);
-                    (
-                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
-                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
-                        open_new,
-                        !open_new
-                            && !create
-                            && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
-                        create,
-                    )
+                    );
                 });
-                if up && !results.is_empty() {
-                    switcher.selected = switcher
-                        .selected
-                        .checked_sub(1)
-                        .unwrap_or(results.len() - 1);
-                }
-                if down && !results.is_empty() {
-                    switcher.selected = (switcher.selected + 1) % results.len();
-                }
-                if create && !switcher.query.trim().is_empty() {
-                    create_query = Some(switcher.query.clone());
-                } else if (open_current || open_new) && !results.is_empty() {
-                    open = Some((results[switcher.selected].path.clone(), open_new));
-                }
+            });
+            ui.add_space(6.0);
+            ui.separator();
 
-                ui.add_space(10.0);
-                let empty_query = switcher.query.trim().is_empty();
-                let count = if empty_query && !self.recent.is_empty() && !results.is_empty() {
-                    format!("{} recent", results.len())
-                } else if results.len() == 1 {
-                    "1 note".into()
-                } else {
-                    format!("{} notes", results.len())
-                };
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(count).size(13.0).color(theme::WEAK));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Enter open  ·  Ctrl+Enter new tab  ·  Shift+Enter create  ·  Esc",
-                            )
-                            .size(13.0)
-                            .color(theme::WEAK),
-                        );
-                    });
-                });
-                ui.add_space(6.0);
-                ui.separator();
-
-                egui::ScrollArea::vertical()
-                    .max_height(400.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if results.is_empty() {
-                            let q = switcher.query.trim();
-                            if q.is_empty() {
-                                ui.add_space(18.0);
-                                ui.centered_and_justified(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("No notes yet").color(theme::WEAK),
-                                    );
-                                });
-                                ui.add_space(18.0);
-                            } else {
-                                ui.add_space(8.0);
-                                let label = format!("Create \"{q}\"");
-                                let row = egui::Frame::NONE
-                                    .fill(theme::FAINT)
-                                    .inner_margin(egui::Margin::symmetric(10, 10))
-                                    .show(ui, |ui| {
-                                        ui.set_min_width(ui.available_width());
-                                        ui.label(
-                                            egui::RichText::new(label)
-                                                .size(17.0)
-                                                .color(theme::TEXT),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new("Shift+Enter")
-                                                .size(13.0)
-                                                .color(theme::WEAK),
-                                        );
-                                    })
-                                    .response
-                                    .interact(egui::Sense::click());
-                                if row.clicked() {
-                                    create_query = Some(switcher.query.clone());
-                                }
-                            }
-                        }
-                        for (index, result) in results.iter().enumerate() {
-                            let selected = index == switcher.selected;
-                            let fill = if selected {
-                                theme::FAINT
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            };
+            egui::ScrollArea::vertical()
+                .max_height(400.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if results.is_empty() {
+                        let q = switcher.query.trim();
+                        if q.is_empty() {
+                            ui.add_space(18.0);
+                            ui.centered_and_justified(|ui| {
+                                ui.label(egui::RichText::new("No notes yet").color(theme::WEAK));
+                            });
+                            ui.add_space(18.0);
+                        } else {
+                            ui.add_space(8.0);
+                            let label = format!("Create \"{q}\"");
                             let row = egui::Frame::NONE
-                                .fill(fill)
-                                .inner_margin(egui::Margin::symmetric(10, 8))
+                                .fill(theme::FAINT)
+                                .inner_margin(egui::Margin::symmetric(10, 10))
                                 .show(ui, |ui| {
                                     ui.set_min_width(ui.available_width());
-                                    ui.vertical(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(&result.title)
-                                                .size(17.0)
-                                                .color(theme::TEXT),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(&result.path)
-                                                .size(13.0)
-                                                .color(theme::ACCENT),
-                                        );
-                                        if let Some(snippet) = &result.snippet {
-                                            ui.add_space(2.0);
-                                            ui.label(
-                                                egui::RichText::new(snippet)
-                                                    .size(14.0)
-                                                    .color(theme::WEAK),
-                                            );
-                                        }
-                                    });
+                                    ui.label(
+                                        egui::RichText::new(label).size(17.0).color(theme::TEXT),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("Shift+Enter")
+                                            .size(13.0)
+                                            .color(theme::WEAK),
+                                    );
                                 })
                                 .response
                                 .interact(egui::Sense::click());
-                            if row.hovered() {
-                                switcher.selected = index;
-                            }
                             if row.clicked() {
-                                open = Some((result.path.clone(), false));
+                                create_query = Some(switcher.query.clone());
                             }
                         }
-                    });
-            });
+                    }
+                    for (index, result) in results.iter().enumerate() {
+                        let selected = index == switcher.selected;
+                        let fill = if selected {
+                            theme::FAINT
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        };
+                        let row = egui::Frame::NONE
+                            .fill(fill)
+                            .inner_margin(egui::Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&result.title)
+                                            .size(17.0)
+                                            .color(theme::TEXT),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(&result.path)
+                                            .size(13.0)
+                                            .color(theme::ACCENT),
+                                    );
+                                    if let Some(snippet) = &result.snippet {
+                                        ui.add_space(2.0);
+                                        ui.label(
+                                            egui::RichText::new(snippet)
+                                                .size(14.0)
+                                                .color(theme::WEAK),
+                                        );
+                                    }
+                                });
+                            })
+                            .response
+                            .interact(egui::Sense::click());
+                        if row.hovered() {
+                            switcher.selected = index;
+                        }
+                        if row.clicked() {
+                            open = Some((result.path.clone(), false));
+                        }
+                    }
+                });
+        });
 
         if let Some(query) = create_query {
             self.quick_switch_create_from_query(&query);
@@ -1438,9 +1509,7 @@ impl App {
                     let new_prefix = format!("{to}/");
                     for tab in &mut self.open_tabs {
                         match tab {
-                            OpenTab::Note {
-                                path, history, ..
-                            } => {
+                            OpenTab::Note { path, history, .. } => {
                                 if let Some(rest) = path.strip_prefix(&prefix) {
                                     *path = format!("{new_prefix}{rest}");
                                 }
@@ -1455,16 +1524,17 @@ impl App {
                                     *center_path = format!("{new_prefix}{rest}");
                                 }
                             }
+                            OpenTab::Devices | OpenTab::Sync => {}
                         }
                     }
                     let selected_was_inside = self
                         .selected
                         .as_ref()
                         .is_some_and(|s| s.starts_with(&prefix));
-                    let new_selected = self.selected.as_ref().and_then(|s| {
-                        s.strip_prefix(&prefix)
-                            .map(|rest| format!("{to}/{rest}"))
-                    });
+                    let new_selected = self
+                        .selected
+                        .as_ref()
+                        .and_then(|s| s.strip_prefix(&prefix).map(|rest| format!("{to}/{rest}")));
                     self.refresh_notes();
                     if selected_was_inside {
                         if let Some(path) = new_selected {
@@ -1530,10 +1600,7 @@ impl App {
                 .selected
                 .as_ref()
                 .is_some_and(|s| s.starts_with(&prefix));
-            let result = self
-                .vault
-                .as_mut()
-                .map(|v| v.delete_folder(rel));
+            let result = self.vault.as_mut().map(|v| v.delete_folder(rel));
             match result {
                 Some(Ok(())) => {
                     self.push_undo(UndoItem::DeletedFolder {
@@ -1594,11 +1661,14 @@ impl App {
                     || self
                         .active_tab
                         .and_then(|i| self.open_tabs.get(i))
-                        .is_some_and(|t| matches!(t, OpenTab::Graph { center_path } if center_path == rel));
+                        .is_some_and(
+                            |t| matches!(t, OpenTab::Graph { center_path } if center_path == rel),
+                        );
                 // Drop the note tab; drop graph tab if it was centered on this note.
                 self.open_tabs.retain(|t| match t {
                     OpenTab::Note { path, .. } => path != rel,
                     OpenTab::Graph { center_path } => center_path != rel,
+                    OpenTab::Devices | OpenTab::Sync => true,
                 });
                 if was_active || self.selected.as_deref() == Some(rel) {
                     self.selected = None;
@@ -1665,9 +1735,9 @@ impl App {
                     if let Err(e) = vault.create_folder(&path) {
                         Some(e)
                     } else {
-                        notes.iter().find_map(|(note_path, content)| {
-                            vault.write(note_path, content).err()
-                        })
+                        notes
+                            .iter()
+                            .find_map(|(note_path, content)| vault.write(note_path, content).err())
                     }
                 };
                 if let Some(e) = restore_err {
@@ -1718,10 +1788,8 @@ impl App {
                     ) =>
                 {
                     // Don't clobber an unrelated dialog; surface a status hint instead.
-                    let can_prompt = matches!(
-                        &self.dialog,
-                        None | Some(Dialog::ExternalEdit { .. })
-                    );
+                    let can_prompt =
+                        matches!(&self.dialog, None | Some(Dialog::ExternalEdit { .. }));
                     if can_prompt {
                         self.dialog = Some(Dialog::ExternalEdit {
                             path: rel,
@@ -1803,11 +1871,7 @@ impl App {
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Find")
-                            .size(13.0)
-                            .color(theme::WEAK),
-                    );
+                    ui.label(egui::RichText::new("Find").size(13.0).color(theme::WEAK));
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.find_bar.query)
                             .desired_width(160.0)
@@ -1820,25 +1884,23 @@ impl App {
                     if resp.changed() {
                         query_changed = true;
                     }
-                    if ui
-                        .small_button(regular::ARROW_DOWN.to_string())
-                        .on_hover_text("Next")
-                        .clicked()
+                    if theme::accessible_icon(
+                        ui.small_button(regular::ARROW_DOWN.to_string()),
+                        "Next",
+                    )
+                    .clicked()
                     {
                         go_next = true;
                     }
-                    if ui
-                        .small_button(regular::ARROW_UP.to_string())
-                        .on_hover_text("Previous")
-                        .clicked()
+                    if theme::accessible_icon(
+                        ui.small_button(regular::ARROW_UP.to_string()),
+                        "Previous",
+                    )
+                    .clicked()
                     {
                         go_prev = true;
                     }
-                    ui.label(
-                        egui::RichText::new("Replace")
-                            .size(13.0)
-                            .color(theme::WEAK),
-                    );
+                    ui.label(egui::RichText::new("Replace").size(13.0).color(theme::WEAK));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.find_bar.replace)
                             .desired_width(120.0)
@@ -1847,10 +1909,15 @@ impl App {
                     if ui.small_button("Replace").clicked() {
                         do_replace = true;
                     }
-                    if ui.small_button("All").on_hover_text("Replace all").clicked() {
+                    if ui
+                        .small_button("All")
+                        .on_hover_text("Replace all")
+                        .clicked()
+                    {
                         do_replace_all = true;
                     }
-                    if ui.small_button(regular::X.to_string()).on_hover_text("Close").clicked()
+                    if theme::accessible_icon(ui.small_button(regular::X.to_string()), "Close")
+                        .clicked()
                         || ui.input(|i| i.key_pressed(egui::Key::Escape))
                     {
                         close = true;
@@ -1947,10 +2014,11 @@ impl App {
                                     {
                                         open_path = Some(entry.path.clone());
                                     }
-                                    if ui
-                                        .small_button(regular::X.to_string())
-                                        .on_hover_text("Forget (keeps files on disk)")
-                                        .clicked()
+                                    if theme::accessible_icon(
+                                        ui.small_button(regular::X.to_string()),
+                                        "Forget (keeps files on disk)",
+                                    )
+                                    .clicked()
                                     {
                                         forget_path = Some(entry.path.clone());
                                     }
@@ -2088,6 +2156,17 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_sync_events();
         self.apply_external_reload();
+        self.show_titlebar(ctx);
+
+        if self
+            .workspace_save_due
+            .is_some_and(|due| Instant::now() >= due)
+        {
+            if let Err(error) = self.workspace.save() {
+                self.status = format!("workspace settings: {error}");
+            }
+            self.workspace_save_due = None;
+        }
 
         if self.vault.is_none() {
             self.show_no_vault(ctx);
@@ -2107,9 +2186,8 @@ impl eframe::App for App {
 
         // Ctrl+P is intentionally available from the editor. Other bindings must not
         // steal Delete/Z from TextEdit / rename fields or from the quick switcher.
-        let can_bind = !ctx.wants_keyboard_input()
-            && self.dialog.is_none()
-            && self.quick_switcher.is_none();
+        let can_bind =
+            !ctx.wants_keyboard_input() && self.dialog.is_none() && self.quick_switcher.is_none();
         let can_open_switcher = self.dialog.is_none() && self.quick_switcher.is_none();
         let has_graph_tab = self.open_tabs.iter().any(|t| t.is_graph());
         let can_toggle_graph = self.vault.is_some()
@@ -2135,9 +2213,7 @@ impl eframe::App for App {
                     egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
                     egui::Key::Z,
                 );
-            let undo = can_bind
-                && !redo
-                && i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z);
+            let undo = can_bind && !redo && i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z);
             (
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::T),
@@ -2149,12 +2225,8 @@ impl eframe::App for App {
                 undo,
                 redo,
                 can_open_switcher && i.consume_key(egui::Modifiers::COMMAND, egui::Key::F),
-                i.modifiers.alt
-                    && !i.modifiers.command
-                    && i.key_pressed(egui::Key::ArrowLeft),
-                i.modifiers.alt
-                    && !i.modifiers.command
-                    && i.key_pressed(egui::Key::ArrowRight),
+                i.modifiers.alt && !i.modifiers.command && i.key_pressed(egui::Key::ArrowLeft),
+                i.modifiers.alt && !i.modifiers.command && i.key_pressed(egui::Key::ArrowRight),
             )
         });
         if save {
@@ -2171,62 +2243,39 @@ impl eframe::App for App {
         if next_tab {
             self.cycle_next_tab();
         }
-        let on_notes = self.screen == sync_panels::Screen::Notes;
-        if quick_switch && on_notes {
+        let on_note = self.is_note_active();
+        if quick_switch {
             self.open_quick_switcher();
         }
-        if toggle_graph && on_notes {
+        if toggle_graph {
             self.toggle_local_graph();
         }
-        if delete_note && on_notes && !self.is_graph_active() {
+        if delete_note && on_note {
             if let Some(path) = self.selected.clone() {
                 self.delete_path(&path);
             }
         }
-        if undo && on_notes {
+        if undo && on_note {
             self.undo_note_or_file(ctx);
         }
-        if redo && on_notes {
+        if redo && on_note {
             self.redo_note(ctx);
         }
-        if find && on_notes && !self.is_graph_active() && self.selected.is_some() {
+        if find && on_note && self.selected.is_some() {
             self.find_bar.open = true;
             self.find_bar.request_focus = true;
         }
-        if nav_back && on_notes {
+        if nav_back && on_note {
             self.go_back();
         }
-        if nav_fwd && on_notes {
+        if nav_fwd && on_note {
             self.go_forward();
         }
 
         self.show_dialogs(ctx);
 
-        egui::TopBottomPanel::bottom("status")
-            .exact_height(36.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL)
-                    .inner_margin(egui::Margin::symmetric(12, 0)),
-            )
-            .show_separator_line(true)
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.label(egui::RichText::new(&self.status).color(theme::WEAK));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // right-to-left: time first → rightmost; then saved/unsaved to its left
-                        if let Some(t) = self.selected_mtime_hhmm() {
-                            ui.label(egui::RichText::new(t).color(theme::WEAK));
-                            ui.add_space(10.0);
-                        }
-                        if self.dirty {
-                            ui.colored_label(theme::WARN, format!("{} unsaved", regular::CIRCLE));
-                        } else {
-                            ui.colored_label(theme::WEAK, format!("{} saved", regular::CHECK));
-                        }
-                    });
-                });
-            });
+        self.show_status_bar(ctx);
+        self.show_ribbon(ctx);
 
         let mut switch_to: Option<PathBuf> = None;
         let mut forget_active = false;
@@ -2234,101 +2283,124 @@ impl eframe::App for App {
         let mut create_vault = false;
 
         // Id "tree_sidebar" keeps PanelState clear of the old width-grow "tree" id.
-        egui::SidePanel::left("tree_sidebar")
-            .default_width(theme::SIDEBAR_WIDTH)
-            .min_width(240.0)
-            .max_width(380.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL)
-                    .inner_margin(egui::Margin {
-                        left: 12,
-                        right: 0,
-                        top: 12,
-                        bottom: 12,
-                    }),
-            )
-            .show_separator_line(true)
-            .show(ctx, |ui| {
-                // Sidebar-local spacing — global item_spacing is too airy for a nav rail.
-                ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
-                ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
+        let window_width = ctx.screen_rect().width();
+        if window_width > workspace_prefs::RIGHT_DOCK_BREAKPOINT {
+            self.force_right_dock = false;
+        }
+        if window_width > workspace_prefs::LEFT_DOCK_BREAKPOINT {
+            self.force_left_dock = false;
+        }
+        let left_open = self.workspace.left_open
+            && (window_width > workspace_prefs::LEFT_DOCK_BREAKPOINT || self.force_left_dock);
+        if left_open {
+            let left_response = egui::SidePanel::left("tree_sidebar")
+                .default_width(self.workspace.left_width)
+                .min_width(workspace_prefs::DOCK_WIDTH_MIN)
+                .max_width(workspace_prefs::DOCK_WIDTH_MAX)
+                .resizable(true)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::PANEL)
+                        .inner_margin(egui::Margin {
+                            left: 12,
+                            right: 0,
+                            top: 12,
+                            bottom: 12,
+                        }),
+                )
+                .show_separator_line(true)
+                .show(ctx, |ui| {
+                    // Sidebar-local spacing — global item_spacing is too airy for a nav rail.
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                    ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
 
-                // Header keeps a right pad; tree scroll sits flush against the scrollbar.
-                egui::Frame::NONE
-                    .inner_margin(egui::Margin {
-                        left: 0,
-                        right: 12,
-                        top: 0,
-                        bottom: 0,
-                    })
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let mark = egui::vec2(10.0, 10.0);
-                            let (rect, _) = ui.allocate_exact_size(mark, egui::Sense::hover());
-                            ui.painter()
-                                .rect_filled(rect, theme::round_sm(), theme::ACCENT);
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("BlueLink")
-                                    .size(18.0)
-                                    .family(theme::display_family())
-                                    .strong()
-                                    .color(theme::TEXT),
-                            );
-                        });
-                        ui.add_space(10.0);
-
-                        let vault_name = self
-                            .vault_root()
-                            .map(VaultRegistry::display_name)
-                            .unwrap_or_else(|| "Vault".into());
-                        let vault_w = ui.available_width();
-                        egui::ComboBox::from_id_salt("vault_switcher")
-                            .width(vault_w)
-                            .selected_text(format!("{}  {vault_name}", regular::FOLDER))
-                            .show_ui(ui, |ui| {
-                                for entry in &self.registry.entries {
-                                    let name = VaultRegistry::display_name(&entry.path);
-                                    let selected = self.vault_root().is_some_and(|r| {
-                                        r == entry.path.as_path()
-                                            || r.canonicalize().ok()
-                                                == entry.path.canonicalize().ok()
-                                    });
+                    egui::TopBottomPanel::bottom("vault_profile")
+                        .exact_height(42.0)
+                        .frame(
+                            egui::Frame::new()
+                                .fill(theme::PANEL)
+                                .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                                .inner_margin(egui::Margin::symmetric(0, 5)),
+                        )
+                        .show_inside(ui, |ui| {
+                            let vault_name = self
+                                .vault_root()
+                                .map(VaultRegistry::display_name)
+                                .unwrap_or_else(|| "Vault".into());
+                            egui::ComboBox::from_id_salt("vault_switcher")
+                                .width((ui.available_width() - 12.0).max(120.0))
+                                .selected_text(format!("{}  {vault_name}", regular::FOLDER))
+                                .show_ui(ui, |ui| {
+                                    for entry in &self.registry.entries {
+                                        let name = VaultRegistry::display_name(&entry.path);
+                                        let selected = self.vault_root().is_some_and(|root| {
+                                            root == entry.path.as_path()
+                                                || root.canonicalize().ok()
+                                                    == entry.path.canonicalize().ok()
+                                        });
+                                        if ui
+                                            .selectable_label(selected, &name)
+                                            .on_hover_text(entry.path.display().to_string())
+                                            .clicked()
+                                        {
+                                            switch_to = Some(entry.path.clone());
+                                        }
+                                    }
+                                    ui.separator();
                                     if ui
-                                        .selectable_label(selected, &name)
-                                        .on_hover_text(entry.path.display().to_string())
+                                        .button(format!("{}  Open…", regular::FOLDER_OPEN))
                                         .clicked()
                                     {
-                                        switch_to = Some(entry.path.clone());
+                                        pick_vault = true;
                                     }
-                                }
-                                ui.separator();
-                                if ui
-                                    .button(format!("{}  Open…", regular::FOLDER_OPEN))
-                                    .clicked()
-                                {
-                                    pick_vault = true;
-                                }
-                                if ui.button(format!("{}  Create…", regular::PLUS)).clicked()
-                                {
-                                    create_vault = true;
-                                }
-                                if ui
-                                    .button(format!("{}  Forget current", regular::X))
-                                    .clicked()
-                                {
-                                    forget_active = true;
-                                }
+                                    if ui.button(format!("{}  Create…", regular::PLUS)).clicked()
+                                    {
+                                        create_vault = true;
+                                    }
+                                    if ui
+                                        .button(format!("{}  Forget current", regular::X))
+                                        .clicked()
+                                    {
+                                        forget_active = true;
+                                    }
+                                });
+                        });
+
+                    // Header keeps a right pad; tree scroll sits flush against the scrollbar.
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin {
+                            left: 0,
+                            right: 12,
+                            top: 0,
+                            bottom: 0,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_min_height(theme::HEADER_HEIGHT);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Files")
+                                        .size(13.0)
+                                        .family(theme::display_family())
+                                        .strong()
+                                        .color(theme::TEXT),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if toolbar_icon(ui, regular::X, true, "Close Files sidebar")
+                                            .clicked()
+                                        {
+                                            self.workspace.left_open = false;
+                                            self.force_left_dock = false;
+                                            self.mark_workspace_dirty();
+                                        }
+                                    },
+                                );
                             });
+                        });
 
-                        ui.add_space(10.0);
-                        sync_panels::show_screen_nav(ui, &mut self.screen);
-                    });
+                    ui.add_space(12.0);
 
-                ui.add_space(12.0);
-
-                if self.screen == sync_panels::Screen::Notes {
                     egui::Frame::NONE
                         .inner_margin(egui::Margin {
                             left: 0,
@@ -2338,7 +2410,7 @@ impl eframe::App for App {
                         })
                         .show(ui, |ui| {
                             ui.label(
-                                egui::RichText::new("NOTES")
+                                egui::RichText::new("FILES")
                                     .size(11.0)
                                     .family(theme::display_family())
                                     .color(theme::WEAK),
@@ -2397,26 +2469,9 @@ impl eframe::App for App {
                     if let Some((from, to)) = action.move_note {
                         self.move_note(&from, &to);
                     }
-                } else {
-                    egui::Frame::NONE
-                        .inner_margin(egui::Margin {
-                            left: 0,
-                            right: 12,
-                            top: 0,
-                            bottom: 0,
-                        })
-                        .show(ui, |ui| {
-                            let hint = match self.screen {
-                                sync_panels::Screen::Devices => "Trusted devices and pairing",
-                                sync_panels::Screen::Sync => "Status and sync log",
-                                sync_panels::Screen::Notes => "",
-                            };
-                            ui.label(
-                                egui::RichText::new(hint).size(13.0).color(theme::WEAK),
-                            );
-                        });
-                }
-            });
+                });
+            self.remember_left_width(left_response.response.rect.width());
+        }
 
         if let Some(path) = switch_to {
             self.open_vault_path(&path);
@@ -2435,11 +2490,11 @@ impl eframe::App for App {
             }
         }
 
-        let notes_screen = self.screen == sync_panels::Screen::Notes;
+        let note_context = self.is_note_active() || self.is_graph_active();
         let mut open_backlink: Option<String> = None;
         let mut outline_jump: Option<usize> = None;
         let mut outline_rename: Option<(usize, String, String)> = None;
-        let backlink_target = if notes_screen {
+        let backlink_target = if note_context {
             if self.is_graph_active() {
                 self.graph_center().map(str::to_string)
             } else {
@@ -2448,8 +2503,7 @@ impl eframe::App for App {
         } else {
             None
         };
-        let outline_entries = if notes_screen && !self.is_graph_active() && self.selected.is_some()
-        {
+        let outline_entries = if self.is_note_active() && self.selected.is_some() {
             outline::headings(&self.buffer)
         } else {
             Vec::new()
@@ -2461,95 +2515,118 @@ impl eframe::App for App {
                     paths
                         .into_iter()
                         .map(|path| {
-                            let snippet = vault
-                                .read(&path)
-                                .ok()
-                                .and_then(|text| backlink_snippet(&text, &path, sel, vault.index()));
+                            let snippet = vault.read(&path).ok().and_then(|text| {
+                                backlink_snippet(&text, &path, sel, vault.index())
+                            });
                             (path, snippet)
                         })
                         .collect()
                 }
                 _ => Vec::new(),
             };
-        let show_right_rail =
-            notes_screen && (!outline_entries.is_empty() || !backlinks.is_empty());
-        // show_animated: hide when empty without remounting the panel every note switch
-        // (abrupt SidePanel mount/unmount has frozen the Wayland event loop before).
-        egui::SidePanel::right("backlinks")
-            .default_width(240.0)
-            .min_width(180.0)
-            .show_animated(ctx, show_right_rail, |ui| {
-                ui.add_space(6.0);
-
-                let outline_action =
-                    outline::show(ui, &outline_entries, &mut self.outline_renaming);
-                if let Some(line) = outline_action.jump {
-                    outline_jump = Some(line);
-                }
-                if let Some((line, title)) = outline_action.start_rename {
-                    self.outline_renaming = Some(outline::OutlineRename {
-                        line,
-                        old: title.clone(),
-                        draft: title,
-                        request_focus: true,
-                    });
-                }
-                if outline_action.cancel_rename {
-                    self.outline_renaming = None;
-                }
-                if let Some(commit) = outline_action.commit_rename {
-                    self.outline_renaming = None;
-                    outline_rename = Some(commit);
-                }
-
-                if !backlinks.is_empty() {
-                    ui.label(
-                        egui::RichText::new("Backlinks")
-                            .size(16.0)
-                            .family(theme::display_family())
-                            .color(theme::TEXT),
-                    );
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-                }
-
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for (path, snippet) in &backlinks {
-                            let name = self.note_display_title(path);
-                            let row = egui::Frame::NONE
-                                .inner_margin(egui::Margin::symmetric(4, 6))
-                                .show(ui, |ui| {
-                                    ui.set_min_width(ui.available_width());
-                                    ui.vertical(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{}  {name}",
-                                                regular::LINK
-                                            ))
-                                            .size(14.0)
-                                            .color(theme::TEXT),
-                                        );
-                                        if let Some(snippet) = snippet {
-                                            ui.label(
-                                                egui::RichText::new(snippet)
-                                                    .size(12.0)
-                                                    .color(theme::WEAK),
-                                            );
-                                        }
-                                    });
-                                })
-                                .response
-                                .interact(egui::Sense::click())
-                                .on_hover_text(path);
-                            if row.clicked() {
-                                open_backlink = Some(path.clone());
-                            }
+        let right_open = self.workspace.right_open
+            && (window_width > workspace_prefs::RIGHT_DOCK_BREAKPOINT || self.force_right_dock);
+        if right_open {
+            let right_response = egui::SidePanel::right("secondary_dock")
+                .default_width(self.workspace.right_width)
+                .min_width(workspace_prefs::DOCK_WIDTH_MIN)
+                .max_width(workspace_prefs::DOCK_WIDTH_MAX)
+                .resizable(true)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::PANEL)
+                        .inner_margin(egui::Margin::symmetric(12, 8)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        let outline_selected = self.workspace.right_view == RightDockView::Outline;
+                        if dock_tab(ui, regular::LIST_BULLETS, outline_selected, "Outline")
+                            .clicked()
+                        {
+                            self.workspace.right_view = RightDockView::Outline;
+                            self.mark_workspace_dirty();
+                        }
+                        if dock_tab(ui, regular::LINK, !outline_selected, "Backlinks").clicked() {
+                            self.workspace.right_view = RightDockView::Backlinks;
+                            self.mark_workspace_dirty();
                         }
                     });
-            });
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    match self.workspace.right_view {
+                        RightDockView::Outline => {
+                            if outline_entries.is_empty() {
+                                dock_empty_state(ui, "No headings in this note");
+                            } else {
+                                let outline_action =
+                                    outline::show(ui, &outline_entries, &mut self.outline_renaming);
+                                if let Some(line) = outline_action.jump {
+                                    outline_jump = Some(line);
+                                }
+                                if let Some((line, title)) = outline_action.start_rename {
+                                    self.outline_renaming = Some(outline::OutlineRename {
+                                        line,
+                                        old: title.clone(),
+                                        draft: title,
+                                        request_focus: true,
+                                    });
+                                }
+                                if outline_action.cancel_rename {
+                                    self.outline_renaming = None;
+                                }
+                                if let Some(commit) = outline_action.commit_rename {
+                                    self.outline_renaming = None;
+                                    outline_rename = Some(commit);
+                                }
+                            }
+                        }
+                        RightDockView::Backlinks => {
+                            if backlinks.is_empty() {
+                                dock_empty_state(ui, "No backlinks found");
+                            } else {
+                                egui::ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        for (path, snippet) in &backlinks {
+                                            let name = self.note_display_title(path);
+                                            let row = egui::Frame::NONE
+                                                .inner_margin(egui::Margin::symmetric(4, 6))
+                                                .show(ui, |ui| {
+                                                    ui.set_min_width(ui.available_width());
+                                                    ui.vertical(|ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "{}  {name}",
+                                                                regular::LINK
+                                                            ))
+                                                            .size(13.0)
+                                                            .color(theme::TEXT),
+                                                        );
+                                                        if let Some(snippet) = snippet {
+                                                            ui.label(
+                                                                egui::RichText::new(snippet)
+                                                                    .size(12.0)
+                                                                    .color(theme::WEAK),
+                                                            );
+                                                        }
+                                                    });
+                                                })
+                                                .response
+                                                .interact(egui::Sense::click())
+                                                .on_hover_text(path);
+                                            if row.clicked() {
+                                                open_backlink = Some(path.clone());
+                                            }
+                                        }
+                                    });
+                            }
+                        }
+                    }
+                });
+            self.remember_right_width(right_response.response.rect.width());
+        }
         if let Some(path) = open_backlink {
             self.select_note(&path);
         }
@@ -2569,71 +2646,23 @@ impl eframe::App for App {
                     .inner_margin(egui::Margin::symmetric(12, 8)),
             )
             .show(ctx, |ui| {
-            if self.screen != sync_panels::Screen::Sync {
-                self.sync_panel.reset_ensure_ble();
-            }
-            match self.screen {
-                sync_panels::Screen::Devices => {
-                    ui.add_space(8.0);
-                    let handle = self.sync_ui.as_ref();
-                    sync_panels::show_devices(
-                        ui,
-                        ctx,
-                        &mut self.sync_panel,
-                        handle,
-                        hhmm_from_unix_ms,
-                    );
-                    return;
+                if !self.is_sync_active() {
+                    self.sync_panel.reset_ensure_ble();
                 }
-                sync_panels::Screen::Sync => {
-                    ui.add_space(8.0);
-                    let handle = self.sync_ui.as_ref();
-                    sync_panels::show_sync(ui, &mut self.sync_panel, handle, hhmm_from_unix_ms);
-                    return;
-                }
-                sync_panels::Screen::Notes => {}
-            }
 
-            let mut tab_select: Option<usize> = None;
-            let mut tab_close: Option<usize> = None;
+                let mut tab_select: Option<usize> = None;
+                let mut tab_close: Option<usize> = None;
 
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                ui.set_min_height(tabs::BAR_HEIGHT);
-                ui.with_layout(
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        self.show_nav_buttons(ui);
-                        if toolbar_icon(
-                            ui,
-                            regular::MAGNIFYING_GLASS,
-                            true,
-                            "Find a note (Ctrl+P)",
-                        )
-                        .clicked()
-                        {
-                            self.open_quick_switcher();
-                        }
-                        {
-                            let has_graph = self.open_tabs.iter().any(|t| t.is_graph());
-                            let graph_enabled =
-                                self.vault.is_some() && (self.selected.is_some() || has_graph);
-                            let tip = if graph_enabled {
-                                "Local graph (Ctrl+G)"
-                            } else {
-                                "Open a note to show its local graph"
-                            };
-                            if toolbar_icon(ui, regular::SHARE_NETWORK, graph_enabled, tip)
-                                .clicked()
-                            {
-                                self.toggle_local_graph();
-                            }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.set_min_height(tabs::BAR_HEIGHT);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        if self.is_note_active() {
+                            self.show_nav_buttons(ui);
                         }
                         ui.add_space(6.0);
                         if self.open_tabs.is_empty() {
-                            ui.label(
-                                egui::RichText::new("Note").size(15.0).color(theme::WEAK),
-                            );
+                            ui.label(egui::RichText::new("Note").size(15.0).color(theme::WEAK));
                         } else {
                             let views = self.tab_views();
                             let tab_action = tabs::show(
@@ -2645,7 +2674,7 @@ impl eframe::App for App {
                             tab_select = tab_action.select;
                             tab_close = tab_action.close;
                         }
-                        if !self.is_graph_active() && self.selected.is_some() {
+                        if self.is_note_active() && self.selected.is_some() {
                             ui.add_space(8.0);
                             ui.label(
                                 egui::RichText::new(self.view_mode.label())
@@ -2653,128 +2682,354 @@ impl eframe::App for App {
                                     .color(theme::WEAK),
                             );
                         }
-                        if self.readonly && !self.is_graph_active() {
+                        if self.readonly && self.is_note_active() {
                             ui.add_space(8.0);
                             ui.colored_label(theme::WARN, "read-only");
                         }
-                    },
-                );
-            });
-            ui.add_space(4.0);
-            if self.open_tabs.is_empty() {
-                ui.separator();
-            }
-            ui.add_space(8.0);
-
-            if let Some(i) = tab_select {
-                self.focus_tab(i);
-            }
-            if let Some(i) = tab_close {
-                self.close_tab_at(i);
-            }
-
-            if self.is_graph_active() {
-                self.show_local_graph_panel(ui);
-                return;
-            }
-
-            if self.selected.is_none() {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        egui::RichText::new("Select or create a note")
-                            .size(20.0)
-                            .color(theme::WEAK),
-                    );
+                    });
                 });
-                return;
-            }
-
-            if self.find_bar.open {
-                self.show_find_bar(ui);
-                ui.add_space(6.0);
-            }
-
-            // Source edits YAML in the full buffer — hide the strip to avoid dual edit.
-            if self.view_mode != editor::ViewMode::Source {
-                let props_locked =
-                    self.readonly || self.view_mode == editor::ViewMode::Reading;
-                let props = properties_panel::show(
-                    ui,
-                    &self.buffer,
-                    props_locked,
-                    &mut self.props_folded,
-                    &mut self.props_view,
-                );
-                if let Some(next) = props.rewritten {
-                    if next != self.buffer {
-                        if !self.props_burst {
-                            self.note_history.checkpoint(&self.buffer);
-                            self.props_burst = true;
-                        }
-                        self.buffer = next;
-                        self.dirty = true;
-                        self.last_edit = Some(Instant::now());
-                    }
-                }
-                if !props.focused {
-                    self.props_burst = false;
+                ui.add_space(4.0);
+                if self.open_tabs.is_empty() {
+                    ui.separator();
                 }
                 ui.add_space(8.0);
-            }
 
-            // Take vault temporarily so we can mutate buffer alongside an immutable vault borrow.
-            let vault = self.vault.take();
-            let mut wiki_click = None;
-            let mut want_attach = false;
-            let mut tag_query = None;
-            let scroll_to = self.scroll_to_line;
-            if let Some(ref v) = vault {
-                let live = editor::show_live(
-                    ui,
-                    v,
-                    self.selected.as_deref(),
-                    &mut self.buffer,
-                    &mut self.active_line,
-                    &mut self.view_mode,
-                    self.readonly,
-                    scroll_to,
-                    &mut self.note_history,
-                    &mut self.props_folded,
-                );
-                if live.changed {
-                    self.dirty = true;
-                    self.last_edit = Some(Instant::now());
-                    ctx.request_repaint_after(Duration::from_secs(1));
+                if let Some(i) = tab_select {
+                    self.focus_tab(i);
                 }
-                if live.scroll_consumed {
-                    self.scroll_to_line = None;
+                if let Some(i) = tab_close {
+                    self.close_tab_at(i);
                 }
-                if let Some(msg) = live.status {
-                    self.status = msg;
-                }
-                want_attach = live.attach_file;
-                wiki_click = live.wikilink;
-                tag_query = live.tag_query;
-            }
-            self.vault = vault;
-            if want_attach {
-                self.pick_attach_file();
-            }
-            if let Some(click) = wiki_click {
-                self.handle_wikilink(&click.raw, click.new_tab, click.fragment);
-            }
-            if let Some(query) = tag_query {
-                self.open_quick_switcher_with(&query);
-            }
-        });
 
-        if notes_screen {
-            self.show_quick_switcher(ctx);
+                if self.is_devices_active() {
+                    let handle = self.sync_ui.as_ref();
+                    sync_panels::show_devices(
+                        ui,
+                        ctx,
+                        &mut self.sync_panel,
+                        handle,
+                        hhmm_from_unix_ms,
+                    );
+                    return;
+                }
+
+                if self.is_sync_active() {
+                    let handle = self.sync_ui.as_ref();
+                    sync_panels::show_sync(ui, &mut self.sync_panel, handle, hhmm_from_unix_ms);
+                    return;
+                }
+
+                if self.is_graph_active() {
+                    self.show_local_graph_panel(ui);
+                    return;
+                }
+
+                if self.selected.is_none() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new("Select or create a note")
+                                .size(20.0)
+                                .color(theme::WEAK),
+                        );
+                    });
+                    return;
+                }
+
+                if self.find_bar.open {
+                    self.show_find_bar(ui);
+                    ui.add_space(6.0);
+                }
+
+                // Source edits YAML in the full buffer — hide the strip to avoid dual edit.
+                if self.view_mode != editor::ViewMode::Source {
+                    let props_locked = self.readonly || self.view_mode == editor::ViewMode::Reading;
+                    let props = properties_panel::show(
+                        ui,
+                        &self.buffer,
+                        props_locked,
+                        &mut self.props_folded,
+                        &mut self.props_view,
+                    );
+                    if let Some(next) = props.rewritten {
+                        if next != self.buffer {
+                            if !self.props_burst {
+                                self.note_history.checkpoint(&self.buffer);
+                                self.props_burst = true;
+                            }
+                            self.buffer = next;
+                            self.dirty = true;
+                            self.last_edit = Some(Instant::now());
+                        }
+                    }
+                    if !props.focused {
+                        self.props_burst = false;
+                    }
+                    ui.add_space(8.0);
+                }
+
+                // Take vault temporarily so we can mutate buffer alongside an immutable vault borrow.
+                let vault = self.vault.take();
+                let mut wiki_click = None;
+                let mut want_attach = false;
+                let mut tag_query = None;
+                let scroll_to = self.scroll_to_line;
+                if let Some(ref v) = vault {
+                    let live = editor::show_live(
+                        ui,
+                        v,
+                        self.selected.as_deref(),
+                        &mut self.buffer,
+                        &mut self.active_line,
+                        &mut self.view_mode,
+                        self.readonly,
+                        scroll_to,
+                        &mut self.note_history,
+                        &mut self.props_folded,
+                    );
+                    if live.changed {
+                        self.dirty = true;
+                        self.last_edit = Some(Instant::now());
+                        ctx.request_repaint_after(Duration::from_secs(1));
+                    }
+                    if live.scroll_consumed {
+                        self.scroll_to_line = None;
+                    }
+                    if let Some(msg) = live.status {
+                        self.status = msg;
+                    }
+                    want_attach = live.attach_file;
+                    wiki_click = live.wikilink;
+                    tag_query = live.tag_query;
+                }
+                self.vault = vault;
+                if want_attach {
+                    self.pick_attach_file();
+                }
+                if let Some(click) = wiki_click {
+                    self.handle_wikilink(&click.raw, click.new_tab, click.fragment);
+                }
+                if let Some(query) = tag_query {
+                    self.open_quick_switcher_with(&query);
+                }
+            });
+
+        self.show_quick_switcher(ctx);
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if self.workspace_save_due.is_some() {
+            let _ = self.workspace.save();
         }
     }
 }
 
 impl App {
+    fn mark_workspace_dirty(&mut self) {
+        self.workspace_save_due = Some(Instant::now() + Duration::from_millis(300));
+    }
+
+    fn remember_left_width(&mut self, width: f32) {
+        let width = width.clamp(
+            workspace_prefs::DOCK_WIDTH_MIN,
+            workspace_prefs::DOCK_WIDTH_MAX,
+        );
+        if (self.workspace.left_width - width).abs() > 0.5 {
+            self.workspace.left_width = width;
+            self.mark_workspace_dirty();
+        }
+    }
+
+    fn remember_right_width(&mut self, width: f32) {
+        let width = width.clamp(
+            workspace_prefs::DOCK_WIDTH_MIN,
+            workspace_prefs::DOCK_WIDTH_MAX,
+        );
+        if (self.workspace.right_width - width).abs() > 0.5 {
+            self.workspace.right_width = width;
+            self.mark_workspace_dirty();
+        }
+    }
+
+    fn show_titlebar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("bluelink_titlebar")
+            .exact_height(theme::TITLEBAR_HEIGHT)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                    .inner_margin(egui::Margin::symmetric(6, 0)),
+            )
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.horizontal_centered(|ui| {
+                    let (mark_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(mark_rect, theme::round_sm(), theme::ACCENT);
+
+                    let vault = self
+                        .vault_root()
+                        .map(VaultRegistry::display_name)
+                        .unwrap_or_else(|| "No vault".into());
+                    let title_width = (ui.available_width() - 176.0).max(80.0);
+                    let title = ui.add_sized(
+                        [title_width, theme::TITLEBAR_HEIGHT],
+                        egui::Label::new(
+                            egui::RichText::new(format!("BlueLink — {vault}"))
+                                .size(12.0)
+                                .color(theme::WEAK),
+                        )
+                        .sense(egui::Sense::click_and_drag()),
+                    );
+                    if title.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    if title.double_clicked() {
+                        let maximized =
+                            ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                    }
+
+                    if chrome_button(ui, regular::SIDEBAR_SIMPLE, "Toggle secondary sidebar")
+                        .clicked()
+                    {
+                        if ctx.screen_rect().width() <= workspace_prefs::RIGHT_DOCK_BREAKPOINT
+                            && !self.force_right_dock
+                        {
+                            self.workspace.right_open = true;
+                            self.force_right_dock = true;
+                        } else {
+                            self.workspace.right_open = !self.workspace.right_open;
+                            self.force_right_dock = false;
+                        }
+                        self.mark_workspace_dirty();
+                    }
+                    if chrome_button(ui, regular::MINUS, "Minimize").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+                    if chrome_button(ui, regular::SQUARE, "Maximize or restore").clicked() {
+                        let maximized =
+                            ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                    }
+                    if chrome_button(ui, regular::X, "Close BlueLink").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
+        show_window_resize_grips(ctx);
+    }
+
+    fn show_ribbon(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("workspace_ribbon")
+            .exact_width(theme::RIBBON_WIDTH)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                    .inner_margin(egui::Margin::symmetric(4, 6)),
+            )
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
+                if ribbon_button(ui, regular::FOLDER_OPEN, self.workspace.left_open, "Files")
+                    .clicked()
+                {
+                    if ctx.screen_rect().width() <= workspace_prefs::LEFT_DOCK_BREAKPOINT
+                        && !self.force_left_dock
+                    {
+                        self.workspace.left_open = true;
+                        self.force_left_dock = true;
+                    } else {
+                        self.workspace.left_open = !self.workspace.left_open;
+                        self.force_left_dock = false;
+                    }
+                    self.mark_workspace_dirty();
+                }
+                if ribbon_button(
+                    ui,
+                    regular::MAGNIFYING_GLASS,
+                    false,
+                    "Quick switcher (Ctrl+P)",
+                )
+                .clicked()
+                {
+                    self.open_quick_switcher();
+                }
+                if ribbon_button(
+                    ui,
+                    regular::SHARE_NETWORK,
+                    self.is_graph_active(),
+                    "Local graph (Ctrl+G)",
+                )
+                .clicked()
+                {
+                    self.toggle_local_graph();
+                }
+                if ribbon_button(ui, regular::DEVICES, self.is_devices_active(), "Devices")
+                    .clicked()
+                {
+                    self.open_devices_tab();
+                }
+                if ribbon_button(ui, regular::ARROWS_CLOCKWISE, self.is_sync_active(), "Sync")
+                    .clicked()
+                {
+                    self.open_sync_tab();
+                }
+
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                    if ribbon_button(ui, regular::GEAR, false, "Open or create a vault").clicked() {
+                        self.pick_open_vault();
+                    }
+                });
+            });
+    }
+
+    fn show_status_bar(&self, ctx: &egui::Context) {
+        egui::Area::new(egui::Id::new("compact_status_bar"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(0.0, 0.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                    .corner_radius(egui::CornerRadius {
+                        nw: theme::ROUND_LG,
+                        ne: 0,
+                        sw: 0,
+                        se: 0,
+                    })
+                    .inner_margin(egui::Margin::symmetric(8, 3))
+                    .show(ui, |ui| {
+                        ui.set_min_height(theme::STATUS_HEIGHT - 6.0);
+                        ui.horizontal(|ui| {
+                            let save_state = if self.dirty { "Unsaved" } else { "Saved" };
+                            ui.label(
+                                egui::RichText::new(save_state)
+                                    .size(11.0)
+                                    .color(if self.dirty { theme::WARN } else { theme::WEAK }),
+                            );
+                            if let Some(time) = self.selected_mtime_hhmm() {
+                                ui.label(
+                                    egui::RichText::new(time)
+                                        .size(11.0)
+                                        .color(theme::TEXT_FAINT),
+                                );
+                            }
+                            if !self.status.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(&self.status)
+                                        .size(11.0)
+                                        .color(theme::TEXT_FAINT),
+                                );
+                            }
+                        });
+                    });
+            });
+    }
+
     fn show_local_graph_panel(&mut self, ui: &mut egui::Ui) {
         let Some(center) = self.graph_center().map(str::to_string) else {
             ui.centered_and_justified(|ui| {
@@ -2861,12 +3116,195 @@ impl App {
 }
 
 /// Ghost icon button for the note chrome toolbar — equal hit target, muted ink.
-fn toolbar_icon(
+fn ribbon_button(
     ui: &mut egui::Ui,
     icon: &str,
-    enabled: bool,
-    tip: &str,
+    selected: bool,
+    accessible_name: &str,
 ) -> egui::Response {
+    let fill = if selected {
+        theme::ACCENT.gamma_multiply(0.22)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let response = ui.add(
+        egui::Button::new(egui::RichText::new(icon).size(19.0).color(if selected {
+            theme::ACCENT_HOVER
+        } else {
+            theme::WEAK
+        }))
+        .min_size(egui::vec2(34.0, 34.0))
+        .corner_radius(theme::round_sm())
+        .fill(fill)
+        .stroke(egui::Stroke::NONE),
+    );
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessible_name));
+    paint_keyboard_focus(ui, &response, theme::round_sm());
+    response.on_hover_text(accessible_name)
+}
+
+fn show_window_resize_grips(ctx: &egui::Context) {
+    if ctx.input(|input| input.viewport().maximized.unwrap_or(false)) {
+        return;
+    }
+    let bounds = ctx.screen_rect();
+    let edge = 5.0;
+    let corner = 9.0;
+    let horizontal = (bounds.width() - corner * 2.0).max(0.0);
+    let vertical = (bounds.height() - corner * 2.0).max(0.0);
+    let grips = [
+        (
+            "north",
+            egui::Rect::from_min_size(
+                bounds.min + egui::vec2(corner, 0.0),
+                egui::vec2(horizontal, edge),
+            ),
+            egui::ResizeDirection::North,
+            egui::CursorIcon::ResizeNorth,
+        ),
+        (
+            "south",
+            egui::Rect::from_min_size(
+                egui::pos2(bounds.left() + corner, bounds.bottom() - edge),
+                egui::vec2(horizontal, edge),
+            ),
+            egui::ResizeDirection::South,
+            egui::CursorIcon::ResizeSouth,
+        ),
+        (
+            "west",
+            egui::Rect::from_min_size(
+                bounds.min + egui::vec2(0.0, corner),
+                egui::vec2(edge, vertical),
+            ),
+            egui::ResizeDirection::West,
+            egui::CursorIcon::ResizeWest,
+        ),
+        (
+            "east",
+            egui::Rect::from_min_size(
+                egui::pos2(bounds.right() - edge, bounds.top() + corner),
+                egui::vec2(edge, vertical),
+            ),
+            egui::ResizeDirection::East,
+            egui::CursorIcon::ResizeEast,
+        ),
+        (
+            "north_west",
+            egui::Rect::from_min_size(bounds.min, egui::vec2(corner, corner)),
+            egui::ResizeDirection::NorthWest,
+            egui::CursorIcon::ResizeNorthWest,
+        ),
+        (
+            "north_east",
+            egui::Rect::from_min_size(
+                egui::pos2(bounds.right() - corner, bounds.top()),
+                egui::vec2(corner, corner),
+            ),
+            egui::ResizeDirection::NorthEast,
+            egui::CursorIcon::ResizeNorthEast,
+        ),
+        (
+            "south_west",
+            egui::Rect::from_min_size(
+                egui::pos2(bounds.left(), bounds.bottom() - corner),
+                egui::vec2(corner, corner),
+            ),
+            egui::ResizeDirection::SouthWest,
+            egui::CursorIcon::ResizeSouthWest,
+        ),
+        (
+            "south_east",
+            egui::Rect::from_min_size(
+                bounds.max - egui::vec2(corner, corner),
+                egui::vec2(corner, corner),
+            ),
+            egui::ResizeDirection::SouthEast,
+            egui::CursorIcon::ResizeSouthEast,
+        ),
+    ];
+
+    for (id, rect, direction, cursor) in grips {
+        egui::Area::new(egui::Id::new(("window_resize", id)))
+            .fixed_pos(rect.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let response = ui
+                    .allocate_exact_size(rect.size(), egui::Sense::drag())
+                    .1
+                    .on_hover_cursor(cursor);
+                if response.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+                }
+            });
+    }
+}
+
+fn chrome_button(ui: &mut egui::Ui, icon: &str, accessible_name: &str) -> egui::Response {
+    let response = ui.add(
+        egui::Button::new(egui::RichText::new(icon).size(13.0).color(theme::WEAK))
+            .min_size(egui::vec2(30.0, theme::TITLEBAR_HEIGHT))
+            .corner_radius(0.0)
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE),
+    );
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessible_name));
+    paint_keyboard_focus(ui, &response, egui::CornerRadius::ZERO);
+    response.on_hover_text(accessible_name)
+}
+
+fn dock_tab(
+    ui: &mut egui::Ui,
+    icon: &str,
+    selected: bool,
+    accessible_name: &str,
+) -> egui::Response {
+    let response = ui.add(
+        egui::Button::new(egui::RichText::new(icon).size(16.0).color(if selected {
+            theme::TEXT
+        } else {
+            theme::WEAK
+        }))
+        .min_size(egui::vec2(36.0, 30.0))
+        .corner_radius(theme::round_sm())
+        .fill(if selected {
+            theme::BG_ALT
+        } else {
+            egui::Color32::TRANSPARENT
+        })
+        .stroke(egui::Stroke::NONE),
+    );
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessible_name));
+    paint_keyboard_focus(ui, &response, theme::round_sm());
+    response.on_hover_text(accessible_name)
+}
+
+fn paint_keyboard_focus(ui: &egui::Ui, response: &egui::Response, radius: egui::CornerRadius) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.shrink(1.0),
+            radius,
+            egui::Stroke::new(2.0_f32, theme::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+fn dock_empty_state(ui: &mut egui::Ui, message: &str) {
+    ui.add_space(20.0);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            egui::RichText::new(message)
+                .size(12.0)
+                .color(theme::TEXT_FAINT),
+        );
+    });
+}
+
+fn toolbar_icon(ui: &mut egui::Ui, icon: &str, enabled: bool, tip: &str) -> egui::Response {
     let color = if enabled { theme::WEAK } else { theme::STROKE };
     let btn = egui::Button::new(egui::RichText::new(icon).size(15.0).color(color))
         .min_size(egui::vec2(32.0, 32.0))
@@ -2874,6 +3312,8 @@ fn toolbar_icon(
         .fill(egui::Color32::TRANSPARENT)
         .stroke(egui::Stroke::NONE);
     let response = ui.add_enabled(enabled, btn);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tip));
+    paint_keyboard_focus(ui, &response, theme::round_sm());
     if enabled {
         response.on_hover_text(tip)
     } else {
@@ -2965,7 +3405,8 @@ mod automatic_name_tests {
     fn starts_with_base_and_uses_the_next_available_number() {
         assert_eq!(next_available_name("untitled", |_| false), "untitled");
         assert_eq!(
-            next_available_name("inbox", |candidate| candidate == "inbox" || candidate == "inbox1"),
+            next_available_name("inbox", |candidate| candidate == "inbox"
+                || candidate == "inbox1"),
             "inbox2"
         );
         assert_eq!(
@@ -3024,5 +3465,106 @@ mod external_conflict_tests {
     #[test]
     fn no_prompt_when_file_vanished() {
         assert!(!should_prompt_external_conflict(Some("aaa"), None, None));
+    }
+}
+
+#[cfg(test)]
+mod workspace_tab_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn test_app() -> (App, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let mut vault = Vault::open(dir.path()).unwrap();
+        vault.write("alpha.md", "# Alpha\n").unwrap();
+        vault.write("beta.md", "# Beta\n").unwrap();
+        let notes = vault.list().unwrap();
+        let app = App {
+            vault: Some(vault),
+            notes,
+            folders: Vec::new(),
+            open_tabs: Vec::new(),
+            active_tab: None,
+            selected: None,
+            buffer: String::new(),
+            dirty: false,
+            readonly: false,
+            last_edit: None,
+            active_line: None,
+            view_mode: editor::ViewMode::Live,
+            status: String::new(),
+            dialog: None,
+            renaming: None,
+            reload_flag: Arc::new(AtomicBool::new(false)),
+            pick_folder: None,
+            pick_file: None,
+            selected_sha: None,
+            suppress_reload_until: None,
+            acked_external_sha: None,
+            registry: VaultRegistry::load(),
+            undo_stack: Vec::new(),
+            quick_switcher: None,
+            recent: Vec::new(),
+            local_graph: local_graph::LocalGraphUi::default(),
+            sync_ui: None,
+            sync_panel: sync_panels::SyncPanelState::default(),
+            workspace: WorkspacePrefs::default(),
+            workspace_save_due: None,
+            force_left_dock: false,
+            force_right_dock: false,
+            note_history: note_history::NoteHistory::new(),
+            scroll_to_line: None,
+            find_bar: FindBar::default(),
+            outline_renaming: None,
+            props_burst: false,
+            props_folded: false,
+            props_view: properties_panel::PropertiesView::Pretty,
+        };
+        (app, dir)
+    }
+
+    #[test]
+    fn note_graph_devices_sync_are_central_tabs_and_close_back_to_note() {
+        let (mut app, _dir) = test_app();
+        app.select_note("alpha.md");
+        assert!(app.is_note_active());
+
+        app.toggle_local_graph();
+        assert!(app.is_graph_active());
+        app.open_devices_tab();
+        assert!(app.is_devices_active());
+        app.open_sync_tab();
+        assert!(app.is_sync_active());
+        assert_eq!(app.open_tabs.len(), 4);
+
+        for kind in ["sync", "devices", "graph"] {
+            let index = app.active_tab.unwrap();
+            match kind {
+                "sync" => assert!(matches!(app.open_tabs[index], OpenTab::Sync)),
+                "devices" => assert!(matches!(app.open_tabs[index], OpenTab::Devices)),
+                "graph" => assert!(matches!(app.open_tabs[index], OpenTab::Graph { .. })),
+                _ => unreachable!(),
+            }
+            app.close_tab_at(index);
+        }
+
+        assert!(app.is_note_active());
+        assert_eq!(app.selected.as_deref(), Some("alpha.md"));
+        assert_eq!(app.open_tabs.len(), 1);
+    }
+
+    #[test]
+    fn selecting_note_from_tool_tab_opens_beside_it() {
+        let (mut app, _dir) = test_app();
+        app.select_note("alpha.md");
+        app.open_devices_tab();
+        app.select_note("beta.md");
+
+        assert!(app.is_note_active());
+        assert_eq!(app.selected.as_deref(), Some("beta.md"));
+        assert!(app
+            .open_tabs
+            .iter()
+            .any(|tab| matches!(tab, OpenTab::Devices)));
     }
 }

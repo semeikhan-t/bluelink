@@ -222,17 +222,21 @@ pub fn callout_kind(raw: &str) -> (CalloutKind, bool) {
 pub fn callout_visual(kind: CalloutKind) -> CalloutVisual {
     let (accent, icon, alpha) = match kind {
         CalloutKind::Note => (theme::ACCENT, regular::NOTE, 48),
-        CalloutKind::Abstract => (Color32::from_rgb(0x00, 0xbf, 0xa5), regular::BOOK_OPEN_TEXT, 48),
+        CalloutKind::Abstract => (
+            Color32::from_rgb(0x00, 0xbf, 0xa5),
+            regular::BOOK_OPEN_TEXT,
+            48,
+        ),
         CalloutKind::Info => (theme::ACCENT, regular::INFO, 48),
-        CalloutKind::Todo => (Color32::from_rgb(0x7c, 0x3a, 0xed), regular::CHECK_SQUARE, 48),
+        CalloutKind::Todo => (theme::ACCENT, regular::CHECK_SQUARE, 48),
         CalloutKind::Tip => (Color32::from_rgb(0x00, 0xb5, 0xe2), regular::LIGHTBULB, 48),
-        CalloutKind::Success => (Color32::from_rgb(0x12, 0xb9, 0x81), regular::CHECK_CIRCLE, 48),
-        CalloutKind::Question => (Color32::from_rgb(0xea, 0xb3, 0x08), regular::QUESTION, 48),
+        CalloutKind::Success => (theme::SUCCESS, regular::CHECK_CIRCLE, 48),
+        CalloutKind::Question => (theme::WARN, regular::QUESTION, 48),
         CalloutKind::Warning => (theme::WARN, regular::WARNING, 48),
         CalloutKind::Failure => (theme::DESTRUCTIVE, regular::X_CIRCLE, 48),
         CalloutKind::Danger => (theme::DESTRUCTIVE, regular::FIRE, 72),
-        CalloutKind::Bug => (Color32::from_rgb(0xf4, 0x3f, 0x5e), regular::BUG, 48),
-        CalloutKind::Example => (Color32::from_rgb(0xa8, 0x55, 0xf7), regular::FLASK, 48),
+        CalloutKind::Bug => (theme::DESTRUCTIVE, regular::BUG, 48),
+        CalloutKind::Example => (theme::ACCENT_HOVER, regular::FLASK, 48),
         CalloutKind::Quote => (theme::WEAK, regular::QUOTES, 40),
     };
     CalloutVisual {
@@ -444,9 +448,7 @@ pub fn is_list_line(line: &str) -> bool {
         return true;
     }
     let trimmed = line.trim_start();
-    trimmed.starts_with("- ")
-        || trimmed.starts_with("* ")
-        || numbered_list_rest(trimmed).is_some()
+    trimmed.starts_with("- ") || trimmed.starts_with("* ") || numbered_list_rest(trimmed).is_some()
 }
 
 /// Prepend one [`LIST_INDENT`] level.
@@ -1412,12 +1414,8 @@ fn render_text_chunks(ui: &mut Ui, text: &str, size: f32, heading: bool, level: 
             crate::footnote::InlinePiece::Inline { text: inner } => {
                 let resp = ui
                     .add(
-                        egui::Label::new(
-                            RichText::new("*")
-                                .size(size * 0.85)
-                                .color(theme::ACCENT),
-                        )
-                        .sense(Sense::click()),
+                        egui::Label::new(RichText::new("*").size(size * 0.85).color(theme::ACCENT))
+                            .sense(Sense::click()),
                     )
                     .on_hover_text(inner)
                     .on_hover_cursor(CursorIcon::Help);
@@ -1473,15 +1471,21 @@ fn render_tag_chunks(ui: &mut Ui, text: &str, size: f32, heading: bool, level: u
             continue;
         }
         let tag = &after[..tag_len];
-        let resp = ui
-            .add(
-                egui::Label::new(
-                    RichText::new(format!("#{tag}"))
-                        .size(size)
-                        .color(theme::ACCENT),
+        let resp = egui::Frame::NONE
+            .fill(theme::ACCENT.gamma_multiply(0.16))
+            .corner_radius(egui::CornerRadius::same(theme::ROUND_PILL))
+            .inner_margin(egui::Margin::symmetric(4, 1))
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("#{tag}"))
+                            .size(size)
+                            .color(theme::ACCENT_HOVER),
+                    )
+                    .sense(Sense::click()),
                 )
-                .sense(Sense::click()),
-            )
+            })
+            .inner
             .on_hover_cursor(CursorIcon::PointingHand);
         if resp.clicked() {
             click = LineClick::Tag {
@@ -1548,7 +1552,7 @@ fn render_note_embed(ui: &mut Ui, vault: &Vault, path: &str, alias: Option<&str>
             for line in preview_lines {
                 let resp = ui.add(
                     egui::Label::new(RichText::new(line).size(13.0).color(theme::WEAK))
-                    .sense(Sense::click()),
+                        .sense(Sense::click()),
                 );
                 open |= resp.clicked();
             }
@@ -2092,10 +2096,12 @@ mod fence_tests {
         assert!(indent_list_line("3. x").contains("3. "));
 
         let text = "- a\nplain\n- b\n";
-        let (next, lo, hi) = adjust_list_indent_in_range(text, 0, text.chars().count(), true).unwrap();
+        let (next, lo, hi) =
+            adjust_list_indent_in_range(text, 0, text.chars().count(), true).unwrap();
         assert_eq!(next, "  - a\nplain\n  - b\n");
         assert_eq!((lo, hi), (0, text.chars().count() + 4));
-        let (back, _, _) = adjust_list_indent_in_range(&next, 0, next.chars().count(), false).unwrap();
+        let (back, _, _) =
+            adjust_list_indent_in_range(&next, 0, next.chars().count(), false).unwrap();
         assert_eq!(back, text);
     }
 }

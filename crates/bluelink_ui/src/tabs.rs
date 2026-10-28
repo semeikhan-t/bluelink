@@ -13,6 +13,8 @@ pub struct TabAction {
 pub enum TabKind {
     Note,
     Graph,
+    Devices,
+    Sync,
 }
 
 pub struct TabView {
@@ -20,15 +22,15 @@ pub struct TabView {
     pub kind: TabKind,
 }
 
-const TAB_H: f32 = 34.0;
-const BAR_PAD_Y: f32 = 6.0;
+const TAB_H: f32 = 35.0;
+const BAR_PAD_Y: f32 = 5.0;
 /// Full tab strip height — use to vertically center toolbar icons.
-pub const BAR_HEIGHT: f32 = TAB_H + BAR_PAD_Y * 2.0;
+pub const BAR_HEIGHT: f32 = 40.0;
 const TITLE_MAX: usize = 28;
 const TITLE_SIZE: f32 = 14.0;
 const ICON_SIZE: f32 = 14.0;
 
-/// Floating chip tab strip — shadcn-like pills over a quiet bar.
+/// Obsidian-like tabs: quiet inactive labels and a raised active leaf.
 pub fn show(ui: &mut Ui, tabs: &[TabView], active: Option<usize>, dirty: bool) -> TabAction {
     let mut action = TabAction::default();
     if tabs.is_empty() {
@@ -39,7 +41,7 @@ pub fn show(ui: &mut Ui, tabs: &[TabView], active: Option<usize>, dirty: bool) -
     let (_, bar_rect) = ui.allocate_space(egui::vec2(bar_w, BAR_HEIGHT));
 
     ui.painter()
-        .rect_filled(bar_rect, theme::round(), theme::PANEL);
+        .rect_filled(bar_rect, egui::CornerRadius::ZERO, theme::PANEL);
     ui.painter().hline(
         bar_rect.x_range(),
         bar_rect.bottom() - 0.5,
@@ -48,7 +50,10 @@ pub fn show(ui: &mut Ui, tabs: &[TabView], active: Option<usize>, dirty: bool) -
 
     let mut child = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(bar_rect.shrink2(egui::vec2(8.0, BAR_PAD_Y)))
+            .max_rect(egui::Rect::from_min_max(
+                bar_rect.min + egui::vec2(8.0, BAR_PAD_Y),
+                bar_rect.max - egui::vec2(8.0, 0.0),
+            ))
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
 
@@ -58,13 +63,21 @@ pub fn show(ui: &mut Ui, tabs: &[TabView], active: Option<usize>, dirty: bool) -
         .auto_shrink([false, true])
         .show(&mut child, |ui| {
             ui.set_min_height(TAB_H);
-            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.spacing_mut().item_spacing.x = 1.0;
 
             for (index, tab) in tabs.iter().enumerate() {
                 let is_active = active == Some(index);
                 let title = truncate_title(&tab.title);
                 let show_dirty = dirty && is_active && tab.kind == TabKind::Note;
-                tab_chip(ui, index, tab.kind, &title, is_active, show_dirty, &mut action);
+                tab_chip(
+                    ui,
+                    index,
+                    tab.kind,
+                    &title,
+                    is_active,
+                    show_dirty,
+                    &mut action,
+                );
             }
         });
 
@@ -82,55 +95,63 @@ fn tab_chip(
 ) {
     let close_id = ui.id().with(("note_tab_close", index));
 
-    let pad_x = 12.0_f32;
-    let icon_w = 16.0_f32;
+    let pad_x = 8.0_f32;
+    let icon_w = if kind == TabKind::Note { 0.0 } else { 16.0 };
     let close_w = 18.0_f32;
-    let gap_icon = 8.0_f32;
-    let gap_close = 6.0_f32;
+    let gap_icon = if kind == TabKind::Note { 0.0 } else { 6.0 };
+    let gap_close = 4.0_f32;
     let dirty_w = if dirty { 10.0 } else { 0.0 };
     let text_w = ui.fonts(|f| {
-        f.layout_no_wrap(title.to_owned(), FontId::proportional(TITLE_SIZE), theme::TEXT)
-            .size()
-            .x
+        f.layout_no_wrap(
+            title.to_owned(),
+            FontId::proportional(TITLE_SIZE),
+            theme::TEXT,
+        )
+        .size()
+        .x
     });
     let width = pad_x + icon_w + gap_icon + dirty_w + text_w + gap_close + close_w + pad_x;
-    let size = Vec2::new(width.max(88.0), TAB_H);
+    let size = Vec2::new(width.clamp(96.0, 320.0), TAB_H);
 
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Tab {title}"))
+    });
     let hovered = response.hovered();
 
     let fill = if active {
-        theme::FAINT
+        theme::BG
     } else if hovered {
-        Color32::from_rgb(0x1c, 0x1c, 0x1f)
+        Color32::from_rgba_unmultiplied(255, 255, 255, 17)
     } else {
         Color32::TRANSPARENT
     };
     let stroke = if active {
         Stroke::new(1.0_f32, theme::STROKE)
     } else if hovered {
-        Stroke::new(1.0_f32, Color32::from_rgb(0x3f, 0x3f, 0x46))
+        Stroke::new(1.0_f32, theme::STROKE_HOVER)
     } else {
         Stroke::NONE
     };
 
-    ui.painter().rect(
-        rect,
-        theme::round(),
-        fill,
-        stroke,
-        egui::StrokeKind::Inside,
-    );
-
-    if active {
-        // Short primary underline centered under the chip.
-        let underline_w = (rect.width() * 0.55).clamp(28.0, 72.0);
-        let mid = rect.center().x;
-        let y = rect.bottom() - 3.0;
-        ui.painter().hline(
-            (mid - underline_w * 0.5)..=(mid + underline_w * 0.5),
-            y,
+    let radius = if active {
+        egui::CornerRadius {
+            nw: 10,
+            ne: 10,
+            sw: 0,
+            se: 0,
+        }
+    } else {
+        theme::round_sm()
+    };
+    ui.painter()
+        .rect(rect, radius, fill, stroke, egui::StrokeKind::Inside);
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            radius,
             Stroke::new(2.0_f32, theme::ACCENT),
+            egui::StrokeKind::Inside,
         );
     }
 
@@ -139,9 +160,7 @@ fn tab_chip(
     } else {
         theme::WEAK
     };
-    let icon_color = if active {
-        theme::ACCENT
-    } else if hovered {
+    let icon_color = if active || hovered {
         theme::TEXT
     } else {
         theme::WEAK
@@ -151,11 +170,22 @@ fn tab_chip(
     let cy = rect.center().y;
 
     let icon = match kind {
-        TabKind::Note => regular::NOTE,
+        TabKind::Note => "",
         TabKind::Graph => regular::SHARE_NETWORK,
+        TabKind::Devices => regular::DEVICES,
+        TabKind::Sync => regular::ARROWS_CLOCKWISE,
     };
-    paint_glyph(ui, egui::pos2(x, cy), icon, ICON_SIZE, icon_color, AlignX::Left);
-    x += icon_w + gap_icon;
+    if !icon.is_empty() {
+        paint_glyph(
+            ui,
+            egui::pos2(x, cy),
+            icon,
+            ICON_SIZE,
+            icon_color,
+            AlignX::Left,
+        );
+        x += icon_w + gap_icon;
+    }
 
     if dirty {
         ui.painter()
@@ -163,7 +193,14 @@ fn tab_chip(
         x += dirty_w;
     }
 
-    paint_glyph(ui, egui::pos2(x, cy), title, TITLE_SIZE, text_color, AlignX::Left);
+    paint_glyph(
+        ui,
+        egui::pos2(x, cy),
+        title,
+        TITLE_SIZE,
+        text_color,
+        AlignX::Left,
+    );
     x += text_w + gap_close;
 
     let close_rect = egui::Rect::from_center_size(
@@ -174,6 +211,17 @@ fn tab_chip(
     let mut closed = false;
     if show_close {
         let close = ui.interact(close_rect, close_id, Sense::click());
+        close.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Close {title}"))
+        });
+        if close.has_focus() {
+            ui.painter().rect_stroke(
+                close_rect.expand(1.0),
+                theme::round_sm(),
+                Stroke::new(2.0_f32, theme::ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
         let ch = close.hovered();
         if ch {
             ui.painter().rect_filled(
@@ -187,12 +235,15 @@ fn tab_chip(
                 ),
             );
         }
-        let xc = if ch {
-            theme::DESTRUCTIVE
-        } else {
-            theme::WEAK
-        };
-        paint_glyph(ui, close_rect.center(), regular::X, 12.0, xc, AlignX::Center);
+        let xc = if ch { theme::DESTRUCTIVE } else { theme::WEAK };
+        paint_glyph(
+            ui,
+            close_rect.center(),
+            regular::X,
+            12.0,
+            xc,
+            AlignX::Center,
+        );
         close.clone().on_hover_text("Close");
         if close.clicked() {
             action.close = Some(index);

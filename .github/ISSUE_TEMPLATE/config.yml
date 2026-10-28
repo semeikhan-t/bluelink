@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: BlueLink documentation
+    url: https://github.com/semeikhan-t/bluelink#documentation
+    about: Read the setup, usage, and architecture documentation before opening an issue.

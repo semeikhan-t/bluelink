@@ -151,10 +151,7 @@ pub fn show(
                             PropertiesView::Pretty => (regular::CODE, "Show raw YAML"),
                             PropertiesView::Raw => (regular::LIST_BULLETS, "Show fields"),
                         };
-                        if ui
-                            .small_button(icon.to_string())
-                            .on_hover_text(tip)
-                            .clicked()
+                        if theme::accessible_icon(ui.small_button(icon.to_string()), tip).clicked()
                         {
                             *view = view.toggle();
                         }
@@ -283,10 +280,11 @@ pub fn show(
                                 action.focused = true;
                             }
                             if !readonly
-                                && ui
-                                    .small_button(regular::X.to_string())
-                                    .on_hover_text("Remove")
-                                    .clicked()
+                                && theme::accessible_icon(
+                                    ui.small_button(regular::X.to_string()),
+                                    "Remove property",
+                                )
+                                .clicked()
                             {
                                 remove = Some(i);
                             }
@@ -342,10 +340,7 @@ mod tests {
         assert_eq!(classify_property_value("FALSE"), PropertyValueKind::Bool);
         assert_eq!(classify_property_value("42"), PropertyValueKind::Number);
         assert_eq!(classify_property_value("-3.5"), PropertyValueKind::Number);
-        assert_eq!(
-            classify_property_value("a\nb"),
-            PropertyValueKind::List
-        );
+        assert_eq!(classify_property_value("a\nb"), PropertyValueKind::List);
         assert_eq!(
             classify_property_value("2024-01-15"),
             PropertyValueKind::String

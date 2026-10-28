@@ -84,10 +84,7 @@ pub fn show(
     for entry in entries {
         let indent = ((entry.level.saturating_sub(1)) as f32) * 12.0;
 
-        if renaming
-            .as_ref()
-            .is_some_and(|r| r.line == entry.line)
-        {
+        if renaming.as_ref().is_some_and(|r| r.line == entry.line) {
             let Some(rename) = renaming.as_mut() else {
                 continue;
             };
@@ -108,8 +105,7 @@ pub fn show(
                     } else {
                         let new = rename.draft.trim().to_string();
                         if !new.is_empty() && new != rename.old {
-                            action.commit_rename =
-                                Some((rename.line, rename.old.clone(), new));
+                            action.commit_rename = Some((rename.line, rename.old.clone(), new));
                         } else {
                             action.cancel_rename = true;
                         }
@@ -131,12 +127,8 @@ pub fn show(
             ui.add_space(indent);
             let row = ui
                 .add(
-                    egui::Label::new(
-                        RichText::new(&entry.title)
-                            .size(13.0)
-                            .color(theme::TEXT),
-                    )
-                    .sense(Sense::click()),
+                    egui::Label::new(RichText::new(&entry.title).size(13.0).color(theme::TEXT))
+                        .sense(Sense::click()),
                 )
                 .on_hover_text(format!("Line {}", entry.line + 1));
             if row.clicked() {
@@ -145,10 +137,11 @@ pub fn show(
             if row.secondary_clicked() {
                 action.start_rename = Some((entry.line, entry.title.clone()));
             }
-            if ui
-                .small_button(regular::PENCIL_SIMPLE.to_string())
-                .on_hover_text("Rename heading")
-                .clicked()
+            if theme::accessible_icon(
+                ui.small_button(regular::PENCIL_SIMPLE.to_string()),
+                "Rename heading",
+            )
+            .clicked()
             {
                 action.start_rename = Some((entry.line, entry.title.clone()));
             }
