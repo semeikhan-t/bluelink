@@ -141,6 +141,105 @@ pub fn toggle_checklist_line(line: &str) -> Option<String> {
     }
 }
 
+/// Default Insert → Callout snippet (`> [!note]` + empty body line).
+pub const CALLOUT_SNIPPET: &str = "> [!note]\n> ";
+
+/// Canonical Obsidian callout kinds (aliases resolve here).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalloutKind {
+    Note,
+    Abstract,
+    Info,
+    Todo,
+    Tip,
+    Success,
+    Question,
+    Warning,
+    Failure,
+    Danger,
+    Bug,
+    Example,
+    Quote,
+}
+
+impl CalloutKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Note => "NOTE",
+            Self::Abstract => "ABSTRACT",
+            Self::Info => "INFO",
+            Self::Todo => "TODO",
+            Self::Tip => "TIP",
+            Self::Success => "SUCCESS",
+            Self::Question => "QUESTION",
+            Self::Warning => "WARNING",
+            Self::Failure => "FAILURE",
+            Self::Danger => "DANGER",
+            Self::Bug => "BUG",
+            Self::Example => "EXAMPLE",
+            Self::Quote => "QUOTE",
+        }
+    }
+}
+
+/// Border / fill / phosphor icon for a callout card.
+#[derive(Clone, Copy, Debug)]
+pub struct CalloutVisual {
+    pub accent: Color32,
+    pub fill: Color32,
+    pub icon: &'static str,
+}
+
+fn callout_fill(accent: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), alpha)
+}
+
+/// Map raw `[!type]` (case-insensitive) to a kind. Second value is `true` when the
+/// type is unknown and should fall back to note styling while keeping the raw label.
+pub fn callout_kind(raw: &str) -> (CalloutKind, bool) {
+    let key = raw.to_ascii_lowercase();
+    let kind = match key.as_str() {
+        "note" => CalloutKind::Note,
+        "abstract" | "summary" | "tldr" => CalloutKind::Abstract,
+        "info" => CalloutKind::Info,
+        "todo" => CalloutKind::Todo,
+        "tip" | "hint" | "important" => CalloutKind::Tip,
+        "success" | "check" | "done" => CalloutKind::Success,
+        "question" | "help" | "faq" => CalloutKind::Question,
+        "warning" | "caution" | "attention" => CalloutKind::Warning,
+        "failure" | "fail" | "missing" => CalloutKind::Failure,
+        "danger" | "error" => CalloutKind::Danger,
+        "bug" => CalloutKind::Bug,
+        "example" => CalloutKind::Example,
+        "quote" | "cite" => CalloutKind::Quote,
+        _ => return (CalloutKind::Note, true),
+    };
+    (kind, false)
+}
+
+pub fn callout_visual(kind: CalloutKind) -> CalloutVisual {
+    let (accent, icon, alpha) = match kind {
+        CalloutKind::Note => (theme::ACCENT, regular::NOTE, 48),
+        CalloutKind::Abstract => (Color32::from_rgb(0x00, 0xbf, 0xa5), regular::BOOK_OPEN_TEXT, 48),
+        CalloutKind::Info => (theme::ACCENT, regular::INFO, 48),
+        CalloutKind::Todo => (Color32::from_rgb(0x7c, 0x3a, 0xed), regular::CHECK_SQUARE, 48),
+        CalloutKind::Tip => (Color32::from_rgb(0x00, 0xb5, 0xe2), regular::LIGHTBULB, 48),
+        CalloutKind::Success => (Color32::from_rgb(0x12, 0xb9, 0x81), regular::CHECK_CIRCLE, 48),
+        CalloutKind::Question => (Color32::from_rgb(0xea, 0xb3, 0x08), regular::QUESTION, 48),
+        CalloutKind::Warning => (theme::WARN, regular::WARNING, 48),
+        CalloutKind::Failure => (theme::DESTRUCTIVE, regular::X_CIRCLE, 48),
+        CalloutKind::Danger => (theme::DESTRUCTIVE, regular::FIRE, 72),
+        CalloutKind::Bug => (Color32::from_rgb(0xf4, 0x3f, 0x5e), regular::BUG, 48),
+        CalloutKind::Example => (Color32::from_rgb(0xa8, 0x55, 0xf7), regular::FLASK, 48),
+        CalloutKind::Quote => (theme::WEAK, regular::QUOTES, 40),
+    };
+    CalloutVisual {
+        accent,
+        fill: callout_fill(accent, alpha),
+        icon,
+    }
+}
+
 /// Obsidian callout: `> [!type] title` plus following `>` lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CalloutPlace {
@@ -155,13 +254,17 @@ pub enum CalloutPlace {
     },
 }
 
+/// Map each line to callout head/tail. Lines inside a code fence are never callouts.
 pub fn callout_places(lines: &[String]) -> Vec<CalloutPlace> {
     let mut out = vec![CalloutPlace::None; lines.len()];
     let mut i = 0;
+    let mut fence = None;
     while i < lines.len() {
-        if callout_type(&lines[i]).is_some() {
+        let in_fence = !matches!(advance_fence(&lines[i], &mut fence), FenceRole::Outside);
+        if !in_fence && callout_type(&lines[i]).is_some() {
             let mut end = i + 1;
             while end < lines.len() && is_quote_line(&lines[end]) {
+                let _ = advance_fence(&lines[end], &mut fence);
                 end += 1;
             }
             out[i] = CalloutPlace::Head { end };
@@ -1315,6 +1418,13 @@ pub fn paint_callout(ui: &mut Ui, lines: &[String], start: usize, end: usize) ->
     };
     let collapsed = callout_collapsed(first);
     let ty = callout_type(first).unwrap_or("note");
+    let (kind, unknown) = callout_kind(ty);
+    let visual = callout_visual(kind);
+    let type_label = if unknown {
+        ty.to_ascii_uppercase()
+    } else {
+        kind.label().to_string()
+    };
     let title = {
         let t = first.trim_start();
         let after_gt = t.strip_prefix('>').map(str::trim_start).unwrap_or(t);
@@ -1329,22 +1439,22 @@ pub fn paint_callout(ui: &mut Ui, lines: &[String], start: usize, end: usize) ->
     let mut edit = None;
     let mut toggle_fold = false;
     egui::Frame::NONE
-        .fill(ui.visuals().faint_bg_color)
-        .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT))
+        .fill(visual.fill)
+        .stroke(egui::Stroke::new(1.0_f32, visual.accent))
         .corner_radius(theme::round())
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.spacing_mut().interact_size.y = 18.0;
-                let icon = if collapsed {
+                let chevron = if collapsed {
                     regular::CARET_RIGHT
                 } else {
                     regular::CARET_DOWN
                 };
                 if ui
                     .add(
-                        egui::Button::new(RichText::new(icon).size(14.0).color(theme::WEAK))
+                        egui::Button::new(RichText::new(chevron).size(14.0).color(theme::WEAK))
                             .frame(false),
                     )
                     .on_hover_cursor(CursorIcon::PointingHand)
@@ -1352,11 +1462,12 @@ pub fn paint_callout(ui: &mut Ui, lines: &[String], start: usize, end: usize) ->
                 {
                     toggle_fold = true;
                 }
+                ui.label(RichText::new(visual.icon).size(14.0).color(visual.accent));
                 ui.label(
-                    RichText::new(ty.to_ascii_uppercase())
+                    RichText::new(&type_label)
                         .size(12.0)
                         .strong()
-                        .color(theme::ACCENT),
+                        .color(visual.accent),
                 );
                 if !title.is_empty() {
                     let resp = ui.add(
@@ -1374,22 +1485,22 @@ pub fn paint_callout(ui: &mut Ui, lines: &[String], start: usize, end: usize) ->
                 }
             });
             if !collapsed {
-            for (k, line) in lines.iter().enumerate().take(end).skip(start + 1) {
-                let body = line
-                    .trim_start()
-                    .strip_prefix('>')
-                    .map(str::trim_start)
-                    .unwrap_or(line.as_str());
-                let shown = if body.is_empty() { " " } else { body };
-                let resp = ui.add(
+                for (k, line) in lines.iter().enumerate().take(end).skip(start + 1) {
+                    let body = line
+                        .trim_start()
+                        .strip_prefix('>')
+                        .map(str::trim_start)
+                        .unwrap_or(line.as_str());
+                    let shown = if body.is_empty() { " " } else { body };
+                    let resp = ui.add(
                         egui::Label::new(
                             RichText::new(shown)
                                 .size(theme::EDITOR_SIZE)
                                 .color(theme::TEXT),
                         )
                         .sense(Sense::click()),
-                );
-                if resp.clicked() {
+                    );
+                    if resp.clicked() {
                         edit = Some(k);
                     }
                 }
@@ -1714,6 +1825,55 @@ mod fence_tests {
         assert_eq!(places[4], CalloutPlace::None);
         assert_eq!(callout_type("> [!warning]"), Some("warning"));
         assert_eq!(callout_type("> plain"), None);
+
+        let fenced = vec![
+            "```".into(),
+            "> [!note] inside".into(),
+            "```".into(),
+            "> [!danger] out".into(),
+            "> body".into(),
+        ];
+        let places = callout_places(&fenced);
+        assert_eq!(places[0], CalloutPlace::None);
+        assert_eq!(places[1], CalloutPlace::None);
+        assert_eq!(places[2], CalloutPlace::None);
+        assert_eq!(places[3], CalloutPlace::Head { end: 5 });
+        assert_eq!(places[4], CalloutPlace::Tail { start: 3, end: 5 });
+    }
+
+    #[test]
+    fn callout_kind_aliases_and_unknown() {
+        let cases = [
+            ("note", CalloutKind::Note, false),
+            ("NOTE", CalloutKind::Note, false),
+            ("summary", CalloutKind::Abstract, false),
+            ("tldr", CalloutKind::Abstract, false),
+            ("info", CalloutKind::Info, false),
+            ("todo", CalloutKind::Todo, false),
+            ("hint", CalloutKind::Tip, false),
+            ("important", CalloutKind::Tip, false),
+            ("check", CalloutKind::Success, false),
+            ("done", CalloutKind::Success, false),
+            ("help", CalloutKind::Question, false),
+            ("faq", CalloutKind::Question, false),
+            ("caution", CalloutKind::Warning, false),
+            ("attention", CalloutKind::Warning, false),
+            ("fail", CalloutKind::Failure, false),
+            ("missing", CalloutKind::Failure, false),
+            ("error", CalloutKind::Danger, false),
+            ("bug", CalloutKind::Bug, false),
+            ("example", CalloutKind::Example, false),
+            ("cite", CalloutKind::Quote, false),
+            ("weird", CalloutKind::Note, true),
+            ("custom_type", CalloutKind::Note, true),
+        ];
+        for (raw, kind, unknown) in cases {
+            assert_eq!(callout_kind(raw), (kind, unknown), "raw={raw}");
+        }
+        let note = callout_visual(CalloutKind::Note);
+        let danger = callout_visual(CalloutKind::Danger);
+        assert_ne!(note.accent, danger.accent);
+        assert_ne!(note.icon, danger.icon);
     }
 
     #[test]

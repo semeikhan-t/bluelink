@@ -248,7 +248,8 @@ pub fn show_popup(ctx: &egui::Context) -> Option<(CtxMenu, EditorAction)> {
                                 action = Some(EditorAction::InsertSnippet(crate::table::SNIPPET));
                             }
                             if row(ui, regular::QUOTES, "Callout", false) {
-                                action = Some(EditorAction::InsertSnippet("> [!note]\n> "));
+                                action =
+                                    Some(EditorAction::InsertSnippet(crate::preview::CALLOUT_SNIPPET));
                             }
                             if row(ui, regular::MINUS, "Horizontal rule", false) {
                                 action = Some(EditorAction::InsertSnippet("---"));
