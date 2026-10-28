@@ -22,6 +22,10 @@ pub enum EditorAction {
     Footnote,
     /// Wrap / unwrap `%%…%%` on the selection or current line.
     ToggleComments,
+    /// Add one list indent level (`  `) on list lines in the selection.
+    IndentList,
+    /// Remove one list indent level on list lines in the selection.
+    UnindentList,
     /// Collapse the innermost open fold at the caret (callout, then heading/indent).
     FoldMore,
     /// Open the innermost closed fold at the caret.
@@ -238,6 +242,12 @@ pub fn show_popup(ctx: &egui::Context) -> Option<(CtxMenu, EditorAction)> {
                             }
                             if row(ui, regular::LIST_NUMBERS, "Numbered list", false) {
                                 action = Some(EditorAction::SetLinePrefix("1. "));
+                            }
+                            if row(ui, regular::TEXT_INDENT, "Indent list", false) {
+                                action = Some(EditorAction::IndentList);
+                            }
+                            if row(ui, regular::TEXT_OUTDENT, "Unindent list", false) {
+                                action = Some(EditorAction::UnindentList);
                             }
                         }
                         SubMenu::Insert => {
@@ -572,6 +582,13 @@ pub fn apply_text_action(
             Some(wrap_selection(text, primary, secondary, before, after))
         }
         EditorAction::ToggleComments => Some(toggle_comments(text, primary, secondary)),
+        EditorAction::IndentList | EditorAction::UnindentList => {
+            let deeper = matches!(action, EditorAction::IndentList);
+            let (next, new_p, new_s) =
+                crate::preview::adjust_list_indent_in_range(text, primary, secondary, deeper)?;
+            *text = next;
+            Some(if primary <= secondary { new_p } else { new_s })
+        }
         EditorAction::SetLinePrefix(prefix) => Some(set_prefix_at_char(text, primary, prefix)),
         EditorAction::InsertSnippet(snippet) => Some(insert_at(text, primary, secondary, snippet)),
         EditorAction::Footnote => Some(insert_footnote(text, primary, secondary)),

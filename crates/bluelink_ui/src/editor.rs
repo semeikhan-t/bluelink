@@ -985,6 +985,7 @@ pub fn show_live(
                             });
 
                         // egui only inserts Tab in multiline — handle it for the live line.
+                        // ponytail: Live has no multi-line selection; Source applies per list line in the range.
                         let tab_pressed = focused
                             && ui.input(|inp| {
                                 inp.key_pressed(Key::Tab)
@@ -993,11 +994,30 @@ pub fn show_live(
                             });
                         if tab_pressed && splice.is_none() {
                             let unindent = ui.input(|inp| inp.modifiers.shift);
-                            if unindent {
+                            let mut applied = false;
+                            if preview::is_list_line(&draft) {
+                                if unindent {
+                                    if let Some(next) = preview::unindent_list_line(&draft) {
+                                        let n = draft.chars().count() - next.chars().count();
+                                        draft = next;
+                                        primary = primary.saturating_sub(n);
+                                        secondary = secondary.saturating_sub(n);
+                                        applied = true;
+                                    }
+                                } else {
+                                    draft = preview::indent_list_line(&draft);
+                                    let n = preview::LIST_INDENT.chars().count();
+                                    primary += n;
+                                    secondary += n;
+                                    applied = true;
+                                }
+                            } else if unindent {
                                 let (p, s) = unindent_line(&mut draft, primary, secondary);
                                 primary = p;
                                 secondary = s;
+                                applied = true;
                             } else {
+                                // Non-list (paragraph or fence): insert a literal tab.
                                 let lo = primary.min(secondary);
                                 let hi = primary.max(secondary);
                                 let b0 = editor_menu::char_to_byte(&draft, lo);
@@ -1005,11 +1025,14 @@ pub fn show_live(
                                 draft.replace_range(b0..b1, "\t");
                                 primary = lo + 1;
                                 secondary = primary;
+                                applied = true;
                             }
-                            splice = Some((start, end, draft.clone()));
-                            ui.ctx().data_mut(|d| {
-                                d.insert_temp(egui::Id::new(("live_cursor", i)), primary);
-                            });
+                            if applied {
+                                splice = Some((start, end, draft.clone()));
+                                ui.ctx().data_mut(|d| {
+                                    d.insert_temp(egui::Id::new(("live_cursor", i)), primary);
+                                });
+                            }
                         }
 
                         // Format shortcuts when the line field has focus (not S/P/Z/F/A/W/T/G).
@@ -1700,6 +1723,36 @@ fn show_doc_edit(
 
     boost_note_scroll(ui);
 
+    // Steal Tab before multiline TextEdit inserts `\t` into a list line.
+    let mut pending_list_tab: Option<(bool, usize, usize)> = None;
+    let source_focused = ui.memory(|m| m.has_focus(id));
+    if source_focused {
+        let (p, s) = egui::text_edit::TextEditState::load(ui.ctx(), id)
+            .and_then(|st| st.cursor.char_range())
+            .map(|r| (r.primary.index, r.secondary.index))
+            .unwrap_or_else(|| {
+                let n = buffer.chars().count();
+                (n, n)
+            });
+        let wants_tab = ui.input(|inp| {
+            inp.key_pressed(Key::Tab) && !inp.modifiers.command && !inp.modifiers.alt
+        });
+        if wants_tab {
+            let deeper = !ui.input(|inp| inp.modifiers.shift);
+            if preview::adjust_list_indent_in_range(buffer, p, s, deeper).is_some() {
+                let mods = if deeper {
+                    egui::Modifiers::NONE
+                } else {
+                    egui::Modifiers::SHIFT
+                };
+                ui.input_mut(|i| {
+                    i.consume_key(mods, Key::Tab);
+                });
+                pending_list_tab = Some((deeper, p, s));
+            }
+        }
+    }
+
     let mut caret_primary = 0usize;
     let mut caret_secondary = 0usize;
     let mut focused = false;
@@ -1812,6 +1865,22 @@ fn show_doc_edit(
             state
                 .cursor
                 .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
+            state.store(ui.ctx(), id);
+            history.begin_burst(buffer);
+            result.changed = true;
+        }
+    }
+
+    if let Some((deeper, p, s)) = pending_list_tab {
+        if let Some((next, new_p, new_s)) = preview::adjust_list_indent_in_range(buffer, p, s, deeper)
+        {
+            history.checkpoint(buffer);
+            *buffer = next;
+            let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+            state.cursor.set_char_range(Some(CCursorRange::two(
+                CCursor::new(new_p),
+                CCursor::new(new_s),
+            )));
             state.store(ui.ctx(), id);
             history.begin_burst(buffer);
             result.changed = true;

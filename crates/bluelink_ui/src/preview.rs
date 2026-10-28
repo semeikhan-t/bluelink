@@ -433,6 +433,120 @@ fn is_quote_line(line: &str) -> bool {
     line.trim_start().starts_with('>')
 }
 
+/// One list indent level (Markdown-typical two spaces).
+pub const LIST_INDENT: &str = "  ";
+
+/// Bullet, numbered, or checklist line — same markers Enter continues, excluding quotes.
+pub fn is_list_line(line: &str) -> bool {
+    if parse_checklist(line).is_some() {
+        return true;
+    }
+    let trimmed = line.trim_start();
+    trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || numbered_list_rest(trimmed).is_some()
+}
+
+/// Prepend one [`LIST_INDENT`] level.
+pub fn indent_list_line(line: &str) -> String {
+    format!("{LIST_INDENT}{line}")
+}
+
+/// Remove one leading indent level (`\\t`, 4 spaces, or 2 spaces).
+pub fn unindent_list_line(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix('\t') {
+        return Some(rest.to_string());
+    }
+    if let Some(rest) = line.strip_prefix("    ") {
+        return Some(rest.to_string());
+    }
+    if let Some(rest) = line.strip_prefix(LIST_INDENT) {
+        return Some(rest.to_string());
+    }
+    None
+}
+
+/// Indent or unindent list lines that intersect the char range. Non-list lines
+/// are left alone. `None` when nothing changes.
+pub fn adjust_list_indent_in_range(
+    text: &str,
+    primary: usize,
+    secondary: usize,
+    indent: bool,
+) -> Option<(String, usize, usize)> {
+    let sel_lo = primary.min(secondary);
+    let sel_hi = primary.max(secondary);
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut orig_char = 0usize;
+    let mut new_lo = sel_lo as i32;
+    let mut new_hi = sel_hi as i32;
+    let mut changed = false;
+
+    for piece in text.split_inclusive('\n') {
+        let (line, has_nl) = match piece.strip_suffix('\n') {
+            Some(body) => (body, true),
+            None => (piece, false),
+        };
+        let line_len = line.chars().count();
+        let line_start = orig_char;
+        let line_content_end = orig_char + line_len;
+        let line_span_end = line_content_end + usize::from(has_nl);
+
+        let on_line = if sel_lo == sel_hi {
+            if has_nl {
+                sel_lo >= line_start && sel_lo < line_span_end
+            } else {
+                sel_lo >= line_start && sel_lo <= line_content_end
+            }
+        } else {
+            sel_lo < line_span_end && sel_hi > line_start
+        };
+
+        let next_line = if on_line && is_list_line(line) {
+            if indent {
+                Some(indent_list_line(line))
+            } else {
+                unindent_list_line(line)
+            }
+        } else {
+            None
+        };
+
+        match next_line {
+            Some(ref new_line) if new_line.as_str() != line => {
+                changed = true;
+                let delta = new_line.chars().count() as i32 - line_len as i32;
+                // Keep an anchor at line_start so a whole-line selection still
+                // covers the new leading indent; carets inside the line move.
+                if sel_lo > line_start {
+                    new_lo += delta;
+                }
+                if sel_hi > line_start {
+                    new_hi += delta;
+                }
+                out.push_str(new_line);
+            }
+            _ => out.push_str(line),
+        }
+        if has_nl {
+            out.push('\n');
+        }
+        orig_char = line_span_end;
+    }
+
+    if !changed {
+        return None;
+    }
+    let new_lo = new_lo.max(0) as usize;
+    let new_hi = new_hi.max(0) as usize;
+    let (np, ns) = if primary <= secondary {
+        (new_lo, new_hi)
+    } else {
+        (new_hi, new_lo)
+    };
+    Some((out, np, ns))
+}
+
 /// List / checklist marker to continue on Enter. Empty body → clear instead.
 pub fn continue_list_marker(line: &str) -> Option<ListContinue> {
     let trimmed = line.trim_start();
@@ -1912,5 +2026,29 @@ mod fence_tests {
         let c = continue_list_marker("- item").unwrap();
         assert!(!c.empty_body);
         assert_eq!(c.next_prefix, "- ");
+    }
+
+    #[test]
+    fn list_line_predicate_and_indent() {
+        assert!(is_list_line("- a"));
+        assert!(is_list_line("* a"));
+        assert!(is_list_line("1. a"));
+        assert!(is_list_line("- [ ] a"));
+        assert!(is_list_line("  - nested"));
+        assert!(!is_list_line("text"));
+        assert!(!is_list_line("> q"));
+
+        assert_eq!(indent_list_line("- a"), "  - a");
+        assert_eq!(unindent_list_line("  - a").as_deref(), Some("- a"));
+        assert_eq!(unindent_list_line("- a"), None);
+        assert_eq!(indent_list_line("3. x"), "  3. x");
+        assert!(indent_list_line("3. x").contains("3. "));
+
+        let text = "- a\nplain\n- b\n";
+        let (next, lo, hi) = adjust_list_indent_in_range(text, 0, text.chars().count(), true).unwrap();
+        assert_eq!(next, "  - a\nplain\n  - b\n");
+        assert_eq!((lo, hi), (0, text.chars().count() + 4));
+        let (back, _, _) = adjust_list_indent_in_range(&next, 0, next.chars().count(), false).unwrap();
+        assert_eq!(back, text);
     }
 }
