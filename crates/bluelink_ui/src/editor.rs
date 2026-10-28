@@ -584,6 +584,7 @@ pub fn show_live(
     readonly: bool,
     scroll_to_line: Option<usize>,
     history: &mut NoteHistory,
+    props_folded: &mut bool,
 ) -> LiveResult {
     let mut result = LiveResult {
         changed: false,
@@ -700,6 +701,7 @@ pub fn show_live(
             view_mode,
             active_line,
             history,
+            props_folded,
             result,
         );
     }
@@ -790,6 +792,12 @@ pub fn show_live(
             fold::unfold_containing(&mut folds, &regions, target);
         }
         let mut hidden = fold::hidden(fold_lines.len(), &regions, &folds);
+        // Closed YAML frontmatter is edited in the Properties panel — hide fence lines here.
+        if let Some(n) = bluelink_core::frontmatter_line_count(buffer) {
+            for i in 0..n.min(hidden.len()) {
+                hidden[i] = true;
+            }
+        }
         for (i, tail) in preview::collapsed_callout_tails(&fold_lines)
             .into_iter()
             .enumerate()
@@ -1554,6 +1562,9 @@ pub fn show_live(
                         result.changed = true;
                     }
                 }
+                EditorAction::ToggleFoldProperties => {
+                    *props_folded = !*props_folded;
+                }
                 EditorAction::ToggleReading => {
                     history.end_burst(buffer);
                     *view_mode = view_mode.toggle_reading();
@@ -1773,6 +1784,7 @@ fn show_doc_edit(
     view_mode: &mut ViewMode,
     active_line: &mut Option<usize>,
     history: &mut NoteHistory,
+    props_folded: &mut bool,
     mut result: LiveResult,
 ) -> LiveResult {
     if ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -2001,6 +2013,9 @@ fn show_doc_edit(
                     result.changed = true;
                 }
                 ui.ctx().data_mut(|d| d.insert_temp(fold_key, folds));
+            }
+            EditorAction::ToggleFoldProperties => {
+                *props_folded = !*props_folded;
             }
             EditorAction::ToggleReading => {
                 history.end_burst(buffer);

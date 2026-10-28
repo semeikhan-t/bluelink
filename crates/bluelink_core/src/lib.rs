@@ -9,7 +9,10 @@ mod vault;
 mod wiki;
 
 pub use error::VaultError;
-pub use frontmatter::{parse_frontmatter, write_frontmatter};
+pub use frontmatter::{
+    frontmatter_line_count, frontmatter_raw_yaml, parse_frontmatter, splice_frontmatter_yaml,
+    write_frontmatter,
+};
 pub use markdown::{
     parse_embed_size, parse_preview, split_wikilinks, PreviewBlock, PreviewDoc, Span,
 };

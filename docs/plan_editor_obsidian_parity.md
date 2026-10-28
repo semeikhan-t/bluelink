@@ -677,7 +677,7 @@ Live-редактор; жирный / курсив / код / зачёркива
 | 5 | Callout types + fold | Done |
 | 6 | List indent | Done |
 | 7 | Footnotes advanced | Done |
-| 8 | Properties block | Todo |
+| 8 | Properties block | Done |
 | 9 | Mermaid | Todo |
 | 10 | Menu / table / highlight polish | Todo |
 | 11 | Acceptance | Todo |

@@ -1,31 +1,81 @@
+/// Byte span of a closed YAML frontmatter fence, if present.
+///
+/// `yaml` is the interior between opening and closing `---` (may be empty).
+/// `body` is everything after the closing fence line.
+/// `line_count` includes both fence lines.
+fn frontmatter_span(content: &str) -> Option<FrontmatterSpan<'_>> {
+    let mut iter = content.split_inclusive('\n');
+    let first = iter.next()?;
+    if first.trim_end_matches(['\r', '\n']) != "---" {
+        return None;
+    }
+
+    let yaml_start = first.len();
+    let mut yaml_end = yaml_start;
+    let mut body_start = first.len();
+    let mut line_count = 1_usize;
+    let mut closed = false;
+    for line in iter {
+        body_start += line.len();
+        line_count += 1;
+        if line.trim_end_matches(['\r', '\n']) == "---" {
+            closed = true;
+            break;
+        }
+        yaml_end = body_start;
+    }
+    if !closed {
+        return None;
+    }
+    Some(FrontmatterSpan {
+        yaml: &content[yaml_start..yaml_end],
+        body: &content[body_start..],
+        line_count,
+    })
+}
+
+struct FrontmatterSpan<'a> {
+    yaml: &'a str,
+    body: &'a str,
+    line_count: usize,
+}
+
 /// Split note text into YAML frontmatter fields and the body that follows.
 ///
 /// Expects an opening `---` on the first line and a closing `---` on its own line.
 /// No fence → empty fields and the original `content` as body.
 pub fn parse_frontmatter(content: &str) -> (Vec<(String, String)>, &str) {
-    let mut iter = content.split_inclusive('\n');
-    let Some(first) = iter.next() else {
-        return (Vec::new(), content);
-    };
-    if first.trim_end_matches(['\r', '\n']) != "---" {
-        return (Vec::new(), content);
+    match frontmatter_span(content) {
+        Some(span) => (parse_yaml_fields(span.yaml), span.body),
+        None => (Vec::new(), content),
     }
+}
 
-    let mut yaml = String::new();
-    let mut body_start = first.len();
-    let mut closed = false;
-    for line in iter {
-        body_start += line.len();
-        if line.trim_end_matches(['\r', '\n']) == "---" {
-            closed = true;
-            break;
-        }
-        yaml.push_str(line);
+/// Number of lines occupied by a closed frontmatter fence (`---` … `---`), if any.
+pub fn frontmatter_line_count(content: &str) -> Option<usize> {
+    frontmatter_span(content).map(|s| s.line_count)
+}
+
+/// Raw YAML interior between the opening and closing `---` fences, if closed.
+pub fn frontmatter_raw_yaml(content: &str) -> Option<&str> {
+    frontmatter_span(content).map(|s| s.yaml)
+}
+
+/// Rebuild a note from raw YAML interior + body (no leading/trailing fence in `yaml`).
+///
+/// Empty / whitespace-only `yaml` → `body` unchanged (no fence), matching [`write_frontmatter`].
+pub fn splice_frontmatter_yaml(yaml: &str, body: &str) -> String {
+    if yaml.trim().is_empty() {
+        return body.to_string();
     }
-    if !closed {
-        return (Vec::new(), content);
+    let mut out = String::from("---\n");
+    out.push_str(yaml.trim_start_matches(['\r', '\n']));
+    if !out.ends_with('\n') {
+        out.push('\n');
     }
-    (parse_yaml_fields(&yaml), &content[body_start..])
+    out.push_str("---\n");
+    out.push_str(body);
+    out
 }
 
 /// Serialize fields as a frontmatter block and append `body`.
@@ -189,5 +239,28 @@ mod tests {
         let (fields, body) = parse_frontmatter(src);
         assert!(fields.is_empty());
         assert_eq!(body, src);
+        assert_eq!(frontmatter_line_count(src), None);
+        assert_eq!(frontmatter_raw_yaml(src), None);
+    }
+
+    #[test]
+    fn line_count_and_raw_yaml() {
+        let src = "---\ntitle: Hello\naliases:\n  - a\n---\nbody\n";
+        assert_eq!(frontmatter_line_count(src), Some(5));
+        assert_eq!(
+            frontmatter_raw_yaml(src),
+            Some("title: Hello\naliases:\n  - a\n")
+        );
+        assert_eq!(frontmatter_line_count("# no fm\n"), None);
+    }
+
+    #[test]
+    fn splice_raw_yaml_roundtrip() {
+        let src = "---\ntitle: Hello\n---\nbody text\n";
+        let yaml = frontmatter_raw_yaml(src).unwrap();
+        let body = parse_frontmatter(src).1;
+        let out = splice_frontmatter_yaml(yaml, body);
+        assert_eq!(out, src);
+        assert_eq!(splice_frontmatter_yaml("  \n", "only body\n"), "only body\n");
     }
 }

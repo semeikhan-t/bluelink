@@ -173,6 +173,10 @@ pub struct App {
     outline_renaming: Option<outline::OutlineRename>,
     /// Group property-panel keystrokes into one NoteHistory checkpoint.
     props_burst: bool,
+    /// Session fold for the Properties strip (does not rewrite YAML).
+    props_folded: bool,
+    /// Pretty fields vs raw YAML interior in the Properties strip.
+    props_view: properties_panel::PropertiesView,
 }
 
 impl App {
@@ -226,6 +230,8 @@ impl App {
             find_bar: FindBar::default(),
             outline_renaming: None,
             props_burst: false,
+            props_folded: false,
+            props_view: properties_panel::PropertiesView::Pretty,
         };
 
         // --vault wins; otherwise reopen last known vault.
@@ -288,6 +294,8 @@ impl App {
                 self.find_bar = FindBar::default();
                 self.outline_renaming = None;
                 self.props_burst = false;
+                self.props_folded = false;
+                self.props_view = properties_panel::PropertiesView::Pretty;
                 self.recent.clear();
                 self.selected = None;
                 self.buffer.clear();
@@ -327,6 +335,8 @@ impl App {
         self.find_bar = FindBar::default();
         self.outline_renaming = None;
         self.props_burst = false;
+        self.props_folded = false;
+        self.props_view = properties_panel::PropertiesView::Pretty;
         self.recent.clear();
         self.selected = None;
         self.buffer.clear();
@@ -644,6 +654,8 @@ impl App {
                 self.scroll_to_line = None;
                 self.outline_renaming = None;
                 self.props_burst = false;
+                self.props_folded = false;
+                self.props_view = properties_panel::PropertiesView::Pretty;
                 self.find_bar.cursor = 0;
                 self.selected = Some(rel_path.to_string());
                 self.acked_external_sha = None;
@@ -2681,10 +2693,17 @@ impl eframe::App for App {
                 ui.add_space(6.0);
             }
 
-            {
+            // Source edits YAML in the full buffer — hide the strip to avoid dual edit.
+            if self.view_mode != editor::ViewMode::Source {
                 let props_locked =
                     self.readonly || self.view_mode == editor::ViewMode::Reading;
-                let props = properties_panel::show(ui, &self.buffer, props_locked);
+                let props = properties_panel::show(
+                    ui,
+                    &self.buffer,
+                    props_locked,
+                    &mut self.props_folded,
+                    &mut self.props_view,
+                );
                 if let Some(next) = props.rewritten {
                     if next != self.buffer {
                         if !self.props_burst {
@@ -2719,6 +2738,7 @@ impl eframe::App for App {
                     self.readonly,
                     scroll_to,
                     &mut self.note_history,
+                    &mut self.props_folded,
                 );
                 if live.changed {
                     self.dirty = true;

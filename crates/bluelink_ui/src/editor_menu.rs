@@ -32,6 +32,8 @@ pub enum EditorAction {
     FoldLess,
     FoldAll,
     UnfoldAll,
+    /// Collapse / expand the Properties strip (session-only; YAML unchanged).
+    ToggleFoldProperties,
     /// Host toggles [`crate::editor::ViewMode::Reading`].
     ToggleReading,
     /// Host toggles [`crate::editor::ViewMode::Source`].
@@ -288,6 +290,10 @@ pub fn show_popup(ctx: &egui::Context) -> Option<(CtxMenu, EditorAction)> {
                             }
                             if row(ui, regular::CARET_DOUBLE_DOWN, "Unfold all", false) {
                                 action = Some(EditorAction::UnfoldAll);
+                            }
+                            ui.separator();
+                            if row(ui, regular::SIDEBAR, "Fold properties", false) {
+                                action = Some(EditorAction::ToggleFoldProperties);
                             }
                         }
                         SubMenu::View => {
@@ -601,6 +607,7 @@ pub fn apply_text_action(
         | EditorAction::FoldLess
         | EditorAction::FoldAll
         | EditorAction::UnfoldAll
+        | EditorAction::ToggleFoldProperties
         | EditorAction::ToggleReading
         | EditorAction::ToggleSource => None,
     }
