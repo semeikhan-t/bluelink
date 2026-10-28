@@ -3,12 +3,13 @@
   <h1>BlueLink</h1>
   <p>Own your Markdown notes on Linux with a native local-first editor; encrypted Bluetooth LE sync is in progress.</p>
 
-  <!-- Badges: License | Stars | Release | CI Status | Contributors -->
+  <!-- Badges: License | Stars | Release | CI Status | Contributors | Platform -->
   <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/semeikhan-t/bluelink?style=flat-square" /></a>
   <a href="https://github.com/semeikhan-t/bluelink/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/semeikhan-t/bluelink?style=flat-square" /></a>
   <a href="https://github.com/semeikhan-t/bluelink/releases"><img alt="Release: pre-alpha" src="https://img.shields.io/badge/release-pre--alpha-2563eb?style=flat-square" /></a>
   <a href="https://github.com/semeikhan-t/bluelink/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/semeikhan-t/bluelink/actions/workflows/ci.yml/badge.svg" /></a>
   <a href="https://github.com/semeikhan-t/bluelink/graphs/contributors"><img alt="Contributors" src="https://img.shields.io/github/contributors/semeikhan-t/bluelink?style=flat-square" /></a>
+  <img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux-0f172a?style=flat-square&logo=linux&logoColor=white" />
 
   <br /><br />
 
@@ -27,7 +28,7 @@
 > [!IMPORTANT]
 > BlueLink is pre-alpha software. The Linux editor, vault engine, secure sync protocol, TCP demo, and BlueZ BLE host are implemented. A production Android BLE client and packaged releases are still on the roadmap.
 
-## Why BlueLink?
+## What is BlueLink?
 
 Your notes should remain useful even if an account disappears, a subscription changes, or a sync service is unavailable. BlueLink keeps the source of truth in an ordinary folder of Markdown files, so the vault can be searched, backed up, versioned, or opened with other compatible tools.
 
