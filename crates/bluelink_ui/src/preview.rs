@@ -83,6 +83,8 @@ pub enum LineClick {
     ToggleCheck,
     /// Host should open quick-switcher with this tag text (`#tag` without `#`).
     Tag { query: String },
+    /// Jump to the definition of `[^id]`.
+    Footnote { id: String },
     /// Drag-resize finished: rewrite `![[target|…]]` size in the source buffer.
     ResizeEmbed {
         target: String,
@@ -957,6 +959,8 @@ fn merge_click(a: LineClick, b: LineClick) -> LineClick {
         (LineClick::ToggleCheck, _) => a,
         (_, LineClick::Tag { .. }) => b,
         (LineClick::Tag { .. }, _) => a,
+        (_, LineClick::Footnote { .. }) => b,
+        (LineClick::Footnote { .. }, _) => a,
         (_, LineClick::Wiki { .. }) => b,
         (LineClick::Wiki { .. }, _) => a,
         (_, LineClick::Edit) => b,
@@ -1397,8 +1401,53 @@ fn embed_draw_width(ui: &Ui, width: Option<u32>) -> f32 {
     }
 }
 
-/// Split plain text on `#tags` (Obsidian-style: `#` + non-space run).
+/// Split plain text on footnotes (`^[…]`, `[^id]`) then `#tags`.
 fn render_text_chunks(ui: &mut Ui, text: &str, size: f32, heading: bool, level: u8) -> LineClick {
+    let mut click = LineClick::None;
+    for piece in crate::footnote::split_inline_footnotes(text) {
+        match piece {
+            crate::footnote::InlinePiece::Text(chunk) => {
+                click = merge_click(click, render_tag_chunks(ui, chunk, size, heading, level));
+            }
+            crate::footnote::InlinePiece::Inline { text: inner } => {
+                let resp = ui
+                    .add(
+                        egui::Label::new(
+                            RichText::new("*")
+                                .size(size * 0.85)
+                                .color(theme::ACCENT),
+                        )
+                        .sense(Sense::click()),
+                    )
+                    .on_hover_text(inner)
+                    .on_hover_cursor(CursorIcon::Help);
+                if resp.clicked() {
+                    click = merge_click(click, LineClick::Edit);
+                }
+            }
+            crate::footnote::InlinePiece::Ref { id } => {
+                let resp = ui
+                    .add(
+                        egui::Label::new(
+                            RichText::new(format!("[^{id}]"))
+                                .size(size * 0.85)
+                                .color(theme::ACCENT),
+                        )
+                        .sense(Sense::click()),
+                    )
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text(format!("Go to [^{id}]"));
+                if resp.clicked() {
+                    click = LineClick::Footnote { id: id.to_string() };
+                }
+            }
+        }
+    }
+    click
+}
+
+/// Split plain text on `#tags` (Obsidian-style: `#` + non-space run).
+fn render_tag_chunks(ui: &mut Ui, text: &str, size: f32, heading: bool, level: u8) -> LineClick {
     let mut click = LineClick::None;
     let mut rest = text;
     while !rest.is_empty() {
@@ -1413,7 +1462,6 @@ fn render_text_chunks(ui: &mut Ui, text: &str, size: f32, heading: bool, level: 
             );
             rest = &rest[hash_at..];
         }
-        // Tag: # then letters/digits/_/-//
         let after = &rest[1..];
         let tag_len = after
             .chars()
@@ -1424,7 +1472,6 @@ fn render_text_chunks(ui: &mut Ui, text: &str, size: f32, heading: bool, level: 
             rest = after;
             continue;
         }
-        // Don't treat heading markers or mid-word `#` as tags.
         let tag = &after[..tag_len];
         let resp = ui
             .add(

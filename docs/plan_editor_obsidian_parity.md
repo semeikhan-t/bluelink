@@ -676,7 +676,7 @@ Live-редактор; жирный / курсив / код / зачёркива
 | 4 | Deep links / section embeds | Todo |
 | 5 | Callout types + fold | Done |
 | 6 | List indent | Done |
-| 7 | Footnotes advanced | Todo |
+| 7 | Footnotes advanced | Done |
 | 8 | Properties block | Todo |
 | 9 | Mermaid | Todo |
 | 10 | Menu / table / highlight polish | Todo |

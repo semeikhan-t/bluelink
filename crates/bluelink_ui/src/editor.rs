@@ -320,6 +320,7 @@ fn paint_structured_row(
     math_spans: &[math_block::MathSpan],
     table_places: &[Place],
     callout_places: &[preview::CalloutPlace],
+    footnote_places: &[footnote::FootnotePlace],
     ranges: &[(usize, usize)],
     active_line: Option<usize>,
     readonly: bool,
@@ -327,30 +328,74 @@ fn paint_structured_row(
     table_edit: &mut Option<(usize, usize, String)>,
     request_active: &mut Option<usize>,
     leave_edit: &mut bool,
-    erase_footnote: &mut Option<(u32, usize, usize)>,
+    erase_footnote: &mut Option<(String, usize, usize)>,
+    footnote_jump: &mut Option<usize>,
 ) -> Option<PaintedRow> {
-    if let Some((n, mut body)) = footnote::parse_def(line) {
-        // The field is only for typing. After Enter the line is a normal preview.
-        let editing = !readonly && active_line == Some(i);
-        if !editing {
-            return None;
+    let _ = end;
+    match footnote_places
+        .get(i)
+        .copied()
+        .unwrap_or(footnote::FootnotePlace::None)
+    {
+        footnote::FootnotePlace::Tail { .. } => {
+            return Some(PaintedRow {
+                height: 0.0,
+                skip_gap: true,
+            });
         }
-        let want = take_line_focus(ui, i);
-        let top = ui.cursor().top();
-        let field = footnote::show_field(ui, n, &mut body, want, true);
-        if field.erase {
-            *erase_footnote = Some((n, start, end));
-        } else if field.changed {
-            *splice = Some((start, end, footnote::format_def(n, &body)));
+        footnote::FootnotePlace::Head { end: block_end } => {
+            let block = &lines[i..block_end];
+            let Some((id, mut body)) = footnote::parse_block(block) else {
+                return Some(PaintedRow {
+                    height: 0.0,
+                    skip_gap: true,
+                });
+            };
+            let block_end_byte = ranges
+                .get(block_end.saturating_sub(1))
+                .map(|&(_, e)| e)
+                .unwrap_or(start);
+            let editing = !readonly
+                && active_line.is_some_and(|a| (i..block_end).contains(&a));
+            let top = ui.cursor().top();
+            if editing {
+                let want = take_line_focus(ui, i);
+                let field = footnote::show_field(ui, &id, &mut body, want, true);
+                if field.erase {
+                    *erase_footnote = Some((id.clone(), start, block_end_byte));
+                } else if field.changed {
+                    *splice = Some((start, block_end_byte, footnote::format_block(&id, &body)));
+                }
+                if field.commit {
+                    *leave_edit = true;
+                }
+                if field.jump_to_marker {
+                    if let Some(line) = footnote::first_marker_line(&lines.join("\n"), &id) {
+                        *footnote_jump = Some(line);
+                        *request_active = Some(line);
+                    }
+                }
+            } else {
+                match footnote::paint_preview(ui, &id, &body) {
+                    footnote::PreviewHit::Marker => {
+                        if let Some(line) = footnote::first_marker_line(&lines.join("\n"), &id) {
+                            *footnote_jump = Some(line);
+                            *request_active = Some(line);
+                        }
+                    }
+                    footnote::PreviewHit::Body if !readonly => {
+                        *request_active = Some(i);
+                    }
+                    _ => {}
+                }
+            }
+            let height = (ui.cursor().top() - top).max(28.0);
+            return Some(PaintedRow {
+                height,
+                skip_gap: false,
+            });
         }
-        if field.commit {
-            *leave_edit = true;
-        }
-        let height = (ui.cursor().top() - top).max(28.0);
-        return Some(PaintedRow {
-            height,
-            skip_gap: false,
-        });
+        footnote::FootnotePlace::None => {}
     }
 
     match table_places.get(i).copied().unwrap_or(Place::None) {
@@ -549,6 +594,12 @@ pub fn show_live(
         tag_query: None,
     };
 
+    // Footnote marker/def clicks queue a scroll for the next frame.
+    let scroll_to_line = scroll_to_line.or_else(|| {
+        ui.ctx()
+            .data_mut(|d| d.remove_temp::<usize>(Id::new("live_footnote_jump")))
+    });
+
     // Disk-locked notes cannot enter Source (no typing). Reading still works.
     if readonly && *view_mode == ViewMode::Source {
         *view_mode = ViewMode::Live;
@@ -687,7 +738,8 @@ pub fn show_live(
     // After inserting a completed `[[link]]`, show it as preview (clickable).
     let mut leave_edit_after_wiki = false;
     let mut request_select_all = false;
-    let mut erase_footnote: Option<(u32, usize, usize)> = None;
+    let mut erase_footnote: Option<(String, usize, usize)> = None;
+    let mut footnote_jump: Option<usize> = None;
     let mut pending_clipboard = PendingClipboard::None;
     // Active line + char selection (primary, secondary) for Shift+↑/↓.
     let mut active_sel: Option<(usize, usize, usize)> = None;
@@ -851,6 +903,7 @@ pub fn show_live(
                 let math_spans = math_block::spans(&lines, &fence_roles);
                 let table_places = table::places(&lines);
                 let callout_places = preview::callout_places(&lines);
+                let footnote_places = footnote::places(&lines);
                 if let Some(i) = *active_line {
                     active_in_math = math_spans
                         .get(i)
@@ -893,6 +946,7 @@ pub fn show_live(
                         &math_spans,
                         &table_places,
                         &callout_places,
+                        &footnote_places,
                         &ranges,
                         *active_line,
                         !can_edit,
@@ -901,6 +955,7 @@ pub fn show_live(
                         &mut request_active,
                         &mut leave_edit_after_wiki,
                         &mut erase_footnote,
+                        &mut footnote_jump,
                     ) {
                         layout.lines[i].height = painted.height;
                         if !painted.skip_gap {
@@ -1248,6 +1303,12 @@ pub fn show_live(
                             }
                             preview::LineClick::Tag { query } => {
                                 result.tag_query = Some(query);
+                            }
+                            preview::LineClick::Footnote { id } => {
+                                if let Some(line) = footnote::def_line(buffer, &id) {
+                                    footnote_jump = Some(line);
+                                    request_active = Some(line);
+                                }
                             }
                             preview::LineClick::ToggleCheck if can_edit => {
                                 if let Some(next) = preview::toggle_checklist_line(line) {
@@ -1627,10 +1688,15 @@ pub fn show_live(
         history.checkpoint(buffer);
     }
 
-    if let Some((n, start, end)) = erase_footnote {
+    if let Some(line) = footnote_jump {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(Id::new("live_footnote_jump"), line));
+    }
+
+    if let Some((id, start, end)) = erase_footnote {
         let at = line_index_at(&ranges, start);
         let breaks_before = buffer.matches('\n').count() as i32;
-        let caret = footnote::erase(buffer, n, start, end);
+        let caret = footnote::erase(buffer, &id, start, end);
         let delta = buffer.matches('\n').count() as i32 - breaks_before;
         fold::shift_lines(&mut folds, at, delta);
         let (line, col) = caret_line_col(buffer, caret);
