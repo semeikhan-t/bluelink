@@ -15,6 +15,7 @@ use crate::editor_menu::{self, EditorAction};
 use crate::fold;
 use crate::footnote;
 use crate::math_block::{self, MathRole};
+use crate::mermaid::{self, MermaidRole};
 use crate::media;
 use crate::note_history::NoteHistory;
 use crate::preview;
@@ -308,7 +309,7 @@ fn take_line_focus(ui: &Ui, line: usize) -> bool {
     })
 }
 
-/// Footnote field, visual table, callout, or a resting math block.
+/// Footnote field, visual table, callout, mermaid, or a resting math block.
 /// `None` means this row is still a normal Markdown line.
 fn paint_structured_row(
     ui: &mut Ui,
@@ -318,6 +319,7 @@ fn paint_structured_row(
     line: &str,
     lines: &[String],
     math_spans: &[math_block::MathSpan],
+    mermaid_spans: &[mermaid::MermaidSpan],
     table_places: &[Place],
     callout_places: &[preview::CalloutPlace],
     footnote_places: &[footnote::FootnotePlace],
@@ -479,6 +481,36 @@ fn paint_structured_row(
             }
         }
         preview::CalloutPlace::None => {}
+    }
+
+    if let Some(span) = mermaid_spans.get(i).copied() {
+        if span.role != MermaidRole::Outside {
+            if active_line.is_some_and(|a| span.contains(a)) {
+                return None;
+            }
+            if span.role != MermaidRole::Open {
+                return Some(PaintedRow {
+                    height: 0.0,
+                    skip_gap: true,
+                });
+            }
+            let top = ui.cursor().top();
+            let (_, clicked) = mermaid::show_preview(ui, &mermaid::source(lines, span));
+            if clicked && !readonly {
+                let body = mermaid::body_line(span);
+                let col = lines.get(body).map(|s| s.chars().count()).unwrap_or(0);
+                *request_active = Some(body);
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(egui::Id::new(("live_focus", body)), true);
+                    d.insert_temp(egui::Id::new(("live_cursor", body)), col);
+                });
+            }
+            let height = (ui.cursor().top() - top).max(28.0);
+            return Some(PaintedRow {
+                height,
+                skip_gap: false,
+            });
+        }
     }
 
     let Some(span) = math_spans.get(i).copied() else {
@@ -734,6 +766,7 @@ pub fn show_live(
     let mut splice: Option<(usize, usize, String)> = None;
     let mut table_edit: Option<(usize, usize, String)> = None;
     let mut active_in_math = false;
+    let mut active_in_mermaid = false;
     // Split active line at cursor: (start, end, left, right).
     let mut split_at_cursor: Option<(usize, usize, String, String)> = None;
     let mut merge_with_prev: Option<usize> = None;
@@ -909,6 +942,7 @@ pub fn show_live(
                     .map(|&(s, e)| buffer.get(s..e).unwrap_or("").to_string())
                     .collect();
                 let math_spans = math_block::spans(&lines, &fence_roles);
+                let mermaid_spans = mermaid::spans(&lines, &fence_roles, &fence_langs);
                 let table_places = table::places(&lines);
                 let callout_places = preview::callout_places(&lines);
                 let footnote_places = footnote::places(&lines);
@@ -916,6 +950,9 @@ pub fn show_live(
                     active_in_math = math_spans
                         .get(i)
                         .is_some_and(|span| span.role != MathRole::Outside);
+                    active_in_mermaid = mermaid_spans
+                        .get(i)
+                        .is_some_and(|span| span.role != MermaidRole::Outside);
                 }
 
             let mut fold_clicked: Option<usize> = None;
@@ -952,6 +989,7 @@ pub fn show_live(
                         line,
                         &lines,
                         &math_spans,
+                        &mermaid_spans,
                         &table_places,
                         &callout_places,
                         &footnote_places,
@@ -1351,6 +1389,13 @@ pub fn show_live(
                             math_block::show_preview(ui, &math_block::formula(&lines, span), false);
                         measured_h += extra;
                     }
+                    let mspan = mermaid_spans[i];
+                    let editing_mermaid = active_line.is_some_and(|a| mspan.contains(a));
+                    if editing_mermaid && mspan.role == MermaidRole::Close {
+                        let (extra, _) =
+                            mermaid::show_preview(ui, &mermaid::source(&lines, mspan));
+                        measured_h += extra;
+                    }
 
                     layout.lines[i].height = measured_h;
                     let gap = gap_after_row(i, n, fence_role);
@@ -1611,7 +1656,11 @@ pub fn show_live(
                 }
             }
             let esc = ui.input(|i| i.key_pressed(Key::Escape));
-            if esc && !menu_was_open && !table_was_open && active_in_math {
+            if esc
+                && !menu_was_open
+                && !table_was_open
+                && (active_in_math || active_in_mermaid)
+            {
                 *active_line = None;
             }
         }

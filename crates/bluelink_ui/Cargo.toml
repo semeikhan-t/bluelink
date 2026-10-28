@@ -16,6 +16,8 @@ arboard = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 # 3.0 needs Rust 1.99 and egui 0.36. PNG only: the egui feature pulls egui 0.28.
 latex-rust = { version = "=2.1.1", default-features = false, features = ["std", "png"] }
 

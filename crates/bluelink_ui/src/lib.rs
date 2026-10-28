@@ -8,6 +8,7 @@ mod footnote;
 mod local_graph;
 mod math_block;
 mod media;
+mod mermaid;
 mod note_history;
 mod outline;
 mod preview;

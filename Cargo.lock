@@ -655,10 +655,12 @@ dependencies = [
  "egui",
  "egui-phosphor",
  "egui_extras",
+ "hex",
  "image",
  "latex-rust",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
