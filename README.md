@@ -20,11 +20,9 @@
 </div>
 
 <p align="center">
-  <a href="./assets/social-preview.mp4">
-    <img src="./assets/social-preview.gif" alt="BlueLink launch film showing the native editor, visual graph, and direct encrypted sync" width="900" />
-  </a>
-  <br />
-  <sub>▶ The launch film plays inline. Click it to open the full-quality MP4 with sound.</sub>
+
+https://github.com/user-attachments/assets/c61eebca-5d8b-48fa-a7f3-9a7a608e1d60
+
 </p>
 
 > [!IMPORTANT]
