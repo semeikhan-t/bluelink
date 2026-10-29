@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./logo-concepts/final/digital/bluelink-symbol-color.svg" alt="BlueLink logo" width="120" />
+  <img src="./assets/bluelink-symbol.png" alt="BlueLink logo" width="96" />
   <h1>BlueLink</h1>
   <p>Own your Markdown notes on Linux with a native local-first editor; encrypted Bluetooth LE sync is in progress.</p>
 
@@ -21,10 +21,10 @@
 
 <p align="center">
   <a href="./assets/social-preview.mp4">
-    <img src="./assets/social-preview.jpg" alt="Watch the BlueLink launch video" width="900" />
+    <img src="./assets/social-preview.gif" alt="BlueLink launch film showing the native editor, visual graph, and direct encrypted sync" width="900" />
   </a>
   <br />
-  <sub>▶ Watch the 25-second BlueLink launch film — local-first Markdown, visual graph, native Linux, and encrypted direct sync.</sub>
+  <sub>▶ The launch film plays inline. Click it to open the full-quality MP4 with sound.</sub>
 </p>
 
 > [!IMPORTANT]
