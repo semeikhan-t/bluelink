@@ -1,22 +1,39 @@
 <div align="center">
-  <img src="./assets/bluelink-symbol.png" alt="BlueLink logo" width="96" />
-  <h1>BlueLink</h1>
-  <p>Own your Markdown notes on Linux with a native local-first editor; encrypted Bluetooth LE sync is in progress.</p>
+  <br />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/bluelink-logo-white.png" />
+    <source media="(prefers-color-scheme: light)" srcset="./assets/bluelink-logo-color.png" />
+    <img src="./assets/bluelink-logo-color.png" alt="BlueLink" width="360" />
+  </picture>
+
+  <p><strong>Own your Markdown. Link your thinking.</strong></p>
+  <p>
+    A native, local-first knowledge workspace for Linux.<br />
+    Encrypted Bluetooth LE sync is in progress.
+  </p>
+
+  <p>
+    <code>plain .md</code>&nbsp; → &nbsp;<code>[[wikilinks]]</code>&nbsp; → &nbsp;<code>local graph</code>&nbsp; → &nbsp;<code>trusted devices</code>
+  </p>
 
   <!-- Badges: License | Stars | Release | CI Status | Contributors | Platform -->
+  <a href="https://github.com/semeikhan-t/bluelink/releases"><img alt="Release: pre-alpha" src="https://img.shields.io/badge/release-pre--alpha-2563eb?style=flat-square" /></a>
+  <img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux-0f172a?style=flat-square&logo=linux&logoColor=white" />
+  <a href="https://github.com/semeikhan-t/bluelink/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/semeikhan-t/bluelink/actions/workflows/ci.yml/badge.svg" /></a>
   <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/semeikhan-t/bluelink?style=flat-square" /></a>
   <a href="https://github.com/semeikhan-t/bluelink/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/semeikhan-t/bluelink?style=flat-square" /></a>
-  <a href="https://github.com/semeikhan-t/bluelink/releases"><img alt="Release: pre-alpha" src="https://img.shields.io/badge/release-pre--alpha-2563eb?style=flat-square" /></a>
-  <a href="https://github.com/semeikhan-t/bluelink/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/semeikhan-t/bluelink/actions/workflows/ci.yml/badge.svg" /></a>
   <a href="https://github.com/semeikhan-t/bluelink/graphs/contributors"><img alt="Contributors" src="https://img.shields.io/github/contributors/semeikhan-t/bluelink?style=flat-square" /></a>
-  <img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux-0f172a?style=flat-square&logo=linux&logoColor=white" />
 
   <br /><br />
 
-  <a href="#quick-start">🚀 Quick Start</a> ·
-  <a href="#documentation">📖 Docs</a> ·
-  <a href="https://github.com/semeikhan-t/bluelink/issues/new?template=bug_report.md">🐛 Report Bug</a> ·
-  <a href="https://github.com/semeikhan-t/bluelink/issues/new?template=feature_request.md">💡 Request Feature</a>
+  <a href="#quick-start"><strong>Get started</strong></a>
+  &nbsp;·&nbsp;
+  <a href="#documentation">Documentation</a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/semeikhan-t/bluelink/issues/new?template=bug_report.md">Report a bug</a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/semeikhan-t/bluelink/issues/new?template=feature_request.md">Request a feature</a>
+  <br /><br />
 </div>
 
 <p align="center">
