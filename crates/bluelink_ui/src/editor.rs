@@ -1200,7 +1200,34 @@ pub fn show_live(
                     let show_wiki = wiki_open.is_some() && (focused || grace > 0);
                     if let Some((brack_at, query)) = wiki_open {
                         if show_wiki {
-                            let candidates = wiki_candidates(&vault.index().note_paths(), &query);
+                            let suggest = parse_wiki_suggest_query(&query);
+                            let (popup_title, candidates) = match &suggest {
+                                WikiSuggestQuery::Notes { query } => (
+                                    "Link to note",
+                                    wiki_candidates(&vault.index().note_paths(), query),
+                                ),
+                                WikiSuggestQuery::Headings { note, prefix } => {
+                                    let titles = wiki_target_headings(
+                                        vault,
+                                        source_path,
+                                        note,
+                                        buffer,
+                                    );
+                                    (
+                                        "Heading",
+                                        filter_frag_candidates(&titles, prefix),
+                                    )
+                                }
+                                WikiSuggestQuery::Blocks { note, prefix } => {
+                                    let ids = wiki_target_block_ids(
+                                        vault,
+                                        source_path,
+                                        note,
+                                        buffer,
+                                    );
+                                    ("Block", filter_frag_candidates(&ids, prefix))
+                                }
+                            };
                             let mut picked: Option<String> = None;
                             if !candidates.is_empty() {
                                 egui::Area::new(Id::new(("wiki_ac", i)))
@@ -1210,32 +1237,56 @@ pub fn show_live(
                                         egui::Frame::popup(ui.style()).show(ui, |ui| {
                                             ui.set_min_width(220.0);
                                             ui.label(
-                                                egui::RichText::new("Link to note")
+                                                egui::RichText::new(popup_title)
                                                     .size(12.0)
                                                     .color(theme::WEAK),
                                             );
-                                            for path in candidates.iter().take(12) {
-                                                let label = path.trim_end_matches(".md");
-                                                let r = ui.selectable_label(false, label);
+                                            for item in candidates.iter().take(12) {
+                                                let label = match &suggest {
+                                                    WikiSuggestQuery::Notes { .. } => {
+                                                        item.trim_end_matches(".md").to_string()
+                                                    }
+                                                    WikiSuggestQuery::Headings { .. } => {
+                                                        item.clone()
+                                                    }
+                                                    WikiSuggestQuery::Blocks { .. } => {
+                                                        format!("^{item}")
+                                                    }
+                                                };
+                                                let r = ui.selectable_label(false, &label);
                                                 if r.hovered() || r.clicked() {
                                                     grace = 24;
                                                 }
                                                 if r.clicked() {
-                                                    picked = Some(label.to_string());
+                                                    picked = Some(wiki_suggest_insert_token(
+                                                        &suggest, item,
+                                                    ));
                                                 }
                                             }
                                         });
                                     });
                                 if enter && focused {
-                                    picked =
-                                        Some(candidates[0].trim_end_matches(".md").to_string());
+                                    picked = Some(wiki_suggest_insert_token(
+                                        &suggest,
+                                        &candidates[0],
+                                    ));
                                     wiki_consumed_enter = true;
                                 }
                             }
                             if let Some(name) = picked {
-                                let prefix = &draft[..brack_at];
+                                // Keep a leading `!` so `![[…` becomes an embed on pick.
+                                let open_at = if brack_at > 0
+                                    && draft.as_bytes().get(brack_at - 1) == Some(&b'!')
+                                {
+                                    brack_at - 1
+                                } else {
+                                    brack_at
+                                };
+                                let bang = open_at < brack_at;
+                                let prefix = &draft[..open_at];
                                 let suffix = &draft[byte_idx..];
-                                let inserted = format!("{prefix}[[{name}]]{suffix}");
+                                let open = if bang { "![[" } else { "[[" };
+                                let inserted = format!("{prefix}{open}{name}]]{suffix}");
                                 splice = Some((start, end, inserted));
                                 // Drop raw edit so the link renders as a clickable preview.
                                 leave_edit_after_wiki = true;
@@ -2258,6 +2309,40 @@ fn open_wiki_query(draft: &str, cursor_byte: usize) -> Option<(usize, String)> {
     Some((start, query))
 }
 
+/// Parsed wiki-suggest query: note paths, headings of a note, or block ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WikiSuggestQuery {
+    Notes { query: String },
+    Headings { note: String, prefix: String },
+    Blocks { note: String, prefix: String },
+}
+
+/// Split `Note` / `Note#H` / `Note#^id` / `Note^id` (alias already stripped).
+fn parse_wiki_suggest_query(query: &str) -> WikiSuggestQuery {
+    if let Some((note, frag)) = query.split_once('#') {
+        if let Some(id) = frag.strip_prefix('^') {
+            return WikiSuggestQuery::Blocks {
+                note: note.to_string(),
+                prefix: id.to_string(),
+            };
+        }
+        return WikiSuggestQuery::Headings {
+            note: note.to_string(),
+            prefix: frag.to_string(),
+        };
+    }
+    // Plan also accepts `[[Note^id` without `#`.
+    if let Some((note, id)) = query.split_once('^') {
+        return WikiSuggestQuery::Blocks {
+            note: note.to_string(),
+            prefix: id.to_string(),
+        };
+    }
+    WikiSuggestQuery::Notes {
+        query: query.to_string(),
+    }
+}
+
 fn wiki_candidates(notes: &[String], query: &str) -> Vec<String> {
     let q = query.to_ascii_lowercase();
     let mut out: Vec<String> = notes
@@ -2272,6 +2357,100 @@ fn wiki_candidates(notes: &[String], query: &str) -> Vec<String> {
         .cloned()
         .collect();
     out.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    out
+}
+
+fn filter_frag_candidates(items: &[String], prefix: &str) -> Vec<String> {
+    let q = prefix.to_ascii_lowercase();
+    let mut out: Vec<String> = items
+        .iter()
+        .filter(|t| q.is_empty() || t.to_ascii_lowercase().contains(&q))
+        .cloned()
+        .collect();
+    out.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    out
+}
+
+/// Token inserted inside `[[…]]` for a suggest pick.
+fn wiki_suggest_insert_token(suggest: &WikiSuggestQuery, item: &str) -> String {
+    match suggest {
+        WikiSuggestQuery::Notes { .. } => item.trim_end_matches(".md").to_string(),
+        WikiSuggestQuery::Headings { note, .. } => {
+            if note.is_empty() {
+                format!("#{item}")
+            } else {
+                format!("{note}#{item}")
+            }
+        }
+        WikiSuggestQuery::Blocks { note, .. } => {
+            if note.is_empty() {
+                format!("#^{item}")
+            } else {
+                format!("{note}#^{item}")
+            }
+        }
+    }
+}
+
+fn wiki_target_text(
+    vault: &Vault,
+    source_path: Option<&str>,
+    note: &str,
+    live_buffer: &str,
+) -> Option<String> {
+    let path = vault.index().resolve(note, source_path)?;
+    if source_path == Some(path.as_str()) {
+        Some(live_buffer.to_string())
+    } else {
+        vault.read(&path).ok()
+    }
+}
+
+fn wiki_target_headings(
+    vault: &Vault,
+    source_path: Option<&str>,
+    note: &str,
+    live_buffer: &str,
+) -> Vec<String> {
+    let Some(text) = wiki_target_text(vault, source_path, note, live_buffer) else {
+        return Vec::new();
+    };
+    crate::outline::headings(&text)
+        .into_iter()
+        .map(|e| e.title)
+        .collect()
+}
+
+fn wiki_target_block_ids(
+    vault: &Vault,
+    source_path: Option<&str>,
+    note: &str,
+    live_buffer: &str,
+) -> Vec<String> {
+    let Some(text) = wiki_target_text(vault, source_path, note, live_buffer) else {
+        return Vec::new();
+    };
+    collect_block_ids(&text)
+}
+
+/// Block ids as scanned by [`bluelink_core::block_line`] rules (`^id` alone or trailing).
+fn collect_block_ids(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim_end();
+        if let Some(id) = t.strip_prefix('^') {
+            if !id.is_empty() && !id.chars().any(char::is_whitespace) {
+                out.push(id.to_string());
+                continue;
+            }
+        }
+        if let Some(idx) = t.rfind(" ^") {
+            let id = &t[idx + 2..];
+            if !id.is_empty() && !id.chars().any(char::is_whitespace) {
+                out.push(id.to_string());
+            }
+        }
+    }
     out
 }
 
@@ -2606,10 +2785,12 @@ fn replace_line(buffer: &str, line: usize, next: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_line_col, estimate_row_height, gap_after_row, insert_isolated_block, line_below_last,
-        line_char_offset, line_ranges, note_scroll_boost, open_wiki_query, row_at_local_y,
-        row_prefix_heights, unindent_line, visible_row_range, wiki_candidates, ViewMode,
-        NOTE_TRACKPAD_BOOST, NOTE_WHEEL_BOOST, ROW_GAP, TOP_PAD,
+        caret_line_col, collect_block_ids, estimate_row_height, filter_frag_candidates,
+        gap_after_row, insert_isolated_block, line_below_last, line_char_offset, line_ranges,
+        note_scroll_boost, open_wiki_query, parse_wiki_suggest_query, row_at_local_y,
+        row_prefix_heights, unindent_line, visible_row_range, wiki_candidates,
+        wiki_suggest_insert_token, ViewMode, WikiSuggestQuery, NOTE_TRACKPAD_BOOST,
+        NOTE_WHEEL_BOOST, ROW_GAP, TOP_PAD,
     };
     use crate::math_block;
     use crate::preview::FenceRole;
@@ -2762,6 +2943,78 @@ mod tests {
         assert!(found.iter().any(|p| p == "hello.md"));
         assert!(found.iter().any(|p| p == "inbox/Hello.md"));
         assert!(!found.iter().any(|p| p == "Other.md"));
+    }
+
+    #[test]
+    fn wiki_suggest_query_parses_note_heading_block() {
+        assert_eq!(
+            parse_wiki_suggest_query("Hel"),
+            WikiSuggestQuery::Notes {
+                query: "Hel".into()
+            }
+        );
+        assert_eq!(
+            parse_wiki_suggest_query("Note#He"),
+            WikiSuggestQuery::Headings {
+                note: "Note".into(),
+                prefix: "He".into()
+            }
+        );
+        assert_eq!(
+            parse_wiki_suggest_query("Note#"),
+            WikiSuggestQuery::Headings {
+                note: "Note".into(),
+                prefix: String::new()
+            }
+        );
+        assert_eq!(
+            parse_wiki_suggest_query("Note#^ab"),
+            WikiSuggestQuery::Blocks {
+                note: "Note".into(),
+                prefix: "ab".into()
+            }
+        );
+        assert_eq!(
+            parse_wiki_suggest_query("#^x"),
+            WikiSuggestQuery::Blocks {
+                note: String::new(),
+                prefix: "x".into()
+            }
+        );
+        assert_eq!(
+            parse_wiki_suggest_query("Note^id"),
+            WikiSuggestQuery::Blocks {
+                note: "Note".into(),
+                prefix: "id".into()
+            }
+        );
+    }
+
+    #[test]
+    fn wiki_frag_candidates_filter_and_insert_token() {
+        let heads = vec!["Hello".into(), "World".into(), "Help".into()];
+        let found = filter_frag_candidates(&heads, "he");
+        assert_eq!(found, vec!["Help".to_string(), "Hello".to_string()]);
+
+        let blocks = collect_block_ids("para ^a\n^solo\n# H\nother ^b-2\n");
+        assert_eq!(blocks, vec!["a".to_string(), "solo".to_string(), "b-2".to_string()]);
+        let filtered = filter_frag_candidates(&blocks, "b");
+        assert_eq!(filtered, vec!["b-2".to_string()]);
+
+        let h = WikiSuggestQuery::Headings {
+            note: "Note".into(),
+            prefix: String::new(),
+        };
+        assert_eq!(wiki_suggest_insert_token(&h, "Hello"), "Note#Hello");
+        let b = WikiSuggestQuery::Blocks {
+            note: String::new(),
+            prefix: String::new(),
+        };
+        assert_eq!(wiki_suggest_insert_token(&b, "id"), "#^id");
+        let n = WikiSuggestQuery::Notes {
+            query: "x".into(),
+        };
+        assert_eq!(wiki_suggest_insert_token(&n, "inbox/Hello.md"), "inbox/Hello");
     }
 
     #[test]

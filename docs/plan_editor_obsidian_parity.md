@@ -673,7 +673,7 @@ Live-редактор; жирный / курсив / код / зачёркива
 | 1 | Сворачивание | Done |
 | 2 | Комментарии `%%` | Done |
 | 3 | Reading / Source | Done |
-| 4 | Deep links / section embeds | Todo |
+| 4 | Deep links / section embeds | Done |
 | 5 | Callout types + fold | Done |
 | 6 | List indent | Done |
 | 7 | Footnotes advanced | Done |

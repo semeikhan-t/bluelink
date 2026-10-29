@@ -42,6 +42,32 @@ pub fn block_line(text: &str, id: &str) -> Option<usize> {
     None
 }
 
+/// Half-open line range `[start, end)` for a wiki fragment (`^id` or heading title).
+///
+/// - Block (`^…`): the single line that carries the id.
+/// - Heading: from that ATX line through the line before the next ATX with level ≤ current
+///   (or EOF).
+/// - Unknown fragment → `None`.
+pub fn fragment_line_range(text: &str, fragment: &str) -> Option<(usize, usize)> {
+    if fragment.starts_with('^') {
+        let line = block_line(text, fragment)?;
+        return Some((line, line + 1));
+    }
+    let start = heading_line(text, fragment)?;
+    let level = text.lines().nth(start).and_then(atx_heading)?.0;
+    let end = text
+        .lines()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(i, line)| {
+            atx_heading(line)
+                .filter(|&(l, _)| l <= level)
+                .map(|_| i)
+        })
+        .unwrap_or_else(|| text.lines().count());
+    Some((start, end))
+}
+
 /// Rewrite `#old` → `#new` on wiki links whose target is `note_stem` (or empty `[[#old]]`).
 pub fn rewrite_heading_links(content: &str, note_stem: &str, old: &str, new: &str) -> String {
     if old == new {
@@ -81,7 +107,7 @@ pub fn rewrite_heading_links(content: &str, note_stem: &str, old: &str, new: &st
     out
 }
 
-fn atx_heading_title(line: &str) -> Option<&str> {
+fn atx_heading(line: &str) -> Option<(usize, &str)> {
     let t = line.trim();
     if !t.starts_with('#') {
         return None;
@@ -95,8 +121,12 @@ fn atx_heading_title(line: &str) -> Option<&str> {
     if title.is_empty() {
         None
     } else {
-        Some(title)
+        Some((level, title))
     }
+}
+
+fn atx_heading_title(line: &str) -> Option<&str> {
+    atx_heading(line).map(|(_, title)| title)
 }
 
 fn rewrite_heading_in_body(body: &str, note_stem: &str, old: &str, new: &str) -> Option<String> {
@@ -994,6 +1024,27 @@ mod tests {
         assert_eq!(heading_line(text, "missing"), None);
         assert_eq!(block_line(text, "block-a"), Some(6));
         assert_eq!(block_line(text, "^solo"), Some(8));
+    }
+
+    #[test]
+    fn fragment_line_range_heading_section_slice() {
+        // 0:# H1  1:body1  2:## H2a  3:body2  4:## H2b  5:body3
+        let text = "# H1\nbody1\n## H2a\nbody2\n## H2b\nbody3\n";
+        assert_eq!(fragment_line_range(text, "H2a"), Some((2, 4)));
+        assert_eq!(fragment_line_range(text, "H1"), Some((0, 6)));
+        assert_eq!(fragment_line_range(text, "H2b"), Some((4, 6)));
+    }
+
+    #[test]
+    fn fragment_line_range_block_one_line() {
+        let text = "para\nline ^bid\nother\n";
+        assert_eq!(fragment_line_range(text, "^bid"), Some((1, 2)));
+    }
+
+    #[test]
+    fn fragment_line_range_unknown_none() {
+        assert_eq!(fragment_line_range("# A\n", "missing"), None);
+        assert_eq!(fragment_line_range("x\n", "^nope"), None);
     }
 
     #[test]

@@ -10,6 +10,10 @@ use egui_phosphor::regular;
 pub enum EditorAction {
     WikiLink,
     ExternalLink,
+    /// Insert `#` at the caret, or `#` before the selection (word → `#tag`).
+    InsertTag,
+    /// Insert `![[]]` with the caret between the brackets (wiki embed).
+    InsertEmbed,
     Wrap {
         before: &'static str,
         after: &'static str,
@@ -253,6 +257,12 @@ pub fn show_popup(ctx: &egui::Context) -> Option<(CtxMenu, EditorAction)> {
                             }
                         }
                         SubMenu::Insert => {
+                            if row(ui, regular::HASH, "Tag", false) {
+                                action = Some(EditorAction::InsertTag);
+                            }
+                            if row(ui, regular::SQUARE, "Embed", false) {
+                                action = Some(EditorAction::InsertEmbed);
+                            }
                             if row(ui, regular::ARTICLE, "Footnote", false) {
                                 action = Some(EditorAction::Footnote);
                             }
@@ -569,6 +579,21 @@ pub fn apply_text_action(
                 Some(wrap_selection(text, primary, secondary, "[[", "]]"))
             }
         }
+        EditorAction::InsertTag => {
+            let lo = primary.min(secondary);
+            let hi = primary.max(secondary);
+            if lo == hi {
+                Some(insert_at(text, primary, secondary, "#"))
+            } else {
+                let byte_lo = char_to_byte(text, lo);
+                text.insert(byte_lo, '#');
+                Some(hi + 1)
+            }
+        }
+        EditorAction::InsertEmbed => {
+            let caret = insert_at(text, primary, secondary, "![[]]");
+            Some(caret - "]]".chars().count())
+        }
         EditorAction::ExternalLink => {
             let lo = primary.min(secondary);
             let hi = primary.max(secondary);
@@ -698,5 +723,28 @@ mod tests {
         let caret = apply_text_action(&mut s, 0, 0, &EditorAction::Footnote).unwrap();
         assert_eq!(s, "[^2][^1]\n\n[^1]: \n\n[^2]: ");
         assert_eq!(caret, s.chars().count());
+    }
+
+    #[test]
+    fn insert_tag_at_caret_or_before_selection() {
+        let mut s = "hello".to_string();
+        let caret = apply_text_action(&mut s, 0, 0, &EditorAction::InsertTag).unwrap();
+        assert_eq!(s, "#hello");
+        assert_eq!(caret, 1);
+
+        let mut s = "hello world".to_string();
+        let caret = apply_text_action(&mut s, 0, 5, &EditorAction::InsertTag).unwrap();
+        assert_eq!(s, "#hello world");
+        assert_eq!(caret, 6);
+        assert_eq!(&s[..caret], "#hello");
+    }
+
+    #[test]
+    fn insert_embed_places_caret_inside() {
+        let mut s = String::new();
+        let caret = apply_text_action(&mut s, 0, 0, &EditorAction::InsertEmbed).unwrap();
+        assert_eq!(s, "![[]]");
+        assert_eq!(&s[..caret], "![[");
+        assert_eq!(&s[caret..], "]]");
     }
 }

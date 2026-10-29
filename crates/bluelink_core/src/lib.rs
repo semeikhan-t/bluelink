@@ -24,7 +24,8 @@ pub use path::{
 };
 pub use vault::{title_from_content, NoteMeta, Vault};
 pub use wiki::{
-    block_line, create_path_for_link, extract_wikilinks, heading_line, link_fragment,
-    normalize_link_target, notes_after_renames, preferred_wikilink_text, rewrite_heading_links,
-    rewrite_wikilink_body, rewrite_wikilinks_in_content, LocalGraph, WikiIndex,
+    block_line, create_path_for_link, extract_wikilinks, fragment_line_range, heading_line,
+    link_fragment, normalize_link_target, notes_after_renames, preferred_wikilink_text,
+    rewrite_heading_links, rewrite_wikilink_body, rewrite_wikilinks_in_content, LocalGraph,
+    WikiIndex,
 };

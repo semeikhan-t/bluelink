@@ -1,4 +1,7 @@
-use bluelink_core::{parse_preview, split_wikilinks, PreviewBlock, PreviewDoc, Span, Vault};
+use bluelink_core::{
+    fragment_line_range, link_fragment, parse_preview, split_wikilinks, PreviewBlock, PreviewDoc,
+    Span, Vault,
+};
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, CornerRadius, CursorIcon, FontFamily, FontId, OpenUrl, RichText, Sense, Ui};
 use egui_phosphor::regular;
@@ -1357,7 +1360,7 @@ fn render_one_span(
             let label = alias.as_deref();
             if let Some(path) = vault.index().resolve(target, source_path) {
                 if path.ends_with(".md") {
-                    return render_note_embed(ui, vault, &path, label);
+                    return render_note_embed(ui, vault, &path, target, label);
                 }
             }
             render_media_embed(ui, vault, target, label, *width, *height)
@@ -1514,20 +1517,42 @@ fn paint_plain_text(ui: &mut Ui, text: &str, size: f32, heading: bool, level: u8
     }
 }
 
-/// `![[Note]]` card: title + first few lines. Click opens the note.
-fn render_note_embed(ui: &mut Ui, vault: &Vault, path: &str, alias: Option<&str>) -> LineClick {
+/// `![[Note]]` / `![[Note#frag]]` card. Click opens the note (and scrolls to fragment).
+fn render_note_embed(
+    ui: &mut Ui,
+    vault: &Vault,
+    path: &str,
+    embed_target: &str,
+    alias: Option<&str>,
+) -> LineClick {
     let content = vault.read(path).unwrap_or_default();
     let title = alias
         .map(str::to_string)
         .unwrap_or_else(|| bluelink_core::title_from_content(&content, path));
-    let preview_lines: Vec<&str> = content
-        .lines()
-        .filter(|l| {
-            let t = l.trim();
-            !t.is_empty() && !t.starts_with("---")
-        })
-        .take(4)
-        .collect();
+    let fragment = link_fragment(embed_target);
+
+    enum Body<'a> {
+        Lines(Vec<&'a str>),
+        Missing(String),
+    }
+    let body = match fragment.as_deref() {
+        None => Body::Lines(
+            content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim();
+                    !t.is_empty() && !t.starts_with("---")
+                })
+                .take(4)
+                .collect(),
+        ),
+        Some(frag) => match fragment_line_range(&content, frag) {
+            Some((start, end)) => {
+                Body::Lines(content.lines().skip(start).take(end - start).collect())
+            }
+            None => Body::Missing(format!("Not found: #{frag}")),
+        },
+    };
 
     let mut open = false;
     egui::Frame::NONE
@@ -1549,17 +1574,33 @@ fn render_note_embed(ui: &mut Ui, vault: &Vault, path: &str, alias: Option<&str>
             open |= title_resp
                 .on_hover_cursor(CursorIcon::PointingHand)
                 .clicked();
-            for line in preview_lines {
-                let resp = ui.add(
-                    egui::Label::new(RichText::new(line).size(13.0).color(theme::WEAK))
-                        .sense(Sense::click()),
-                );
-                open |= resp.clicked();
+            match body {
+                Body::Lines(lines) => {
+                    for line in lines {
+                        let resp = ui.add(
+                            egui::Label::new(RichText::new(line).size(13.0).color(theme::WEAK))
+                                .sense(Sense::click()),
+                        );
+                        open |= resp.clicked();
+                    }
+                }
+                Body::Missing(msg) => {
+                    let resp = ui.add(
+                        egui::Label::new(RichText::new(msg).size(13.0).color(theme::WEAK))
+                            .sense(Sense::click()),
+                    );
+                    open |= resp.clicked();
+                }
             }
         });
     if open {
+        let stem = path.trim_end_matches(".md");
+        let raw = match fragment.as_deref() {
+            Some(frag) => format!("{stem}#{frag}"),
+            None => stem.to_string(),
+        };
         LineClick::Wiki {
-            raw: path.trim_end_matches(".md").to_string(),
+            raw,
             new_tab: ui.input(|i| i.modifiers.command),
         }
     } else {
