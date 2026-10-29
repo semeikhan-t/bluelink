@@ -1,5 +1,6 @@
-//! Frontmatter properties strip above the live note body.
+//! Frontmatter properties block inside the note scroll (Obsidian `metadata-container`).
 //!
+//! Mounted in the live/reading ScrollArea above the body — not sticky chrome.
 //! Pretty = typed key/value rows; Raw = YAML interior between `---` fences.
 //! Fold is session-only and does not rewrite the note buffer.
 //!

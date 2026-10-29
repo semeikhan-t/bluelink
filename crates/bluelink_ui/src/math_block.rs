@@ -33,7 +33,7 @@ impl MathSpan {
     }
 }
 
-pub fn spans(lines: &[String], fences: &[FenceRole]) -> Vec<MathSpan> {
+pub fn spans(lines: &[String], fences: &[FenceRole], opaque: &[bool]) -> Vec<MathSpan> {
     let n = lines.len();
     let mut out = vec![
         MathSpan {
@@ -45,11 +45,16 @@ pub fn spans(lines: &[String], fences: &[FenceRole]) -> Vec<MathSpan> {
     ];
     let mut i = 0;
     while i < n {
-        if is_delim(&lines[i], fences.get(i).copied()) {
+        if !opaque.get(i).copied().unwrap_or(false)
+            && is_delim(&lines[i], fences.get(i).copied())
+        {
             let start = i;
             let mut close = None;
             let mut j = i + 1;
             while j < n {
+                if opaque.get(j).copied().unwrap_or(false) {
+                    break;
+                }
                 if is_delim(&lines[j], fences.get(j).copied()) {
                     close = Some(j);
                     break;
@@ -260,7 +265,7 @@ mod tests {
             "$$".into(),
             "after".into(),
         ];
-        let spans = spans(&lines, &outside());
+        let spans = spans(&lines, &outside(), &vec![false; lines.len()]);
         assert_eq!(spans[0].role, MathRole::Outside);
         assert_eq!(spans[1].role, MathRole::Open);
         assert_eq!(spans[2].role, MathRole::Body);
@@ -275,7 +280,7 @@ mod tests {
     #[test]
     fn unclosed_delimiter_stays_text() {
         let lines = vec!["$$".into(), "x".into()];
-        let spans = spans(&lines, &outside());
+        let spans = spans(&lines, &outside(), &vec![false; lines.len()]);
         assert!(spans.iter().all(|s| s.role == MathRole::Outside));
     }
 
@@ -283,8 +288,20 @@ mod tests {
     fn dollar_inside_fence_is_not_math() {
         let lines = vec!["$$".into(), "x".into(), "$$".into()];
         let fences = vec![FenceRole::Body, FenceRole::Body, FenceRole::Body];
-        let spans = spans(&lines, &fences);
+        let spans = spans(&lines, &fences, &vec![false; lines.len()]);
         assert!(spans.iter().all(|s| s.role == MathRole::Outside));
+    }
+
+    #[test]
+    fn opaque_line_breaks_a_math_pair() {
+        let lines = vec!["$$".into(), String::new(), "$$".into(), "x".into(), "$$".into()];
+        let opaque = vec![false, true, false, false, false];
+        let spans = spans(&lines, &outside(), &opaque);
+        assert_eq!(spans[0].role, MathRole::Outside);
+        assert_eq!(spans[1].role, MathRole::Outside);
+        assert_eq!(spans[2].role, MathRole::Open);
+        assert_eq!(spans[3].role, MathRole::Body);
+        assert_eq!(spans[4].role, MathRole::Close);
     }
 
     #[test]

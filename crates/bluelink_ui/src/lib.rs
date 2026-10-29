@@ -208,9 +208,10 @@ pub struct App {
     outline_renaming: Option<outline::OutlineRename>,
     /// Group property-panel keystrokes into one NoteHistory checkpoint.
     props_burst: bool,
-    /// Session fold for the Properties strip (does not rewrite YAML).
+    /// Session fold for Properties inside the note scroll (does not rewrite YAML).
+    /// Default true — matches Obsidian `collapseProperties`.
     props_folded: bool,
-    /// Pretty fields vs raw YAML interior in the Properties strip.
+    /// Pretty fields vs raw YAML interior in the Properties block.
     props_view: properties_panel::PropertiesView,
 }
 
@@ -268,7 +269,7 @@ impl App {
             find_bar: FindBar::default(),
             outline_renaming: None,
             props_burst: false,
-            props_folded: false,
+            props_folded: true,
             props_view: properties_panel::PropertiesView::Pretty,
         };
 
@@ -332,7 +333,8 @@ impl App {
                 self.find_bar = FindBar::default();
                 self.outline_renaming = None;
                 self.props_burst = false;
-                self.props_folded = false;
+                // Obsidian default: collapseProperties = true.
+                self.props_folded = true;
                 self.props_view = properties_panel::PropertiesView::Pretty;
                 self.recent.clear();
                 self.selected = None;
@@ -373,7 +375,7 @@ impl App {
         self.find_bar = FindBar::default();
         self.outline_renaming = None;
         self.props_burst = false;
-        self.props_folded = false;
+        self.props_folded = true;
         self.props_view = properties_panel::PropertiesView::Pretty;
         self.recent.clear();
         self.selected = None;
@@ -733,7 +735,7 @@ impl App {
                 self.scroll_to_line = None;
                 self.outline_renaming = None;
                 self.props_burst = false;
-                self.props_folded = false;
+                self.props_folded = true;
                 self.props_view = properties_panel::PropertiesView::Pretty;
                 self.find_bar.cursor = 0;
                 self.selected = Some(rel_path.to_string());
@@ -2740,32 +2742,8 @@ impl eframe::App for App {
                     ui.add_space(6.0);
                 }
 
-                // Source edits YAML in the full buffer — hide the strip to avoid dual edit.
-                if self.view_mode != editor::ViewMode::Source {
-                    let props_locked = self.readonly || self.view_mode == editor::ViewMode::Reading;
-                    let props = properties_panel::show(
-                        ui,
-                        &self.buffer,
-                        props_locked,
-                        &mut self.props_folded,
-                        &mut self.props_view,
-                    );
-                    if let Some(next) = props.rewritten {
-                        if next != self.buffer {
-                            if !self.props_burst {
-                                self.note_history.checkpoint(&self.buffer);
-                                self.props_burst = true;
-                            }
-                            self.buffer = next;
-                            self.dirty = true;
-                            self.last_edit = Some(Instant::now());
-                        }
-                    }
-                    if !props.focused {
-                        self.props_burst = false;
-                    }
-                    ui.add_space(8.0);
-                }
+                // Properties live inside the note ScrollArea (Obsidian metadata-container).
+                // Source mode edits YAML in the full buffer — widget stays hidden there.
 
                 // Take vault temporarily so we can mutate buffer alongside an immutable vault borrow.
                 let vault = self.vault.take();
@@ -2785,11 +2763,26 @@ impl eframe::App for App {
                         scroll_to,
                         &mut self.note_history,
                         &mut self.props_folded,
+                        &mut self.props_view,
                     );
                     if live.changed {
                         self.dirty = true;
                         self.last_edit = Some(Instant::now());
                         ctx.request_repaint_after(Duration::from_secs(1));
+                    }
+                    if let Some(next) = live.props_rewritten {
+                        if next != self.buffer {
+                            if !self.props_burst {
+                                self.note_history.checkpoint(&self.buffer);
+                                self.props_burst = true;
+                            }
+                            self.buffer = next;
+                            self.dirty = true;
+                            self.last_edit = Some(Instant::now());
+                        }
+                    }
+                    if !live.props_focused {
+                        self.props_burst = false;
                     }
                     if live.scroll_consumed {
                         self.scroll_to_line = None;
@@ -3077,7 +3070,7 @@ impl App {
         }
     }
 
-    /// Keep the open note's sidebar/tab title in sync with the buffer's first line.
+    /// Keep the open note's sidebar/tab title in sync with title metadata or heading.
     fn sync_live_title(&mut self) {
         if self.is_graph_active() {
             return;
@@ -3517,7 +3510,7 @@ mod workspace_tab_tests {
             find_bar: FindBar::default(),
             outline_renaming: None,
             props_burst: false,
-            props_folded: false,
+            props_folded: true,
             props_view: properties_panel::PropertiesView::Pretty,
         };
         (app, dir)

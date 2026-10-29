@@ -7,17 +7,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::error::VaultError;
+use crate::frontmatter::parse_frontmatter;
 use crate::meta::{self, DeviceMeta};
 use crate::path::{self, ATTACHMENTS_DIR, MAX_NOTE_BYTES};
-use crate::wiki::{
-    notes_after_renames, rewrite_wikilinks_in_content, WikiIndex,
-};
+use crate::wiki::{notes_after_renames, rewrite_wikilinks_in_content, WikiIndex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteMeta {
     /// Always uses `/` as separator, e.g. `inbox/todo.md`.
     pub rel_path: String,
-    /// Display title = first non-empty line (ATX `#` markers stripped).
+    /// Display title = frontmatter `title`, leading ATX heading, or file stem.
     pub title: String,
     /// Hex SHA-256 of file contents.
     pub sha256: String,
@@ -26,24 +25,68 @@ pub struct NoteMeta {
     pub modified: u64,
 }
 
-/// First non-empty line of a note, with leading `#` heading markers stripped.
-/// Falls back to the `.md` stem of `rel_path` when the body has no usable line.
+/// Explicit note title, falling back to the `.md` stem of `rel_path`.
+///
+/// Precedence: non-empty frontmatter `title`, an ATX heading on the first
+/// non-empty body line, then the file name. Plain body text and Markdown
+/// thematic breaks are deliberately not treated as note titles.
 pub fn title_from_content(content: &str, rel_path: &str) -> String {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let body = trimmed.trim_start_matches('#').trim();
-        if !body.is_empty() {
-            return body.to_string();
-        }
+    let (fields, body) = parse_frontmatter(content);
+    if let Some(title) = fields
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("title"))
+        .and_then(|(_, value)| value.lines().map(str::trim).find(|line| !line.is_empty()))
+    {
+        return title.to_string();
     }
+
+    if let Some(title) = body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .and_then(atx_title)
+    {
+        return title.to_string();
+    }
+
     Path::new(rel_path)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(rel_path)
         .to_string()
+}
+
+fn atx_title(line: &str) -> Option<&str> {
+    let leading_spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+    if leading_spaces > 3 {
+        return None;
+    }
+    let line = &line[leading_spaces..];
+    let hash_count = line.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&hash_count) {
+        return None;
+    }
+    let after = &line[hash_count..];
+    if after
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| *byte != b' ' && *byte != b'\t')
+    {
+        return None;
+    }
+    let mut title = after.trim();
+    let closing_hashes = title.bytes().rev().take_while(|byte| *byte == b'#').count();
+    if closing_hashes > 0 {
+        let before = &title[..title.len() - closing_hashes];
+        if before.is_empty()
+            || before
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_whitespace)
+        {
+            title = before.trim_end();
+        }
+    }
+    (!title.is_empty()).then_some(title)
 }
 
 pub struct Vault {
@@ -615,13 +658,83 @@ mod title_tests {
     fn strips_heading_markers() {
         assert_eq!(title_from_content("# Hello\nbody", "a.md"), "Hello");
         assert_eq!(title_from_content("### sdfdfs\n", "x.md"), "sdfdfs");
-        assert_eq!(title_from_content("plain title\nmore", "a.md"), "plain title");
     }
 
     #[test]
     fn falls_back_to_stem_when_empty() {
         assert_eq!(title_from_content("\n\n", "inbox/todo.md"), "todo");
         assert_eq!(title_from_content("###\n", "note.md"), "note");
+    }
+
+    #[test]
+    fn separators_and_plain_body_text_do_not_replace_the_file_name() {
+        assert_eq!(
+            title_from_content("---\nbody", "notes/Acceptance.md"),
+            "Acceptance"
+        );
+        assert_eq!(
+            title_from_content("___\nbody", "notes/Acceptance.md"),
+            "Acceptance"
+        );
+        assert_eq!(
+            title_from_content("plain title\nmore", "notes/Acceptance.md"),
+            "Acceptance"
+        );
+        assert_eq!(
+            title_from_content("intro\n# Later section", "notes/Acceptance.md"),
+            "Acceptance"
+        );
+    }
+
+    #[test]
+    fn explicit_frontmatter_title_precedes_body_heading() {
+        let content = "---\ntitle: Release Acceptance\n---\n# Acceptance\n";
+        assert_eq!(
+            title_from_content(content, "notes/Acceptance.md"),
+            "Release Acceptance"
+        );
+    }
+
+    #[test]
+    fn heading_after_frontmatter_precedes_file_name() {
+        let content = "---\ntags: test\n---\n\n## Acceptance Criteria\nbody\n";
+        assert_eq!(
+            title_from_content(content, "notes/Acceptance.md"),
+            "Acceptance Criteria"
+        );
+    }
+
+    #[test]
+    fn recognizes_only_valid_leading_atx_headings() {
+        assert_eq!(
+            title_from_content("   # Acceptance", "notes/fallback.md"),
+            "Acceptance"
+        );
+        assert_eq!(
+            title_from_content("    # code", "notes/Acceptance.md"),
+            "Acceptance"
+        );
+        assert_eq!(
+            title_from_content("\t# code", "notes/Acceptance.md"),
+            "Acceptance"
+        );
+        assert_eq!(
+            title_from_content("#NoSpace", "notes/Acceptance.md"),
+            "Acceptance"
+        );
+        assert_eq!(
+            title_from_content("####### Too many", "notes/Acceptance.md"),
+            "Acceptance"
+        );
+    }
+
+    #[test]
+    fn strips_optional_atx_closing_markers() {
+        assert_eq!(
+            title_from_content("# Acceptance ###", "notes/fallback.md"),
+            "Acceptance"
+        );
+        assert_eq!(title_from_content("# C#", "notes/fallback.md"), "C#");
     }
 }
 

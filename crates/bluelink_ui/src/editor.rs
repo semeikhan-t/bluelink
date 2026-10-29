@@ -19,6 +19,7 @@ use crate::media;
 use crate::mermaid::{self, MermaidRole};
 use crate::note_history::NoteHistory;
 use crate::preview;
+use crate::properties_panel::{self, PropertiesView};
 use crate::table::{self, Place};
 use crate::theme;
 
@@ -113,6 +114,10 @@ pub struct LiveResult {
     pub scroll_consumed: bool,
     /// Tag click (`#tag`) — host opens quick switcher with this query.
     pub tag_query: Option<String>,
+    /// Properties widget rewrote frontmatter (host applies with undo burst).
+    pub props_rewritten: Option<String>,
+    /// True while a Properties field has focus (undo burst grouping).
+    pub props_focused: bool,
 }
 
 #[derive(Clone)]
@@ -617,6 +622,7 @@ pub fn show_live(
     scroll_to_line: Option<usize>,
     history: &mut NoteHistory,
     props_folded: &mut bool,
+    props_view: &mut PropertiesView,
 ) -> LiveResult {
     let mut result = LiveResult {
         changed: false,
@@ -625,6 +631,8 @@ pub fn show_live(
         status: None,
         scroll_consumed: false,
         tag_query: None,
+        props_rewritten: None,
+        props_focused: false,
     };
 
     // Footnote marker/def clicks queue a scroll for the next frame.
@@ -780,15 +788,27 @@ pub fn show_live(
     let mut active_sel: Option<(usize, usize, usize)> = None;
     let mut structural_checkpoint = false;
 
-    // Precompute fence roles so viewport culling can skip lines without breaking ``` state.
-    let (fence_roles, fence_langs) = {
-        let mut open = None;
+    // Precompute opaque block roles so viewport culling cannot break their state.
+    // A standalone comment shadows Markdown fences inside it, and a fence shadows `%%`.
+    let (fence_roles, fence_langs, comment_roles) = {
+        let mut fence_open = None;
+        let mut comment_open = false;
         let mut cur_lang: Option<String> = None;
         let mut roles = Vec::with_capacity(ranges.len());
         let mut langs = Vec::with_capacity(ranges.len());
+        let mut comments = Vec::with_capacity(ranges.len());
         for &(start, end) in &ranges {
             let line = buffer.get(start..end).unwrap_or("");
-            let role = preview::advance_fence(line, &mut open);
+            let comment_role = if fence_open.is_none() {
+                preview::advance_comment(line, &mut comment_open)
+            } else {
+                preview::CommentRole::Outside
+            };
+            let role = if matches!(comment_role, preview::CommentRole::Outside) {
+                preview::advance_fence(line, &mut fence_open)
+            } else {
+                preview::FenceRole::Outside
+            };
             match role {
                 preview::FenceRole::Open => {
                     cur_lang = preview::fence_lang(line);
@@ -806,8 +826,9 @@ pub fn show_live(
                 }
             }
             roles.push(role);
+            comments.push(comment_role);
         }
-        (roles, langs)
+        (roles, langs, comments)
     };
 
     let (regions, hidden, jump_to) = {
@@ -817,7 +838,11 @@ pub fn show_live(
             .collect();
         let in_fence: Vec<bool> = fence_roles
             .iter()
-            .map(|role| !matches!(role, preview::FenceRole::Outside))
+            .zip(&comment_roles)
+            .map(|(fence, comment)| {
+                !matches!(fence, preview::FenceRole::Outside)
+                    || !matches!(comment, preview::CommentRole::Outside)
+            })
             .collect();
         let regions = fold::regions(&fold_lines, &in_fence);
         fold::retain_valid(&mut folds, &regions);
@@ -831,7 +856,25 @@ pub fn show_live(
                 hidden[i] = true;
             }
         }
-        for (i, tail) in preview::collapsed_callout_tails(&fold_lines)
+        if *view_mode == ViewMode::Reading {
+            for (i, role) in comment_roles.iter().enumerate() {
+                if !matches!(role, preview::CommentRole::Outside) {
+                    hidden[i] = true;
+                }
+            }
+        }
+        let callout_lines: Vec<&str> = fold_lines
+            .iter()
+            .zip(&comment_roles)
+            .map(|(line, role)| {
+                if matches!(role, preview::CommentRole::Outside) {
+                    *line
+                } else {
+                    ""
+                }
+            })
+            .collect();
+        for (i, tail) in preview::collapsed_callout_tails(&callout_lines)
             .into_iter()
             .enumerate()
         {
@@ -858,7 +901,10 @@ pub fn show_live(
     }
 
     // Scroll target from prefix heights (virtual rows are not in the tessellator).
+    // Props sit above lines (Obsidian metadata-container in sizerEl) — include last-frame height.
     let layout_id = Id::new(("live_layout", vault.root(), source_path.unwrap_or("")));
+    let props_h_key = Id::new(("live_props_h", source_path.unwrap_or("")));
+    let props_h: f32 = ui.ctx().data(|d| d.get_temp(props_h_key)).unwrap_or(0.0);
     let mut scroll_area = egui::ScrollArea::vertical()
         .id_salt(("live_note_scroll", source_path.unwrap_or("")))
         .auto_shrink([false, false]);
@@ -868,7 +914,7 @@ pub fn show_live(
                 let heights: Vec<f32> = cache.lines.iter().map(|l| l.height.max(1.0)).collect();
                 let prefix = row_prefix_heights(&heights, &fence_roles, &hidden);
                 let idx = target.min(prefix.len().saturating_sub(1));
-                let offset = prefix.get(idx).copied().unwrap_or(TOP_PAD);
+                let offset = props_h + prefix.get(idx).copied().unwrap_or(TOP_PAD);
                 scroll_area = scroll_area.vertical_scroll_offset(offset);
                 result.scroll_consumed = true;
             }
@@ -895,33 +941,49 @@ pub fn show_live(
         let prefix = row_prefix_heights(&heights, &fence_roles, &hidden);
         let content_top = ui.cursor().top();
         let pane = ui.available_rect_before_wrap();
-        // Registered before the lines so text, links, and embeds stay on top.
-        // Empty space at the same height (side margins and the tail of a short line)
-        // still hits this widget and opens that row.
-        let margin = if !can_edit {
-            None
-        } else {
-            let total = *prefix.last().unwrap_or(&TOP_PAD);
-            let rect = egui::Rect::from_min_max(
-                egui::pos2(pane.left(), content_top),
-                egui::pos2(pane.right(), content_top + total),
-            );
-            Some(
-                ui.interact(
-                    rect,
-                    Id::new(("live_margin", source_path.unwrap_or(""))),
-                    egui::Sense::click(),
-                )
-                .on_hover_cursor(egui::CursorIcon::Text),
-            )
-        };
 
         let mut column_top = content_top;
         let mut column_left = pane.left();
+        let mut margin = None;
         centered_column(ui, |ui| {
+            // Obsidian: metadataEditor.containerEl is insertAfter(inlineTitle) inside
+            // editMode.sizerEl / preview header — document flow, not sticky chrome.
+            let props_top = ui.cursor().top();
+            let props = properties_panel::show(
+                ui,
+                buffer,
+                !can_edit,
+                props_folded,
+                props_view,
+            );
+            result.props_rewritten = props.rewritten;
+            result.props_focused = props.focused;
+            ui.add_space(8.0);
+            let props_block_h = (ui.cursor().top() - props_top).max(0.0);
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(props_h_key, props_block_h));
+
             // Prefix heights are measured from this cursor, not the outer pane.
             column_top = ui.cursor().top();
             column_left = ui.cursor().left();
+            // Registered before the lines so text, links, and embeds stay on top.
+            // Empty space at the same height (side margins and the tail of a short line)
+            // still hits this widget and opens that row. Starts below Properties.
+            if can_edit {
+                let total = *prefix.last().unwrap_or(&TOP_PAD);
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(pane.left(), column_top),
+                    egui::pos2(pane.right(), column_top + total),
+                );
+                margin = Some(
+                    ui.interact(
+                        rect,
+                        Id::new(("live_margin", source_path.unwrap_or(""))),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::Text),
+                );
+            }
             // Gaps are baked into prefix strides — avoid egui item_spacing double-count.
             ui.spacing_mut().item_spacing.y = 0.0;
 
@@ -939,9 +1001,20 @@ pub fn show_live(
 
             let lines: Vec<String> = ranges
                 .iter()
-                .map(|&(s, e)| buffer.get(s..e).unwrap_or("").to_string())
+                .zip(&comment_roles)
+                .map(|(&(s, e), role)| {
+                    if matches!(role, preview::CommentRole::Outside) {
+                        buffer.get(s..e).unwrap_or("").to_string()
+                    } else {
+                        String::new()
+                    }
+                })
                 .collect();
-            let math_spans = math_block::spans(&lines, &fence_roles);
+            let opaque_comments: Vec<bool> = comment_roles
+                .iter()
+                .map(|role| !matches!(role, preview::CommentRole::Outside))
+                .collect();
+            let math_spans = math_block::spans(&lines, &fence_roles, &opaque_comments);
             let mermaid_spans = mermaid::spans(&lines, &fence_roles, &fence_langs);
             let table_places = table::places(&lines);
             let callout_places = preview::callout_places(&lines);
@@ -975,6 +1048,7 @@ pub fn show_live(
                 }
                 let (start, end) = ranges[i];
                 let fence_role = fence_roles[i];
+                let comment_role = comment_roles[i];
                 let fence_lang = fence_langs[i].as_deref();
                 let in_fence = !matches!(fence_role, preview::FenceRole::Outside);
                 let is_active = can_edit && *active_line == Some(i);
@@ -1345,7 +1419,9 @@ pub fn show_live(
                     }
                     measured_h = response.rect.height().max(1.0);
                 } else {
-                    let preview = if in_fence {
+                    let preview = if in_fence
+                        || !matches!(comment_role, preview::CommentRole::Outside)
+                    {
                         None
                     } else {
                         let fingerprint = line_fingerprint(line);
@@ -1370,6 +1446,7 @@ pub fn show_live(
                                 source_path,
                                 line,
                                 fence_role,
+                                comment_role,
                                 fence_lang,
                                 preview,
                                 show_comments,

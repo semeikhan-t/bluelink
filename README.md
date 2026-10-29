@@ -250,7 +250,7 @@ cargo run -p desktop --no-default-features -- \
 | Document | What it covers |
 |---|---|
 | [Product and protocol specification](./docs/%D0%A2%D0%97_BlueLink.md) | Original Russian product requirements, vault layout, pairing, and sync protocol. Some platform items remain roadmap work. |
-| [Editor parity plan](./docs/plan_editor_obsidian_parity.md) | Detailed implementation plan for Obsidian-compatible editor behavior. |
+| [Editor compatibility plan](./docs/plan_editor_obsidian_parity.md) | Implementation plan for vault-Markdown editor behavior compatible with common Obsidian conventions. |
 | [`bluelink_core`](./crates/bluelink_core) | Vault I/O, Markdown parsing, paths, frontmatter, and wikilinks. |
 | [`bluelink_sync`](./crates/bluelink_sync) | Pairing, trust, Noise sessions, manifests, conflicts, and transports. |
 | [`bluelink_ble`](./crates/bluelink_ble) | BlueZ GATT peripheral and BLE fragmentation. |

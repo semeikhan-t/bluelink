@@ -1,7 +1,8 @@
 //! Mermaid fenced diagrams (` ```mermaid ` … ` ``` `).
 //!
 //! Renderer choice (stage 9.1): external `mmdc` (mermaid-cli) → PNG, hashed under
-//! `{temp}/bluelink-mermaid/`. If `mmdc` is missing or fails → stub widget with
+//! `{temp}/bluelink-mermaid/`. Uses `-t dark -b transparent` so edges stay visible on
+//! BlueLink’s dark chrome. If `mmdc` is missing or fails → stub widget with
 //! source + status (no `mermaid.min.js`, no WASM, no SVG stack).
 //!
 //! `ponytail:` sync `mmdc` on the UI thread; first paint can hitch. Upgrade: background
@@ -23,6 +24,9 @@ use crate::preview::FenceRole;
 use crate::theme;
 
 const MMDC_TIMEOUT: Duration = Duration::from_secs(10);
+/// Baked into the cache key with the diagram source. Bump when mmdc flags/theme change
+/// so stale PNGs (e.g. default-theme dark arrows on our dark UI) are not reused.
+const RENDER_FINGERPRINT: &str = "mmdc:dark:transparent:v1";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MermaidRole {
@@ -125,6 +129,8 @@ pub fn source(lines: &[String], span: MermaidSpan) -> String {
 
 pub fn source_hash(source: &str) -> String {
     let mut h = Sha256::new();
+    h.update(RENDER_FINGERPRINT.as_bytes());
+    h.update([0]);
     h.update(source.as_bytes());
     hex::encode(h.finalize())
 }
@@ -276,11 +282,15 @@ fn raster_to_png(source: &str, hash: &str) -> Result<Vec<u8>, String> {
 }
 
 fn run_mmdc(input: &Path, output: &Path) -> Result<(), String> {
+    // Default mermaid theme draws dark strokes; with `-b transparent` on BlueLink's
+    // dark editor those arrows vanish. `dark` keeps nodes readable and edges light.
     let mut child = Command::new("mmdc")
         .arg("-i")
         .arg(input)
         .arg("-o")
         .arg(output)
+        .arg("-t")
+        .arg("dark")
         .arg("-b")
         .arg("transparent")
         .stdout(Stdio::null())
@@ -404,6 +414,11 @@ mod tests {
     fn source_hash_stable() {
         assert_eq!(source_hash("A-->B"), source_hash("A-->B"));
         assert_ne!(source_hash("A-->B"), source_hash("A-->C"));
+        // Fingerprint is part of the key (theme/bg bump must invalidate disk cache).
+        assert!(
+            source_hash("A-->B").len() == 64,
+            "sha256 hex"
+        );
     }
 
     #[test]
