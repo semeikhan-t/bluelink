@@ -45,6 +45,12 @@ pub enum EditorAction {
     Cut,
     Copy,
     Paste,
+    /// Text paste only — never image→embed (unlike [`EditorAction::Paste`]).
+    PastePlain,
+    /// Strip inline `** * \` ~~ ==` markers from the selection.
+    ClearFormatting,
+    /// Wrap / unwrap `$…$` (not block `$$`).
+    ToggleInlineMath,
     SelectAll,
 }
 
@@ -160,7 +166,7 @@ pub fn show_popup(ctx: &egui::Context) -> Option<(CtxMenu, EditorAction)> {
                     action = Some(EditorAction::Paste);
                 }
                 if row(ui, regular::CLIPBOARD_TEXT, "Paste as plain text", false) {
-                    action = Some(EditorAction::Paste);
+                    action = Some(EditorAction::PastePlain);
                 }
 
                 ui.separator();
@@ -217,6 +223,14 @@ pub fn show_popup(ctx: &egui::Context) -> Option<(CtxMenu, EditorAction)> {
                             if row(ui, regular::CHAT_CIRCLE, "Toggle comments", false) {
                                 action = Some(EditorAction::ToggleComments);
                             }
+                            if row(ui, regular::MATH_OPERATIONS, "Inline math", false) {
+                                action = Some(EditorAction::ToggleInlineMath);
+                            }
+                            ui.add_enabled_ui(has_selection, |ui| {
+                                if row(ui, regular::ERASER, "Clear formatting", false) {
+                                    action = Some(EditorAction::ClearFormatting);
+                                }
+                            });
                         }
                         SubMenu::Paragraph => {
                             if row(ui, regular::TEXT_T, "Plain text", false) {
@@ -363,7 +377,8 @@ pub fn dispatch_clipboard(ui: &Ui, action: &EditorAction) {
     let cmd = match action {
         EditorAction::Cut => Some(ViewportCommand::RequestCut),
         EditorAction::Copy => Some(ViewportCommand::RequestCopy),
-        EditorAction::Paste => Some(ViewportCommand::RequestPaste),
+        // Paste and PastePlain both request OS text paste; image→embed is only on Paste.
+        EditorAction::Paste | EditorAction::PastePlain => Some(ViewportCommand::RequestPaste),
         _ => None,
     };
     if let Some(cmd) = cmd {
@@ -401,6 +416,146 @@ fn strip_outer_comment(s: &str) -> Option<&str> {
         Some(&s[2..s.len() - 2])
     } else {
         None
+    }
+}
+
+/// Strip inline emphasis/code/strike/highlight markers from `s` (not headings/lists/wiki/`$`).
+pub fn strip_inline_markers(s: &str) -> String {
+    let mut result = s.to_string();
+    // Longest first so `**` wins over `*`.
+    const DELIMS: &[&str] = &["**", "~~", "==", "`", "*"];
+    loop {
+        let before = result.clone();
+        for d in DELIMS {
+            if let Some(inner) = strip_outer_delim(&result, d) {
+                result = inner.to_string();
+            }
+        }
+        for d in DELIMS {
+            result = strip_paired_delims(&result, d);
+        }
+        if result == before {
+            break;
+        }
+    }
+    result
+}
+
+fn strip_outer_delim<'a>(s: &'a str, delim: &str) -> Option<&'a str> {
+    if s.len() >= delim.len() * 2 && s.starts_with(delim) && s.ends_with(delim) {
+        // Avoid treating `**x**` as outer `*` wrap.
+        if delim == "*" && (s.starts_with("**") || s.ends_with("**")) {
+            return None;
+        }
+        Some(&s[delim.len()..s.len() - delim.len()])
+    } else {
+        None
+    }
+}
+
+fn strip_paired_delims(s: &str, delim: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = find_delim_start(rest, delim) {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + delim.len()..];
+        if let Some(j) = find_delim_start(rest, delim) {
+            out.push_str(&rest[..j]);
+            rest = &rest[j + delim.len()..];
+        } else {
+            out.push_str(delim);
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn find_delim_start(s: &str, delim: &str) -> Option<usize> {
+    let mut start = 0;
+    while let Some(rel) = s[start..].find(delim) {
+        let i = start + rel;
+        if delim == "*" && s[i..].starts_with("**") {
+            start = i + 2;
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// Clear inline markers in the selection. No-op if selection is empty.
+pub fn clear_formatting(text: &mut String, primary: usize, secondary: usize) -> usize {
+    let lo = primary.min(secondary);
+    let hi = primary.max(secondary);
+    if lo == hi {
+        return primary;
+    }
+    let byte_lo = char_to_byte(text, lo);
+    let byte_hi = char_to_byte(text, hi);
+    let cleaned = strip_inline_markers(&text[byte_lo..byte_hi]);
+    text.replace_range(byte_lo..byte_hi, &cleaned);
+    lo + cleaned.chars().count()
+}
+
+/// If `s` is a single `$…$` (not `$$`), return the inner body.
+fn strip_outer_inline_math(s: &str) -> Option<&str> {
+    if s.starts_with("$$") || s.ends_with("$$") {
+        return None;
+    }
+    if s.len() >= 2 && s.starts_with('$') && s.ends_with('$') {
+        let inner = &s[1..s.len() - 1];
+        if !inner.contains('$') {
+            return Some(inner);
+        }
+    }
+    None
+}
+
+fn word_char_bounds(text: &str, caret: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return (0, 0);
+    }
+    let i = caret.min(chars.len());
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut lo = i;
+    while lo > 0 && is_word(chars[lo - 1]) {
+        lo -= 1;
+    }
+    let mut hi = i;
+    while hi < chars.len() && is_word(chars[hi]) {
+        hi += 1;
+    }
+    (lo, hi)
+}
+
+/// Toggle `$…$` on the selection, word under caret, or insert an empty pair.
+pub fn toggle_inline_math(text: &mut String, primary: usize, secondary: usize) -> usize {
+    let lo = primary.min(secondary);
+    let hi = primary.max(secondary);
+    if lo != hi {
+        let byte_lo = char_to_byte(text, lo);
+        let byte_hi = char_to_byte(text, hi);
+        let selected = text[byte_lo..byte_hi].to_string();
+        if selected.starts_with("$$") {
+            return hi;
+        }
+        if let Some(inner) = strip_outer_inline_math(&selected) {
+            text.replace_range(byte_lo..byte_hi, inner);
+            lo + inner.chars().count()
+        } else {
+            let replacement = format!("${selected}$");
+            text.replace_range(byte_lo..byte_hi, &replacement);
+            lo + 1 + selected.chars().count()
+        }
+    } else {
+        let (wlo, whi) = word_char_bounds(text, primary);
+        if wlo < whi {
+            toggle_inline_math(text, wlo, whi)
+        } else {
+            wrap_selection(text, primary, primary, "$", "$")
+        }
     }
 }
 
@@ -613,6 +768,8 @@ pub fn apply_text_action(
             Some(wrap_selection(text, primary, secondary, before, after))
         }
         EditorAction::ToggleComments => Some(toggle_comments(text, primary, secondary)),
+        EditorAction::ClearFormatting => Some(clear_formatting(text, primary, secondary)),
+        EditorAction::ToggleInlineMath => Some(toggle_inline_math(text, primary, secondary)),
         EditorAction::IndentList | EditorAction::UnindentList => {
             let deeper = matches!(action, EditorAction::IndentList);
             let (next, new_p, new_s) =
@@ -626,6 +783,7 @@ pub fn apply_text_action(
         EditorAction::Cut
         | EditorAction::Copy
         | EditorAction::Paste
+        | EditorAction::PastePlain
         | EditorAction::SelectAll
         | EditorAction::AttachFile
         | EditorAction::FoldMore
@@ -746,5 +904,37 @@ mod tests {
         assert_eq!(s, "![[]]");
         assert_eq!(&s[..caret], "![[");
         assert_eq!(&s[caret..], "]]");
+    }
+
+    #[test]
+    fn clear_formatting_strips_inline_markers() {
+        let mut s = "**bold** and more".to_string();
+        let caret = clear_formatting(&mut s, 0, 8);
+        assert_eq!(s, "bold and more");
+        assert_eq!(caret, 4);
+
+        let mut s = "`code` and ~~x~~".to_string();
+        let end = s.chars().count();
+        let caret = clear_formatting(&mut s, 0, end);
+        assert_eq!(s, "code and x");
+        assert_eq!(caret, s.chars().count());
+    }
+
+    #[test]
+    fn toggle_inline_math_wraps_and_unwraps() {
+        let mut s = "a^2".to_string();
+        let caret = toggle_inline_math(&mut s, 0, 3);
+        assert_eq!(s, "$a^2$");
+        assert_eq!(caret, 4);
+        let caret = toggle_inline_math(&mut s, 0, 5);
+        assert_eq!(s, "a^2");
+        assert_eq!(caret, 3);
+
+        // Block $$ left alone when selected as block opener.
+        let mut s = "$$\nx\n$$".to_string();
+        let before = s.clone();
+        let caret = toggle_inline_math(&mut s, 0, 2);
+        assert_eq!(s, before);
+        assert_eq!(caret, 2);
     }
 }

@@ -679,7 +679,7 @@ Live-редактор; жирный / курсив / код / зачёркива
 | 7 | Footnotes advanced | Done |
 | 8 | Properties block | Done |
 | 9 | Mermaid | Done |
-| 10 | Menu / table / highlight polish | Todo |
+| 10 | Menu / table / highlight polish | Done |
 | 11 | Acceptance | Todo |
 
 Обновлять колонку «Статус» по мере закрытия подэтапов (`Todo` → `In progress` → `Done`).

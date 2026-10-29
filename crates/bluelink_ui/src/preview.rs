@@ -861,35 +861,123 @@ fn render_fence_stripe(ui: &mut Ui, line: &str, role: FenceRole, lang: Option<&s
     }
 }
 
-fn highlight_code_line(line: &str, lang: Option<&str>) -> LayoutJob {
-    let mut job = LayoutJob::default();
-    let base = TextFormat {
-        font_id: FontId::new(16.0, FontFamily::Monospace),
-        color: theme::TEXT,
-        ..Default::default()
-    };
-    let kw = TextFormat {
-        font_id: FontId::new(16.0, FontFamily::Monospace),
-        color: theme::ACCENT,
-        ..Default::default()
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeSpanKind {
+    Base,
+    Keyword,
+    Comment,
+    String,
+}
+
+/// Lex one code line into (slice, kind) spans — keywords, comments, strings.
+fn highlight_spans<'a>(line: &'a str, lang: Option<&str>) -> Vec<(&'a str, CodeSpanKind)> {
     let words = keywords_for(lang);
-    if words.is_empty() {
-        job.append(line, 0.0, base);
-        return job;
-    }
+    let style = comment_style(lang);
+    let mut out = Vec::new();
     let mut rest = line;
     while !rest.is_empty() {
+        if let Some((n, kind)) = take_comment_or_string(rest, style) {
+            out.push((&rest[..n], kind));
+            rest = &rest[n..];
+            continue;
+        }
         let (tok, next) = next_code_token(rest);
         rest = next;
-        let fmt = if is_ident(tok) && words.iter().any(|w| *w == tok) {
-            kw.clone()
+        let kind = if is_ident(tok) && words.iter().any(|w| *w == tok) {
+            CodeSpanKind::Keyword
         } else {
-            base.clone()
+            CodeSpanKind::Base
+        };
+        out.push((tok, kind));
+    }
+    out
+}
+
+fn highlight_code_line(line: &str, lang: Option<&str>) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let mono = |color: Color32| TextFormat {
+        font_id: FontId::new(16.0, FontFamily::Monospace),
+        color,
+        ..Default::default()
+    };
+    let base = mono(theme::TEXT);
+    let kw = mono(theme::ACCENT);
+    let comment = mono(theme::WEAK);
+    let string = mono(theme::ACCENT_HOVER);
+    for (tok, kind) in highlight_spans(line, lang) {
+        let fmt = match kind {
+            CodeSpanKind::Base => base.clone(),
+            CodeSpanKind::Keyword => kw.clone(),
+            CodeSpanKind::Comment => comment.clone(),
+            CodeSpanKind::String => string.clone(),
         };
         job.append(tok, 0.0, fmt);
     }
     job
+}
+
+#[derive(Clone, Copy)]
+struct CommentStyle {
+    line: Option<&'static str>,
+    block_open: Option<&'static str>,
+    block_close: Option<&'static str>,
+}
+
+fn comment_style(lang: Option<&str>) -> CommentStyle {
+    match lang.map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("python" | "py" | "bash" | "sh" | "shell") => CommentStyle {
+            line: Some("#"),
+            block_open: None,
+            block_close: None,
+        },
+        Some("json" | "mermaid") => CommentStyle {
+            line: None,
+            block_open: None,
+            block_close: None,
+        },
+        // rust / js / ts / go / default C-like
+        _ => CommentStyle {
+            line: Some("//"),
+            block_open: Some("/*"),
+            block_close: Some("*/"),
+        },
+    }
+}
+
+fn take_comment_or_string(s: &str, style: CommentStyle) -> Option<(usize, CodeSpanKind)> {
+    let bytes = s.as_bytes();
+    if let Some(mark) = style.line {
+        if s.starts_with(mark) {
+            return Some((s.len(), CodeSpanKind::Comment));
+        }
+    }
+    if let (Some(open), Some(close)) = (style.block_open, style.block_close) {
+        if s.starts_with(open) {
+            let end = s[open.len()..]
+                .find(close)
+                .map(|i| open.len() + i + close.len())
+                .unwrap_or(s.len());
+            return Some((end, CodeSpanKind::Comment));
+        }
+    }
+    let quote = match bytes.first() {
+        Some(b'"' | b'\'') => bytes[0],
+        Some(b'`') if style.line == Some("//") => b'`', // js/ts template — treat as string to EOL or close
+        _ => return None,
+    };
+    // Skip opening quote; scan for unescaped close (or EOL).
+    let mut i = 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == quote {
+            return Some((i + 1, CodeSpanKind::String));
+        }
+        i += 1;
+    }
+    Some((s.len(), CodeSpanKind::String))
 }
 
 fn next_code_token(s: &str) -> (&str, &str) {
@@ -950,6 +1038,11 @@ fn keywords_for(lang: Option<&str>) -> &'static [&'static str] {
             "true",
             "false",
             "nil",
+        ],
+        Some("json") => &["true", "false", "null"],
+        Some("bash" | "sh" | "shell") => &[
+            "if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac",
+            "function", "return", "in", "export", "local", "echo", "cd", "exit",
         ],
         // mermaid / unknown: no keyword paint
         _ => &[],
@@ -1981,6 +2074,38 @@ fn lighten(c: Color32) -> Color32 {
 #[cfg(test)]
 mod fence_tests {
     use super::*;
+
+    #[test]
+    fn highlight_spans_marks_rust_string_and_comment() {
+        let spans = highlight_spans(r#"let x = "hi"; // done"#, Some("rust"));
+        let kinds: Vec<_> = spans.iter().map(|(_, k)| *k).collect();
+        assert!(
+            kinds.contains(&CodeSpanKind::String),
+            "expected string span in {spans:?}"
+        );
+        assert!(
+            kinds.contains(&CodeSpanKind::Comment),
+            "expected comment span in {spans:?}"
+        );
+        assert!(
+            kinds.contains(&CodeSpanKind::Keyword),
+            "expected keyword span in {spans:?}"
+        );
+        let joined: String = spans
+            .iter()
+            .filter(|(_, k)| *k == CodeSpanKind::String)
+            .map(|(t, _)| *t)
+            .collect();
+        assert_eq!(joined, r#""hi""#);
+    }
+
+    #[test]
+    fn highlight_spans_json_and_bash_keywords() {
+        let spans = highlight_spans("true", Some("json"));
+        assert_eq!(spans, vec![("true", CodeSpanKind::Keyword)]);
+        let spans = highlight_spans("echo hi", Some("bash"));
+        assert!(spans.iter().any(|(t, k)| *t == "echo" && *k == CodeSpanKind::Keyword));
+    }
 
     #[test]
     fn tracks_fenced_block_roles() {

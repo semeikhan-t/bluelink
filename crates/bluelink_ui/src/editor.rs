@@ -1580,6 +1580,16 @@ pub fn show_live(
                         pending_clipboard = PendingClipboard::Paste;
                     }
                 }
+                // Plain text only — never image→embed.
+                EditorAction::PastePlain => {
+                    if let Some(i) = menu.line {
+                        request_active = Some(i);
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(egui::Id::new(("live_focus", i)), true);
+                        });
+                    }
+                    pending_clipboard = PendingClipboard::Paste;
+                }
                 EditorAction::Cut | EditorAction::Copy => {
                     if let Some(i) = menu.line {
                         request_active = Some(i);
@@ -2089,6 +2099,10 @@ fn show_doc_edit(
                 } else {
                     editor_menu::dispatch_clipboard(ui, &EditorAction::Paste);
                 }
+            }
+            // Plain text only — never image→embed.
+            EditorAction::PastePlain => {
+                editor_menu::dispatch_clipboard(ui, &EditorAction::PastePlain);
             }
             EditorAction::Cut | EditorAction::Copy => {
                 editor_menu::dispatch_clipboard(ui, &action);

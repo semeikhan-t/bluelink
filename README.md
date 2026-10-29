@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./assets/logo.png" alt="BlueLink logo" width="120" />
+  <img src="./logo-concepts/final/digital/bluelink-symbol-color.svg" alt="BlueLink logo" width="120" />
   <h1>BlueLink</h1>
   <p>Own your Markdown notes on Linux with a native local-first editor; encrypted Bluetooth LE sync is in progress.</p>
 
@@ -20,9 +20,11 @@
 </div>
 
 <p align="center">
-  <img src="./assets/bluelink_after.png" alt="BlueLink Linux desktop app with a Markdown vault, tabs, and backlinks" width="900" />
+  <a href="./assets/social-preview.mp4">
+    <img src="./assets/social-preview.jpg" alt="Watch the BlueLink launch video" width="900" />
+  </a>
   <br />
-  <sub>BlueLink desktop: plain Markdown files, folders, tabs, and backlinks in a native Linux UI.</sub>
+  <sub>▶ Watch the 25-second BlueLink launch film — local-first Markdown, visual graph, native Linux, and encrypted direct sync.</sub>
 </p>
 
 > [!IMPORTANT]
